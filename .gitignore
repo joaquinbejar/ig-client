@@ -25,3 +25,12 @@ Cargo.lock
 /tarpaulin-report.html
 /examples/market/Data/market_hierarchy_backup.json
 /coverage/
+
+# Claude / assistant local files — never committed
+.claude/
+/CLAUDE.md
+/AGENTS.md
+/rules/
+.internalDoc/
+.windsurf/
+/.windsurfrules
