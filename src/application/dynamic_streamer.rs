@@ -67,8 +67,6 @@ use tracing::{debug, info, warn};
 /// }
 /// ```
 pub struct DynamicMarketStreamer {
-    /// Internal streamer client (recreated on epic changes)
-    client: Arc<RwLock<Option<StreamerClient>>>,
     /// Set of EPICs currently subscribed
     epics: Arc<RwLock<HashSet<String>>>,
     /// Market fields to subscribe to
@@ -112,7 +110,6 @@ impl DynamicMarketStreamer {
         let (price_tx, price_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
-            client: Arc::new(RwLock::new(None)),
             epics: Arc::new(RwLock::new(HashSet::new())),
             fields,
             price_tx: Arc::new(RwLock::new(Some(price_tx))),
@@ -350,9 +347,6 @@ impl DynamicMarketStreamer {
             });
         }
 
-        // Store the new client
-        *self.client.write().await = Some(new_client);
-
         // Create new shutdown signal
         let signal = Arc::new(Notify::new());
         *self.shutdown_signal.write().await = Some(Arc::clone(&signal));
@@ -361,22 +355,19 @@ impl DynamicMarketStreamer {
         *self.is_connected.write().await = true;
 
         // Spawn connection task in background
-        let client = Arc::clone(&self.client);
         let is_connected = Arc::clone(&self.is_connected);
         let generation = Arc::clone(&self.generation);
 
+        // Move the freshly-built client (and its matching shutdown signal) INTO
+        // the task by value. Handing off through the shared `self.client` slot
+        // would race: a second `start_internal` could overwrite the slot before
+        // this task takes it, so the task would connect the wrong client while
+        // parked on this task's (now-stale) signal. Owning the client here binds
+        // each task to exactly the client and signal it was created with, and
+        // the connection still runs without holding any lock.
         tokio::spawn(async move {
-            // Move the client out of the shared lock under a short-lived guard,
-            // then run the long-lived connection WITHOUT holding any lock. This
-            // is the core of the fix: previously the write guard was held across
-            // the whole `connect().await`, so any concurrent `add`/`remove`/
-            // `disconnect` that needs the client lock hung until disconnect.
-            let taken = {
-                let mut guard = client.write().await;
-                guard.take()
-            };
-
-            let result = if let Some(mut c) = taken {
+            let mut c = new_client;
+            let result = {
                 let r = c.connect(Some(signal)).await;
                 // The connection has ended (shutdown signal or error): close the
                 // Lightstreamer session and drain its converter tasks, then drop
@@ -385,8 +376,6 @@ impl DynamicMarketStreamer {
                     tracing::error!("Error closing streamer session: {}", e);
                 }
                 r
-            } else {
-                Ok(())
             };
 
             // Mark as disconnected only if we are still the current generation.
@@ -474,26 +463,16 @@ impl DynamicMarketStreamer {
     /// streamer.disconnect().await?;
     /// ```
     pub async fn disconnect(&mut self) -> Result<(), AppError> {
-        // Signal shutdown to the current connection task; once its `connect`
-        // returns it closes the Lightstreamer session itself.
+        // Signal shutdown to the current connection task. The task owns its
+        // `StreamerClient` by value, so once its `connect` returns (woken by this
+        // signal's stored permit even if it has not started awaiting yet) it
+        // closes the Lightstreamer session itself. The guard is scoped so it is
+        // never held across an `.await`.
         {
             let shutdown_lock = self.shutdown_signal.read().await;
             if let Some(signal) = shutdown_lock.as_ref() {
                 signal.notify_one();
             }
-        }
-
-        // If the client is still owned here (the connection task has not taken
-        // it yet, or no connection was ever started), close it directly. During
-        // a live connection the task owns the client, so this take yields `None`
-        // and the task performs the close after being signalled above. The guard
-        // is scoped so it is never held across the `disconnect().await`.
-        let taken = {
-            let mut client_lock = self.client.write().await;
-            client_lock.take()
-        };
-        if let Some(mut client) = taken {
-            client.disconnect().await?;
         }
 
         *self.is_connected.write().await = false;
@@ -505,7 +484,6 @@ impl DynamicMarketStreamer {
 impl Clone for DynamicMarketStreamer {
     fn clone(&self) -> Self {
         Self {
-            client: Arc::clone(&self.client),
             epics: Arc::clone(&self.epics),
             fields: self.fields.clone(),
             price_tx: Arc::clone(&self.price_tx),
