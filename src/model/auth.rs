@@ -4,10 +4,38 @@
    Date: 19/10/25
 ******************************************************************************/
 use crate::application::auth::Session;
+use crate::constants::V2_SESSION_LIFETIME_SECS;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use tracing::warn;
+
+/// Reports whether the effective expiry (`created_at + lifetime - margin`) has
+/// been reached as of `now`, using checked `chrono` arithmetic throughout.
+///
+/// Timestamp math here is on protocol-state (session expiry), so overflow is
+/// never wrapped or silently truncated: any arithmetic overflow fails safe by
+/// reporting the token as expired (`true`), which triggers a refresh rather than
+/// trusting a bogus far-future expiry.
+#[must_use]
+#[inline]
+fn is_past_effective_expiry(
+    created_at: chrono::DateTime<Utc>,
+    lifetime_secs: i64,
+    margin_secs: i64,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let effective = chrono::Duration::try_seconds(lifetime_secs)
+        .and_then(|lifetime| created_at.checked_add_signed(lifetime))
+        .and_then(|expiry| {
+            chrono::Duration::try_seconds(margin_secs).and_then(|m| expiry.checked_sub_signed(m))
+        });
+    match effective {
+        Some(effective_expiry) => effective_expiry <= now,
+        // Overflow computing the effective expiry: treat as expired.
+        None => true,
+    }
+}
 
 /// Response from session creation endpoint
 ///
@@ -58,7 +86,14 @@ impl SessionResponse {
                     ),
                     None => (None, None),
                 };
-                let expires_at = (Utc::now().timestamp() + (3600 * 6)) as u64; // 6 hours from now
+                // Derive expiry from the token's own creation time and lifetime,
+                // staying consistent with `V2Response::is_expired` (which uses
+                // `created_at + expires_in`). Falls back to the full v2 lifetime
+                // when `expires_in` was not set on the response. Saturating math
+                // keeps a far-future / pre-epoch `created_at` from underflowing.
+                let lifetime = v.expires_in.unwrap_or(V2_SESSION_LIFETIME_SECS);
+                let created = u64::try_from(v.created_at.timestamp()).unwrap_or(0);
+                let expires_at = created.saturating_add(lifetime);
                 Session {
                     account_id: v.current_account_id.clone(),
                     client_id: v.client_id.clone(),
@@ -84,7 +119,7 @@ impl SessionResponse {
             }
             SessionResponse::V2(v) => {
                 v.set_security_headers(headers);
-                v.expires_in = Some(21600); // 6 hours
+                v.expires_in = Some(V2_SESSION_LIFETIME_SECS);
                 self.get_session()
             }
         }
@@ -158,6 +193,29 @@ impl fmt::Debug for OAuthToken {
 }
 
 impl OAuthToken {
+    /// Parses the IG `expires_in` field (seconds, delivered as a JSON string)
+    /// into an integer count of seconds.
+    ///
+    /// On a malformed value this falls back to `0`, which makes the token read
+    /// as already expired and forces a refresh — an observable, safe degradation
+    /// rather than a silent one. Because this is called on every expiry check, a
+    /// `WARN` (with the offending value, never the token itself) is emitted at
+    /// most **once per process** to surface the problem without spamming logs.
+    #[must_use]
+    #[inline]
+    fn expires_in_secs(&self) -> i64 {
+        self.expires_in.parse::<i64>().unwrap_or_else(|_| {
+            static MALFORMED_EXPIRES_IN_WARNED: std::sync::Once = std::sync::Once::new();
+            MALFORMED_EXPIRES_IN_WARNED.call_once(|| {
+                warn!(
+                    expires_in = %self.expires_in,
+                    "malformed expires_in; treating token as expired (further occurrences suppressed)"
+                );
+            });
+            0
+        })
+    }
+
     /// Checks if the OAuth token is expired or will expire soon
     ///
     /// # Arguments
@@ -168,12 +226,8 @@ impl OAuthToken {
     #[must_use]
     #[inline]
     pub fn is_expired(&self, margin_seconds: u64) -> bool {
-        let expires_in_secs = self.expires_in.parse::<i64>().unwrap_or(0);
-        let expiry_time = self.created_at + chrono::Duration::seconds(expires_in_secs);
-        let now = Utc::now();
-        let margin = chrono::Duration::seconds(margin_seconds as i64);
-
-        expiry_time - margin <= now
+        let margin = i64::try_from(margin_seconds).unwrap_or(i64::MAX);
+        is_past_effective_expiry(self.created_at, self.expires_in_secs(), margin, Utc::now())
     }
 
     /// Returns the Unix timestamp when the token expires (considering the margin)
@@ -182,17 +236,22 @@ impl OAuthToken {
     /// * `margin_seconds` - Safety margin in seconds before actual expiry
     ///
     /// # Returns
-    /// Unix timestamp (seconds since epoch) when the token should be considered expired
+    /// Unix timestamp (seconds since epoch) when the token should be considered
+    /// expired. Saturates to `0` (already expired) if the computed expiry is
+    /// before the Unix epoch or the arithmetic overflows.
     #[must_use]
     pub fn expire_at(&self, margin_seconds: i64) -> u64 {
-        let expires_in_secs = self.expires_in.parse::<i64>().unwrap_or(0);
-        let expiry_time = self.created_at + chrono::Duration::seconds(expires_in_secs);
-        let margin = chrono::Duration::seconds(margin_seconds);
+        let effective = chrono::Duration::try_seconds(self.expires_in_secs())
+            .and_then(|lifetime| self.created_at.checked_add_signed(lifetime))
+            .and_then(|expiry| {
+                chrono::Duration::try_seconds(margin_seconds)
+                    .and_then(|m| expiry.checked_sub_signed(m))
+            });
 
-        // Subtract margin to get the "effective" expiry time
-        let effective_expiry = expiry_time - margin;
-
-        effective_expiry.timestamp() as u64
+        match effective {
+            Some(effective_expiry) => u64::try_from(effective_expiry.timestamp()).unwrap_or(0),
+            None => 0,
+        }
     }
 }
 
@@ -259,10 +318,9 @@ impl V2Response {
     pub fn is_expired(&self, margin_seconds: u64) -> bool {
         match self.expires_in {
             Some(expires_in) => {
-                let expiry_time = self.created_at + chrono::Duration::seconds(expires_in as i64);
-                let now = Utc::now();
-                let margin = chrono::Duration::seconds(margin_seconds as i64);
-                expiry_time - margin <= now
+                let lifetime = i64::try_from(expires_in).unwrap_or(i64::MAX);
+                let margin = i64::try_from(margin_seconds).unwrap_or(i64::MAX);
+                is_past_effective_expiry(self.created_at, lifetime, margin, Utc::now())
             }
             // If expires_in was never set, treat as expired for safety
             None => true,
@@ -358,5 +416,97 @@ mod redaction_tests {
         assert!(!rendered.contains("SECRET-XST-VALUE"));
         assert!(!rendered.contains("SECRET-API-KEY-VALUE"));
         assert!(rendered.contains("<redacted>"));
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    fn oauth_token(expires_in: &str) -> OAuthToken {
+        OAuthToken {
+            access_token: "ACCESS".to_string(),
+            refresh_token: "REFRESH".to_string(),
+            scope: "read write".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: expires_in.to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_oauth_token_is_expired_malformed_expires_in_treated_expired() {
+        // A non-numeric `expires_in` must not panic; it falls back to 0 seconds
+        // of lifetime, so the token reads as already expired.
+        let token = oauth_token("not-a-number");
+        assert!(token.is_expired(60));
+    }
+
+    #[test]
+    fn test_oauth_token_is_expired_fresh_token_not_expired() {
+        // A freshly created 3600s token is well within its lifetime.
+        let token = oauth_token("3600");
+        assert!(!token.is_expired(60));
+    }
+
+    #[test]
+    fn test_oauth_token_expire_at_malformed_expires_in_saturates() {
+        // Malformed lifetime -> effective expiry at (created_at - margin), which
+        // is in the past; expire_at must not underflow into a huge u64.
+        let token = oauth_token("garbage");
+        let now = Utc::now().timestamp();
+        let expires_at = token.expire_at(1);
+        // Already-expired: the effective expiry is at or before "now".
+        assert!(expires_at <= u64::try_from(now).unwrap_or(0));
+    }
+
+    fn v2_response(expires_in: Option<u64>) -> V2Response {
+        V2Response {
+            account_type: "CFD".to_string(),
+            account_info: AccountInfo {
+                balance: 0.0,
+                deposit: 0.0,
+                profit_loss: 0.0,
+                available: 0.0,
+            },
+            currency_iso_code: "EUR".to_string(),
+            currency_symbol: "E".to_string(),
+            current_account_id: "ACC123".to_string(),
+            lightstreamer_endpoint: "https://demo-apd.marketdatasystems.com".to_string(),
+            accounts: Vec::new(),
+            client_id: "CLIENT1".to_string(),
+            timezone_offset: 1,
+            has_active_demo_accounts: true,
+            has_active_live_accounts: false,
+            trailing_stops_enabled: false,
+            rerouting_environment: None,
+            dealing_enabled: true,
+            security_headers: None,
+            expires_in,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_v2_session_expires_at_derived_from_created_at_plus_lifetime() {
+        // `expires_in` unset -> the full v2 lifetime is used, and expiry is
+        // derived from `created_at`, not the call-time clock.
+        let resp = v2_response(None);
+        let created = u64::try_from(resp.created_at.timestamp()).unwrap_or(0);
+        let session = SessionResponse::V2(resp).get_session();
+        assert_eq!(session.expires_at, created + V2_SESSION_LIFETIME_SECS);
+    }
+
+    #[test]
+    fn test_v2_response_is_expired_none_expires_in_treated_expired() {
+        // No `expires_in` recorded -> fail safe as expired.
+        let resp = v2_response(None);
+        assert!(resp.is_expired(300));
+    }
+
+    #[test]
+    fn test_v2_response_is_expired_fresh_lifetime_not_expired() {
+        let resp = v2_response(Some(V2_SESSION_LIFETIME_SECS));
+        assert!(!resp.is_expired(300));
     }
 }

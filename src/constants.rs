@@ -87,3 +87,32 @@ pub const DEFAULT_ORDER_BUY_LEVEL: f64 = 10000.0;
 /// configured, use whatever account the session lands on". Auth flows must not
 /// attempt to switch to this value.
 pub const DEFAULT_ACCOUNT_ID: &str = "default_account_id";
+
+/// Lifetime of an IG API v2 (CST / X-SECURITY-TOKEN) session, in seconds
+/// (21600 = 6 hours).
+///
+/// This is the single source of truth for the v2 session lifetime: the session
+/// `expires_at` is derived from `created_at + V2_SESSION_LIFETIME_SECS`, staying
+/// consistent with how [`crate::model::auth::V2Response::is_expired`] computes
+/// expiry. It replaces the previously duplicated `now + 3600 * 6` / `21600`
+/// literals.
+pub const V2_SESSION_LIFETIME_SECS: u64 = 21600;
+
+/// Proactive-refresh safety margin for API v2 (CST / X-SECURITY-TOKEN) sessions,
+/// in seconds (5 minutes).
+///
+/// v2 sessions live for [`V2_SESSION_LIFETIME_SECS`] (~6 hours), so a 5-minute
+/// lead time before expiry is ample without churning tokens. The *same* margin
+/// is used both to decide a refresh is due and to actually perform it, so the
+/// proactive refresh window is consistent (see
+/// [`crate::application::auth::Auth::get_session`]).
+pub const PROACTIVE_REFRESH_MARGIN_V2_SECS: u64 = 300;
+
+/// Proactive-refresh safety margin for API v3 (OAuth) sessions, in seconds.
+///
+/// v3 access tokens are short-lived (~60 seconds), so the v2 margin (300s) would
+/// keep them permanently "about to expire" and trigger a login on every call. A
+/// small 10-second margin is sized relative to the ~60s token lifetime: it still
+/// refreshes ahead of expiry without spinning. The *same* margin is used both to
+/// decide a refresh is due and to perform it.
+pub const PROACTIVE_REFRESH_MARGIN_V3_SECS: u64 = 10;

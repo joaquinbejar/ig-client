@@ -164,19 +164,36 @@ impl Session {
     #[inline]
     pub fn is_expired(&self, margin_seconds: Option<u64>) -> bool {
         let margin = margin_seconds.unwrap_or(60);
-        let now = Utc::now().timestamp() as u64;
-        now >= (self.expires_at - margin)
+        let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+        // Saturating: a large margin against a small `expires_at` must not
+        // underflow (debug panic / bogus huge threshold in release).
+        now >= self.expires_at.saturating_sub(margin)
     }
 
-    /// Gets the number of seconds until session expires
+    /// Gets the number of whole seconds until the session expires.
     ///
     /// # Returns
-    /// * Positive number if session is still valid
-    /// * Negative number if session is already expired
+    /// * The number of seconds remaining before expiry.
+    /// * `0` when the session is already expired — the result saturates at zero
+    ///   (a `u64` cannot be negative), so an expired session never reports a
+    ///   spuriously large remaining time.
     #[must_use]
     #[inline]
     pub fn seconds_until_expiry(&self) -> u64 {
-        self.expires_at - Utc::now().timestamp() as u64
+        let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+        self.expires_at.saturating_sub(now)
+    }
+
+    /// Returns the time remaining until the session expires as a
+    /// [`std::time::Duration`].
+    ///
+    /// # Returns
+    /// * The remaining time before expiry.
+    /// * [`std::time::Duration::ZERO`] when the session is already expired.
+    #[must_use]
+    #[inline]
+    pub fn time_until_expiry(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.seconds_until_expiry())
     }
 
     /// Checks if OAuth token needs refresh (alias for is_expired for backwards compatibility)
@@ -253,6 +270,30 @@ fn should_switch_account(api_version: u8, configured: &str, current: &str) -> bo
         && !configured.is_empty()
         && configured != crate::constants::DEFAULT_ACCOUNT_ID
         && configured != current
+}
+
+/// Selects the proactive-refresh safety margin (in seconds) for a session based
+/// on its authentication model.
+///
+/// v3 (OAuth) access tokens are short-lived (~60s), so the v2 margin would keep
+/// them permanently "about to expire" and force a login on every call; a small
+/// [`PROACTIVE_REFRESH_MARGIN_V3_SECS`](crate::constants::PROACTIVE_REFRESH_MARGIN_V3_SECS)
+/// margin is used instead. v2 (CST / X-SECURITY-TOKEN) sessions last ~6h, so the
+/// larger
+/// [`PROACTIVE_REFRESH_MARGIN_V2_SECS`](crate::constants::PROACTIVE_REFRESH_MARGIN_V2_SECS)
+/// margin gives ample lead time.
+///
+/// The *same* margin is used by both [`Auth::get_session`] (to decide a refresh
+/// is due) and [`Auth::refresh_token`] (to actually perform it), so the
+/// proactive-refresh window is consistent and always fires — the previous 300s /
+/// 1s mismatch meant the advertised margin never triggered a refresh.
+#[must_use]
+fn proactive_refresh_margin_secs(session: &Session) -> u64 {
+    if session.is_oauth() {
+        crate::constants::PROACTIVE_REFRESH_MARGIN_V3_SECS
+    } else {
+        crate::constants::PROACTIVE_REFRESH_MARGIN_V2_SECS
+    }
 }
 
 /// Authentication manager for IG Markets API
@@ -334,10 +375,14 @@ impl Auth {
         let session = self.session.read().await;
 
         if let Some(sess) = session.as_ref() {
-            // Check if OAuth token needs refresh
-            if sess.needs_token_refresh(Some(300)) {
+            // Refresh proactively once the session enters its refresh margin. The
+            // margin is derived from the session type so it matches the one
+            // `refresh_token` re-checks with — otherwise the refresh detour would
+            // hand back the same near-expired session (the old 300s/1s mismatch).
+            let margin = proactive_refresh_margin_secs(sess);
+            if sess.needs_token_refresh(Some(margin)) {
                 drop(session); // Release read lock
-                debug!("OAuth token needs refresh");
+                debug!(margin_secs = margin, "session within refresh margin");
                 return self.refresh_token().await;
             }
             return Ok(sess.clone());
@@ -531,13 +576,27 @@ impl Auth {
         Ok(session)
     }
 
-    /// Refreshes an expired OAuth token with automatic retry on rate limit
+    /// Proactively refreshes the session when it is within its refresh margin.
     ///
-    /// If refresh fails (e.g., refresh token expired), performs full re-authentication.
+    /// This is the *proactive* path (driven by the local clock). It re-checks the
+    /// cached session against the same margin
+    /// [`get_session`](Self::get_session) used to decide a refresh was due, so
+    /// the two stay consistent and the refresh actually fires when the session is
+    /// close to expiry. If the session is still comfortably valid it is returned
+    /// unchanged; otherwise a full [`login`](Self::login) is performed.
+    ///
+    /// For the reactive 401 / server-side-invalidation path — where the local
+    /// clock still considers the token valid but IG has already rejected it — use
+    /// [`force_refresh`](Self::force_refresh), which re-authenticates
+    /// unconditionally.
     ///
     /// # Returns
-    /// * `Ok(Session)` - New session with refreshed tokens
-    /// * `Err(AppError)` - If refresh and re-authentication both fail
+    /// * `Ok(Session)` - A valid session (refreshed if it was within margin).
+    /// * `Err(AppError)` - If re-authentication fails.
+    ///
+    /// # Errors
+    /// Returns [`AppError`] when a required login fails (network, credentials, or
+    /// rate limiting).
     pub async fn refresh_token(&self) -> Result<Session, AppError> {
         let current_session = {
             let session = self.session.read().await;
@@ -545,8 +604,15 @@ impl Auth {
         };
 
         if let Some(sess) = current_session {
-            if sess.is_expired(Some(1)) {
-                debug!("Session expired, performing login");
+            // Honour the SAME margin `get_session` used to route here, so a
+            // session inside the proactive window is actually re-authenticated
+            // instead of being handed back near-expired.
+            let margin = proactive_refresh_margin_secs(&sess);
+            if sess.is_expired(Some(margin)) {
+                debug!(
+                    margin_secs = margin,
+                    "session within refresh margin, logging in"
+                );
                 self.login().await
             } else {
                 Ok(sess)
@@ -555,6 +621,35 @@ impl Auth {
             warn!("No session to refresh, performing login");
             self.login().await
         }
+    }
+
+    /// Forces a fresh re-authentication regardless of local expiry state.
+    ///
+    /// This is the reactive 401 / server-side-invalidation path. When IG rejects
+    /// a token that the local clock still considers valid (server-side
+    /// invalidation, a concurrent login elsewhere, or clock skew), a proactive
+    /// [`refresh_token`](Self::refresh_token) would see a "valid" session and
+    /// hand back the *same* stale token, so the replayed request would fail
+    /// again. `force_refresh` ignores local expiry and performs a full
+    /// [`login`](Self::login), which fetches and stores a brand-new session.
+    ///
+    /// It cannot loop back through the 401 handler: [`login`](Self::login) issues
+    /// its HTTP requests through
+    /// [`make_http_request`](crate::model::http::make_http_request) directly, not
+    /// through the [`HttpClient`](crate::model::http::HttpClient) refresh-and-replay
+    /// path, so a 401 encountered *during* login surfaces as a typed error rather
+    /// than recursing into `force_refresh`.
+    ///
+    /// # Returns
+    /// * `Ok(Session)` - A freshly authenticated session with new tokens.
+    /// * `Err(AppError)` - If re-authentication fails.
+    ///
+    /// # Errors
+    /// Returns [`AppError`] when the login request fails (network, credentials,
+    /// or rate limiting).
+    pub async fn force_refresh(&self) -> Result<Session, AppError> {
+        debug!("forcing re-authentication, ignoring local expiry");
+        self.login().await
     }
 
     /// Switches to a different trading account
@@ -911,6 +1006,140 @@ mod session_lifecycle_tests {
         assert_eq!(ws.cst.as_deref(), Some("CST-TOKEN"));
         assert_eq!(ws.x_security_token.as_deref(), Some("XST-TOKEN"));
         assert!(ws.server.contains("demo-apd.marketdatasystems.com"));
+    }
+}
+
+#[cfg(test)]
+mod expiry_and_refresh_tests {
+    use super::*;
+
+    fn v2_session(expires_at: u64) -> Session {
+        Session {
+            account_id: "ACC123".to_string(),
+            client_id: "CLIENT1".to_string(),
+            lightstreamer_endpoint: "demo-apd.marketdatasystems.com".to_string(),
+            cst: Some("CST-TOKEN".to_string()),
+            x_security_token: Some("XST-TOKEN".to_string()),
+            oauth_token: None,
+            api_version: 2,
+            expires_at,
+        }
+    }
+
+    fn v3_session(expires_at: u64) -> Session {
+        Session {
+            account_id: "ACC123".to_string(),
+            client_id: "CLIENT1".to_string(),
+            lightstreamer_endpoint: "demo-apd.marketdatasystems.com".to_string(),
+            cst: None,
+            x_security_token: None,
+            oauth_token: Some(OAuthToken {
+                access_token: "ACCESS".to_string(),
+                refresh_token: "REFRESH".to_string(),
+                scope: "read write".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: "60".to_string(),
+                created_at: Utc::now(),
+            }),
+            api_version: 3,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn test_seconds_until_expiry_expired_session_returns_zero() {
+        // expires_at 100s in the past -> saturating to 0, never a huge u64.
+        let past = u64::try_from(Utc::now().timestamp())
+            .unwrap_or(0)
+            .saturating_sub(100);
+        let session = v2_session(past);
+        assert_eq!(session.seconds_until_expiry(), 0);
+    }
+
+    #[test]
+    fn test_seconds_until_expiry_valid_session_is_positive() {
+        let future = u64::try_from(Utc::now().timestamp())
+            .unwrap_or(0)
+            .saturating_add(3600);
+        let session = v2_session(future);
+        // Allow a small slack for the wall-clock read inside the method.
+        assert!(session.seconds_until_expiry() > 3500);
+    }
+
+    #[test]
+    fn test_time_until_expiry_expired_session_is_zero() {
+        let past = u64::try_from(Utc::now().timestamp())
+            .unwrap_or(0)
+            .saturating_sub(100);
+        let session = v2_session(past);
+        assert_eq!(session.time_until_expiry(), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_is_expired_large_margin_does_not_underflow() {
+        // Tiny expires_at with an enormous margin must not underflow / panic;
+        // it simply reports the session as expired.
+        let session = v2_session(1);
+        assert!(session.is_expired(Some(u64::MAX)));
+        assert!(session.is_expired(Some(1000)));
+    }
+
+    #[test]
+    fn test_is_expired_valid_session_within_margin_still_valid() {
+        let future = u64::try_from(Utc::now().timestamp())
+            .unwrap_or(0)
+            .saturating_add(3600);
+        let session = v2_session(future);
+        assert!(!session.is_expired(Some(60)));
+    }
+
+    #[test]
+    fn test_proactive_refresh_margin_v3_is_small_v2_is_large() {
+        let v3 = v3_session(0);
+        let v2 = v2_session(0);
+        assert_eq!(
+            proactive_refresh_margin_secs(&v3),
+            crate::constants::PROACTIVE_REFRESH_MARGIN_V3_SECS
+        );
+        assert_eq!(
+            proactive_refresh_margin_secs(&v2),
+            crate::constants::PROACTIVE_REFRESH_MARGIN_V2_SECS
+        );
+        // v3's short-lived tokens get a tighter margin than v2's 6h sessions.
+        assert!(proactive_refresh_margin_secs(&v3) < proactive_refresh_margin_secs(&v2));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_returns_cached_valid_session_without_login() {
+        // refresh_token has an expiry gate: a comfortably-valid session is
+        // returned unchanged, so no network login is attempted. This is the
+        // behaviour that differs from force_refresh (which always re-logs in).
+        let auth = Auth::new(Arc::new(Config::default()));
+        let future = u64::try_from(Utc::now().timestamp())
+            .unwrap_or(0)
+            .saturating_add(3600);
+        let seeded = v2_session(future);
+        {
+            let mut guard = auth.session.write().await;
+            *guard = Some(seeded);
+        }
+
+        let refreshed = match auth.refresh_token().await {
+            Ok(session) => session,
+            Err(e) => panic!("refresh_token should return the cached session: {e}"),
+        };
+        // Same cached tokens returned: no re-authentication happened.
+        assert_eq!(refreshed.account_id, "ACC123");
+        assert_eq!(refreshed.cst.as_deref(), Some("CST-TOKEN"));
+        assert_eq!(refreshed.expires_at, future);
+    }
+
+    #[test]
+    fn test_force_refresh_is_public_and_present() {
+        // Compile-time proof that the additive 401-path API exists. Invoking it
+        // would perform a real login, so it is not called here (no network in
+        // unit tests).
+        let _ = Auth::force_refresh;
     }
 }
 

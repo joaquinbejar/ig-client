@@ -181,8 +181,11 @@ impl HttpClient {
         {
             Ok(response) => self.parse_response(response).await,
             Err(AppError::OAuthTokenExpired) => {
-                warn!("OAuth token expired, refreshing and retrying");
-                self.auth.refresh_token().await?;
+                warn!("OAuth token expired, forcing refresh and retrying once");
+                // Force a fresh login: the server has invalidated the token even
+                // though the local clock may still consider it valid, so a
+                // proactive refresh could resend the same stale token.
+                self.auth.force_refresh().await?;
                 let response = self
                     .request_internal_with_delete_method(path, &body, version)
                     .await?;
@@ -206,8 +209,11 @@ impl HttpClient {
         {
             Ok(response) => self.parse_response(response).await,
             Err(AppError::OAuthTokenExpired) => {
-                warn!("OAuth token expired, refreshing and retrying");
-                self.auth.refresh_token().await?;
+                warn!("OAuth token expired, forcing refresh and retrying once");
+                // Force a fresh login so the single replay below never resends
+                // the same server-invalidated token. This match arm is not a
+                // loop: the replay happens exactly once.
+                self.auth.force_refresh().await?;
                 let response = self.request_internal(method, path, &body, version).await?;
                 self.parse_response(response).await
             }
