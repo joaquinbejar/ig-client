@@ -20,6 +20,7 @@ use crate::model::http::make_http_request;
 use crate::model::retry::RetryConfig;
 use chrono::Utc;
 use reqwest::{Client, Method};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -31,7 +32,7 @@ const USER_AGENT: &str = "ig-client/0.6.0";
 ///
 /// Contains the necessary credentials and endpoint information
 /// to establish a WebSocket connection to IG's Lightstreamer service.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct WebsocketInfo {
     /// Lightstreamer endpoint URL
     pub server: String,
