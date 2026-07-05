@@ -441,10 +441,14 @@ impl MarketDatabaseService {
         // `OPT_CURRENCIES`, `INDICES`) WITHOUT surrounding quotes. Using
         // `format!("{:?}", ..)` would emit the `DebugPretty` (serde_json)
         // rendering, which includes literal quotes (e.g. `"\"OPT_CURRENCIES\""`).
+        // `instrument_type` is NOT NULL and used for filtering, so never store an
+        // empty string: fall back to an explicit `UNKNOWN` sentinel if the enum
+        // ever fails to serialize to a string (structurally unreachable today,
+        // but a wrong-but-visible value beats a silent empty one).
         let instrument_type = serde_json::to_value(market.instrument_type)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_default();
+            .unwrap_or_else(|| "UNKNOWN".to_string());
 
         let mut instrument = MarketInstrument::new(
             market.epic.clone(),

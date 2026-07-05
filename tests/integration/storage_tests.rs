@@ -21,13 +21,18 @@ use sqlx::{PgPool, Row};
 
 /// Returns a pool when `DATABASE_URL` is set, otherwise `None` so the test
 /// skips instead of failing on CI machines with no database.
+///
+/// If `DATABASE_URL` **is** set but the connection fails, this panics rather
+/// than returning `None` — a broken DB configuration must surface as a failure
+/// when the ignored tests are run with `--ignored`, not silently pass.
 async fn test_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    sqlx::postgres::PgPoolOptions::new()
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&url)
         .await
-        .ok()
+        .expect("DATABASE_URL is set but the Postgres connection failed");
+    Some(pool)
 }
 
 fn sample_price(snapshot: &str) -> HistoricalPrice {

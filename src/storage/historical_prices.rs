@@ -60,7 +60,13 @@ pub async fn initialize_historical_prices_table(pool: &PgPool) -> Result<(), sql
     // are surfaced rather than silently discarded.
 
     // Drop the legacy two-column constraint if a pre-migration database has it.
-    // `IF EXISTS` makes this idempotent.
+    // `IF EXISTS` makes this idempotent. The target three-column constraint is
+    // NOT dropped here: `CREATE TABLE ... UNIQUE(epic, resolution, snapshot_time)`
+    // above already creates it (auto-named `historical_prices_epic_resolution_snapshot_time_key`),
+    // so dropping and re-adding it on every startup would churn an
+    // AccessExclusive lock for nothing. The tolerant ADD below handles both the
+    // fresh case (constraint already present → 42710 → skipped) and the migration
+    // case (old two-column DB whose legacy constraint was just dropped).
     sqlx::query(
         "ALTER TABLE historical_prices \
          DROP CONSTRAINT IF EXISTS historical_prices_epic_snapshot_time_key",
@@ -68,18 +74,9 @@ pub async fn initialize_historical_prices_table(pool: &PgPool) -> Result<(), sql
     .execute(pool)
     .await?;
 
-    // Drop the target constraint if present so it can be (re)created cleanly.
-    sqlx::query(
-        "ALTER TABLE historical_prices \
-         DROP CONSTRAINT IF EXISTS historical_prices_epic_resolution_snapshot_time_key",
-    )
-    .execute(pool)
-    .await?;
-
     // Add the three-column unique constraint. There is no `IF NOT EXISTS` for
-    // `ADD CONSTRAINT`; the preceding DROP normally clears the way, but tolerate
-    // a concurrent duplicate-object error (SQLSTATE 42710) while surfacing any
-    // other failure.
+    // `ADD CONSTRAINT`, so tolerate a duplicate-object error (SQLSTATE 42710)
+    // when it already exists while surfacing any other failure.
     if let Err(e) = sqlx::query(
         "ALTER TABLE historical_prices \
          ADD CONSTRAINT historical_prices_epic_resolution_snapshot_time_key \
