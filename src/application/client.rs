@@ -32,6 +32,7 @@ use crate::model::responses::{
 use crate::model::responses::{
     ClosePositionResponse, CreateOrderResponse, CreateWorkingOrderResponse, UpdatePositionResponse,
 };
+use crate::model::retry::backoff_delay;
 use crate::model::streaming::{
     StreamingAccountDataField, StreamingChartField, StreamingMarketField, StreamingPriceField,
     get_streaming_account_data_fields, get_streaming_chart_fields, get_streaming_market_fields,
@@ -50,6 +51,7 @@ use lightstreamer_rs::subscription::{
     ChannelSubscriptionListener, Snapshot, Subscription, SubscriptionMode,
 };
 use lightstreamer_rs::utils::setup_signal_hook;
+use reqwest::StatusCode;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -59,6 +61,32 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const MAX_CONNECTION_ATTEMPTS: u64 = 3;
+
+/// Returns `true` if an error from the order-confirmation endpoint is transient
+/// and worth polling again.
+///
+/// The IG `GET /confirms/{dealReference}` endpoint returns `404 Not Found` until
+/// the deal has been processed, so a not-found result means "not yet available"
+/// rather than a permanent failure. Transient cases retried by
+/// [`Client::get_order_confirmation_w_retry`]:
+///
+/// - [`AppError::RateLimitExceeded`] — rate limited.
+/// - [`AppError::Network`] — connection / transport error.
+/// - [`AppError::NotFound`] / [`AppError::Unexpected`] with a `404` or `5xx`
+///   status — confirmation not yet available or a server error.
+///
+/// Everything else (auth failures, invalid input, deserialization, 4xx client
+/// errors) is permanent and returned to the caller immediately.
+#[must_use]
+fn is_transient_confirmation_error(err: &AppError) -> bool {
+    match err {
+        AppError::RateLimitExceeded | AppError::Network(_) | AppError::NotFound => true,
+        AppError::Unexpected(status) => {
+            *status == StatusCode::NOT_FOUND || status.is_server_error()
+        }
+        _ => false,
+    }
+}
 
 /// Main client for interacting with IG Markets API
 ///
@@ -665,20 +693,36 @@ impl OrderService for Client {
         retries: u64,
         delay_ms: u64,
     ) -> Result<OrderConfirmationResponse, AppError> {
-        let mut attempts = 0;
+        // `delay_ms` is the backoff base; the actual per-attempt wait grows
+        // exponentially (with jitter) via the shared `RetryConfig` policy.
+        let base = Duration::from_millis(delay_ms);
+        let mut attempt: u32 = 0;
         loop {
             match self.get_order_confirmation(deal_reference).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
-                    attempts += 1;
-                    if attempts > retries {
+                    // Only poll again on transient errors; permanent failures
+                    // (auth, invalid input, deserialization) return immediately.
+                    if !is_transient_confirmation_error(&e) {
                         return Err(e);
                     }
+                    if u64::from(attempt) >= retries {
+                        return Err(e);
+                    }
+                    let delay = backoff_delay(base, attempt);
+                    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    let next_attempt = attempt.checked_add(1).ok_or_else(|| {
+                        AppError::Generic("retry attempt counter overflow".to_string())
+                    })?;
                     warn!(
-                        "Failed to get order confirmation (attempt {}/{}): {}. Retrying in {} ms...",
-                        attempts, retries, e, delay_ms
+                        deal_reference = %deal_reference,
+                        attempt = next_attempt,
+                        max_retries = retries,
+                        delay_ms,
+                        "retrying order confirmation after transient error"
                     );
-                    sleep(Duration::from_millis(delay_ms)).await;
+                    sleep(delay).await;
+                    attempt = next_attempt;
                 }
             }
         }
@@ -1767,5 +1811,59 @@ impl StreamerClient {
 
         info!("Disconnected {} streaming client(s)", disconnected);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_confirmation_error;
+    use crate::error::AppError;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn test_confirmation_error_rate_limit_is_transient() {
+        assert!(is_transient_confirmation_error(
+            &AppError::RateLimitExceeded
+        ));
+    }
+
+    #[test]
+    fn test_confirmation_error_not_found_is_transient() {
+        // Confirmation not yet available: IG returns 404 until the deal settles.
+        assert!(is_transient_confirmation_error(&AppError::NotFound));
+        assert!(is_transient_confirmation_error(&AppError::Unexpected(
+            StatusCode::NOT_FOUND
+        )));
+    }
+
+    #[test]
+    fn test_confirmation_error_server_error_is_transient() {
+        assert!(is_transient_confirmation_error(&AppError::Unexpected(
+            StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(is_transient_confirmation_error(&AppError::Unexpected(
+            StatusCode::BAD_GATEWAY
+        )));
+    }
+
+    #[test]
+    fn test_confirmation_error_invalid_input_is_permanent() {
+        assert!(!is_transient_confirmation_error(&AppError::InvalidInput(
+            "bad".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_confirmation_error_auth_and_deser_are_permanent() {
+        assert!(!is_transient_confirmation_error(&AppError::Unauthorized));
+        assert!(!is_transient_confirmation_error(
+            &AppError::OAuthTokenExpired
+        ));
+        assert!(!is_transient_confirmation_error(
+            &AppError::Deserialization("bad".to_string())
+        ));
+        assert!(!is_transient_confirmation_error(&AppError::Unexpected(
+            StatusCode::BAD_REQUEST
+        )));
     }
 }
