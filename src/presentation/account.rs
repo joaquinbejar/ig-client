@@ -251,22 +251,12 @@ impl Position {
     ///
     /// # Logic
     ///
-    /// - If `self.pnl` is available, it directly returns the cached value.
-    /// - If not, the PnL is calculated based on the direction of the position:
-    ///   - For a Buy position:
-    ///     - The PnL is calculated as the difference between the `current_value`
-    ///       (based on the `market.bid` price or fallback value) and the original
-    ///       `value` (based on the position's size and level).
-    ///   - For a Sell position:
-    ///     - The PnL is calculated as the difference between the original
-    ///       `value` and the `current_value` (based on the `market.offer`
-    ///       price or fallback value).
-    ///
-    /// # Assumptions
-    /// - The `market.bid` and `market.offer` values are optional, so fallback
-    ///   to the original position value is used if they are unavailable.
-    /// - `self.position.direction` must be either `Direction::Buy` or
-    ///   `Direction::Sell`.
+    /// - If `self.pnl` is set, the cached value is returned directly.
+    /// - Otherwise it delegates to [`Position::pnl_checked`], which marks a Buy
+    ///   against `market.bid` and a Sell against `market.offer`. When the
+    ///   direction's market price is unavailable there is no basis for a P&L, so
+    ///   this returns `0.0` (use [`Position::pnl_checked`] to distinguish the
+    ///   unknown case as `None`).
     ///
     #[must_use]
     pub fn pnl(&self) -> f64 {
@@ -300,31 +290,17 @@ impl Position {
         Some(price_diff * self.position.size)
     }
 
-    /// Updates the profit and loss (PnL) for the current position in the market.
+    /// Updates the cached profit and loss (PnL) for the current position from
+    /// current market prices.
     ///
-    /// The method calculates the PnL based on the position's direction (Buy or Sell),
-    /// size, level (entry price), and the current bid or offer price from the market data.
-    /// The result is stored in the `pnl` field.
+    /// Delegates to [`Position::pnl_checked`] (a Buy marked against `market.bid`,
+    /// a Sell against `market.offer`) and stores the result in `self.pnl`. When
+    /// the direction's market price is unavailable there is no basis for a P&L,
+    /// so `0.0` is stored.
     ///
-    /// # Calculation:
-    /// - If the position is a Buy:
-    ///     - Calculate the initial value of the position as `size * level`.
-    ///     - Calculate the current value of the position using the current `bid` price from the market,
-    ///       or use the initial value if the `bid` price is not available.
-    ///     - PnL is the difference between the current value and the initial value.
-    /// - If the position is a Sell:
-    ///     - Calculate the initial value of the position as `size * level`.
-    ///     - Calculate the current value of the position using the current `offer` price from the market,
-    ///       or use the initial value if the `offer` price is not available.
-    ///     - PnL is the difference between the initial value and the current value.
-    ///
-    /// # Fields Updated:
-    /// - `self.pnl`: The calculated profit or loss is updated in this field. If no valid market price
-    ///   (bid/offer) is available, `pnl` will be calculated based on the initial value.
-    ///
-    /// # Panics:
-    /// This function does not explicitly panic but relies on the `unwrap_or` method to handle cases
-    /// where the `bid` or `offer` is unavailable. It assumes that the market or position data are initialized correctly.
+    /// # Fields Updated
+    /// - `self.pnl`: set to `Some(pnl)`, or `Some(0.0)` when the required market
+    ///   price is missing.
     ///
     pub fn update_pnl(&mut self) {
         // Store the market-derived P&L (0.0 when the direction's price is
