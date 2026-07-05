@@ -367,10 +367,19 @@ impl HttpClient {
 }
 
 impl Default for HttpClient {
+    /// Creates a lazily-authenticated client with the default configuration.
+    ///
+    /// # Panics
+    /// Panics if the underlying HTTP client cannot be constructed via
+    /// [`HttpClient::new_lazy`], which happens only when the system TLS backend
+    /// fails to initialize — an unrecoverable startup invariant. Callers that
+    /// need to handle that case gracefully should call
+    /// [`HttpClient::new_lazy`] directly and propagate the returned
+    /// [`AppError`] with `?`.
     fn default() -> Self {
         let config = Config::default();
-        // SAFETY: Default TLS configuration should always succeed.
-        // This only fails if the system has no TLS backend, which is unrecoverable.
+        // The default TLS configuration should always succeed; this only fails
+        // if the system has no usable TLS backend, which is unrecoverable.
         Self::new_lazy(config).expect("failed to create default HTTP client")
     }
 }

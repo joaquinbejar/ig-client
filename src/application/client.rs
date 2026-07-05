@@ -4,6 +4,7 @@
    Date: 19/10/25
 ******************************************************************************/
 use crate::application::auth::WebsocketInfo;
+use crate::application::config::Config;
 use crate::application::interfaces::account::AccountService;
 use crate::application::interfaces::costs::CostsService;
 use crate::application::interfaces::market::MarketService;
@@ -101,9 +102,34 @@ impl Client {
     ///
     /// # Returns
     /// A new Client with default configuration
+    ///
+    /// # Panics
+    /// Panics only if the underlying [`HttpClient`] cannot be constructed,
+    /// which happens exclusively when the system TLS backend fails to
+    /// initialize at startup — an unrecoverable environment invariant. For
+    /// graceful handling of that case use [`Client::try_new`], which returns a
+    /// typed [`AppError`] instead of panicking.
     pub fn new() -> Self {
-        let http_client = Arc::new(HttpClient::default());
-        Self { http_client }
+        Self::try_new().expect("failed to create HTTP client")
+    }
+
+    /// Creates a new client instance without performing initial authentication,
+    /// returning an error if the underlying HTTP client cannot be constructed.
+    ///
+    /// This is the fallible counterpart to [`Client::new`]: it builds the
+    /// underlying [`HttpClient`] via [`HttpClient::new_lazy`] and surfaces a
+    /// client-construction failure as a typed [`AppError`] instead of panicking.
+    ///
+    /// # Returns
+    /// * `Ok(Client)` - A client ready to use with the default configuration.
+    /// * `Err(AppError)` - If the underlying HTTP client cannot be constructed.
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
+    /// be built (e.g. the system TLS backend fails to initialize).
+    pub fn try_new() -> Result<Self, AppError> {
+        let http_client = Arc::new(HttpClient::new_lazy(Config::default())?);
+        Ok(Self { http_client })
     }
 
     /// Gets WebSocket connection information for Lightstreamer, reusing the

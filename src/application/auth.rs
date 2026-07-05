@@ -296,6 +296,29 @@ fn proactive_refresh_margin_secs(session: &Session) -> u64 {
     }
 }
 
+/// Ensures a v3 (OAuth) login actually produced an OAuth session.
+///
+/// The v3 `/session` endpoint is expected to return an OAuth body. Because
+/// [`SessionResponse`] is untagged, a v2-shaped body sent to the v3 request
+/// still deserializes successfully — as a v2 session carrying no OAuth token.
+/// That is a server-side / protocol mismatch, not a client bug. On the reactive
+/// [`force_refresh`](Auth::force_refresh) -> [`login`](Auth::login) path a 401
+/// reaches this code more often, so a mismatched body must surface as a typed
+/// error rather than panic.
+///
+/// The offending response body / token is never logged.
+///
+/// # Errors
+/// Returns [`AppError::Unauthorized`] when the session lacks an OAuth token.
+fn ensure_oauth_session(session: Session) -> Result<Session, AppError> {
+    if session.is_oauth() {
+        Ok(session)
+    } else {
+        error!("v3 login response did not contain an OAuth token");
+        Err(AppError::Unauthorized)
+    }
+}
+
 /// Authentication manager for IG Markets API
 ///
 /// Handles all authentication operations including:
@@ -316,20 +339,41 @@ impl Auth {
     ///
     /// # Arguments
     /// * `config` - Configuration containing credentials and API settings
+    ///
+    /// # Panics
+    /// Panics only if the underlying `reqwest` client cannot be constructed,
+    /// which happens exclusively when the system TLS backend fails to
+    /// initialize at startup — an unrecoverable environment invariant. For
+    /// graceful handling of that case use [`Auth::try_new`], which returns a
+    /// typed [`AppError`] instead of panicking.
     pub fn new(config: Arc<Config>) -> Self {
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .build()
-            .expect("Failed to create HTTP client");
+        Self::try_new(config).expect("Failed to create HTTP client")
+    }
+
+    /// Creates a new Auth instance, returning an error if the HTTP client
+    /// cannot be constructed.
+    ///
+    /// This is the fallible counterpart to [`Auth::new`]: it surfaces a TLS /
+    /// client-builder failure as a typed [`AppError`] instead of panicking, so
+    /// callers can handle a broken TLS backend gracefully.
+    ///
+    /// # Arguments
+    /// * `config` - Configuration containing credentials and API settings
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
+    /// be built (e.g. the system TLS backend fails to initialize).
+    pub fn try_new(config: Arc<Config>) -> Result<Self, AppError> {
+        let client = Client::builder().user_agent(USER_AGENT).build()?;
 
         let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(&config.rate_limiter)));
 
-        Self {
+        Ok(Self {
             config,
             client,
             session: Arc::new(RwLock::new(None)),
             rate_limiter,
-        }
+        })
     }
 
     /// Gets WebSocket connection information for Lightstreamer, reusing the
@@ -571,9 +615,9 @@ impl Auth {
             session.account_id = self.config.credentials.account_id.clone();
         };
 
-        assert!(session.is_oauth());
-
-        Ok(session)
+        // A v2-shaped body on the v3 path (server-side mismatch) must not panic;
+        // surface it as a typed error instead.
+        ensure_oauth_session(session)
     }
 
     /// Proactively refreshes the session when it is within its refresh margin.
@@ -1140,6 +1184,58 @@ mod expiry_and_refresh_tests {
         // would perform a real login, so it is not called here (no network in
         // unit tests).
         let _ = Auth::force_refresh;
+    }
+}
+
+#[cfg(test)]
+mod oauth_login_guard_tests {
+    use super::*;
+
+    // Captured real IG demo v2 `/session` body (same shape as the existing
+    // deserialization tests). Deserialized through the untagged
+    // `SessionResponse` it lands on the V2 variant, so the derived session
+    // carries no OAuth token — exactly the mismatch `login_oauth` must reject.
+    const V2_BODY: &str = r#"{"accountType":"CFD","accountInfo":{"balance":21065.86,"deposit":3033.31,"profitLoss":-285.27,"available":16659.01},"currencyIsoCode":"EUR","currencySymbol":"E","currentAccountId":"ZZZZZ","lightstreamerEndpoint":"https://demo-apd.marketdatasystems.com","accounts":[{"accountId":"Z405P5","accountName":"Turbo24","preferred":false,"accountType":"PHYSICAL"},{"accountId":"ZHJ5N","accountName":"DEMO_A","preferred":false,"accountType":"CFD"},{"accountId":"ZZZZZ","accountName":"Opciones","preferred":true,"accountType":"CFD"}],"clientId":"101290216","timezoneOffset":1,"hasActiveDemoAccounts":true,"hasActiveLiveAccounts":true,"trailingStopsEnabled":false,"reroutingEnvironment":null,"dealingEnabled":true}"#;
+
+    #[test]
+    fn test_ensure_oauth_session_v2_body_on_v3_path_yields_unauthorized()
+    -> Result<(), serde_json::Error> {
+        // Deserialize a v2-shaped body the way `login_oauth` does after a v3
+        // request, then run it through the same guard.
+        let response: SessionResponse = serde_json::from_str(V2_BODY)?;
+        let session = response.get_session();
+        // A v2 body carries no OAuth token.
+        assert!(!session.is_oauth());
+
+        // The guard maps this to a typed error instead of panicking (the old
+        // `assert!(session.is_oauth())` would have aborted here).
+        match ensure_oauth_session(session) {
+            Err(AppError::Unauthorized) => Ok(()),
+            other => panic!("expected AppError::Unauthorized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ensure_oauth_session_oauth_body_passes_through() {
+        // A genuine v3 session passes the guard unchanged.
+        let session = Session {
+            account_id: "ACC123".to_string(),
+            client_id: "CLIENT1".to_string(),
+            lightstreamer_endpoint: "demo-apd.marketdatasystems.com".to_string(),
+            cst: None,
+            x_security_token: None,
+            oauth_token: Some(OAuthToken {
+                access_token: "ACCESS".to_string(),
+                refresh_token: "REFRESH".to_string(),
+                scope: "read write".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: "60".to_string(),
+                created_at: Utc::now(),
+            }),
+            api_version: 3,
+            expires_at: 0,
+        };
+        assert!(ensure_oauth_session(session).is_ok());
     }
 }
 

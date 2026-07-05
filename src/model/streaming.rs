@@ -78,24 +78,12 @@ impl Display for StreamingMarketField {
 ///
 /// # Returns
 ///
-/// A `Vec<String>` where each `String` is a serialized representation of a `StreamingMarketField` from the input set.
-///
-/// # Panics
-///
-/// This function will panic if the serialization of any `StreamingMarketField` fails.
-///
+/// A `Vec<String>` where each `String` is the exact IG Lightstreamer wire name
+/// of a `StreamingMarketField` from the input set.
 pub(crate) fn get_streaming_market_fields(fields: &HashSet<StreamingMarketField>) -> Vec<String> {
-    let mut fields_vec = Vec::new();
-    for field in fields {
-        // Serialize to a JSON value and extract the underlying string without quotes
-        let val = serde_json::to_value(field).expect("Failed to serialize StreamingMarketField");
-        match val {
-            serde_json::Value::String(s) => fields_vec.push(s),
-            // Fallback: use Debug which yields SCREAMING_SNAKE_CASE variant name
-            _ => fields_vec.push(format!("{:?}", field)),
-        }
-    }
-    fields_vec
+    // `Display` (via the `Debug` impl above) emits the exact IG Lightstreamer
+    // wire field name for every variant, so no fallible serialization is needed.
+    fields.iter().map(|field| field.to_string()).collect()
 }
 
 /// Streaming price fields available for price subscriptions.
@@ -594,25 +582,14 @@ impl Display for StreamingAccountDataField {
 ///
 /// # Returns
 ///
-/// A `Vec<String>` where each `String` is a serialized representation of a `StreamingAccountDataField` from the input set.
-///
-/// # Panics
-///
-/// This function will panic if the serialization of any `StreamingAccountDataField` fails.
-///
+/// A `Vec<String>` where each `String` is the exact IG Lightstreamer wire name
+/// of a `StreamingAccountDataField` from the input set.
 pub(crate) fn get_streaming_account_data_fields(
     fields: &HashSet<StreamingAccountDataField>,
 ) -> Vec<String> {
-    let mut fields_vec = Vec::new();
-    for field in fields {
-        let val =
-            serde_json::to_value(field).expect("Failed to serialize StreamingAccountDataField");
-        match val {
-            serde_json::Value::String(s) => fields_vec.push(s),
-            _ => fields_vec.push(format!("{:?}", field)),
-        }
-    }
-    fields_vec
+    // `Display` (via the `Debug` impl above) emits the exact IG Lightstreamer
+    // wire field name for every variant, so no fallible serialization is needed.
+    fields.iter().map(|field| field.to_string()).collect()
 }
 
 /// Streaming chart fields available for chart subscriptions (tick and candle).
@@ -729,21 +706,12 @@ impl std::fmt::Display for StreamingChartField {
 ///
 /// # Returns
 ///
-/// A `Vec<String>` of serialized field names for Lightstreamer subscriptions.
-///
-/// # Panics
-///
-/// Panics if serialization of any field fails.
+/// A `Vec<String>` of exact IG Lightstreamer wire field names for
+/// subscriptions.
 pub(crate) fn get_streaming_chart_fields(fields: &HashSet<StreamingChartField>) -> Vec<String> {
-    let mut out = Vec::with_capacity(fields.len());
-    for field in fields {
-        let val = serde_json::to_value(field).expect("Failed to serialize StreamingChartField");
-        match val {
-            serde_json::Value::String(s) => out.push(s),
-            _ => out.push(format!("{:?}", field)),
-        }
-    }
-    out
+    // `Display` (via the `Debug` impl above) emits the exact IG Lightstreamer
+    // wire field name for every variant, so no fallible serialization is needed.
+    fields.iter().map(|field| field.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -815,6 +783,22 @@ mod tests {
         assert!(result.contains(&"BID".to_string()));
         assert!(result.contains(&"OFFER".to_string()));
         assert!(result.contains(&"HIGH".to_string()));
+    }
+
+    #[test]
+    fn test_get_streaming_account_data_fields_wire_names() {
+        // Pins the exact IG Lightstreamer wire names produced by the getter
+        // after replacing the serde_json round-trip with Display, so a future
+        // divergence between Display and the wire contract fails loudly.
+        let mut fields = HashSet::new();
+        fields.insert(StreamingAccountDataField::Pnl);
+        fields.insert(StreamingAccountDataField::AvailableCash);
+        fields.insert(StreamingAccountDataField::PnlLr);
+        let result = get_streaming_account_data_fields(&fields);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&"PNL".to_string()));
+        assert!(result.contains(&"AVAILABLE_CASH".to_string()));
+        assert!(result.contains(&"PNL_LR".to_string()));
     }
 
     #[test]
