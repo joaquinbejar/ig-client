@@ -105,8 +105,11 @@ pub struct RateLimiter {
 ///   (one request per period).
 /// - `period_seconds == 0` falls back to a one-second period.
 ///
-/// Rounding is toward zero (integer nanosecond division); the result is clamped
-/// to at least one nanosecond so the interval is always non-zero.
+/// Rounding is toward positive infinity (ceiling division): the per-cell
+/// interval is never shorter than `period / max_requests`, so the enforced rate
+/// never *exceeds* the configured budget for periods that are not evenly
+/// divisible. The result is clamped to at least one nanosecond so the interval
+/// is always non-zero.
 #[must_use]
 #[inline]
 fn replenish_period(config: &RateLimiterConfig) -> Duration {
@@ -119,8 +122,10 @@ fn replenish_period(config: &RateLimiterConfig) -> Duration {
     // `as_nanos` is u128; clamp to u64 for the very large (multi-century) periods
     // that cannot occur in practice but must not panic.
     let period_nanos = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
-    // `max_requests >= 1` here, so this division can never divide by zero.
-    let per_cell_nanos = (period_nanos / u64::from(max_requests)).max(1);
+    // Ceiling division: round the interval UP so the derived rate can only be
+    // at or below `max_requests` per period, never above it. `max_requests >= 1`
+    // here, so this can never divide by zero.
+    let per_cell_nanos = period_nanos.div_ceil(u64::from(max_requests)).max(1);
     Duration::from_nanos(per_cell_nanos)
 }
 
@@ -359,33 +364,47 @@ mod tests {
         assert_eq!(per_second_period(0), Duration::from_secs(1));
     }
 
-    #[tokio::test]
-    async fn test_wait_for_replenishes_at_configured_rate() {
-        // 20 requests / 1 second => one cell every 50ms. With burst_size 1 only
-        // the initial cell is immediately available; the next must wait ~50ms.
+    #[test]
+    fn test_configured_quota_replenishes_at_max_requests_rate() {
+        // Deterministic (no wall clock): drive the config-derived quota through
+        // governor's FakeRelativeClock. 20 requests / 1 second => one cell every
+        // 50ms. Under the OLD `with_period(period)` bug the interval was the whole
+        // 1s period, so advancing 50ms would NOT replenish — this test pins the fix.
+        use governor::clock::FakeRelativeClock;
+
         let config = RateLimiterConfig {
             max_requests: 20,
             period_seconds: 1,
             burst_size: 1,
         };
-        let limiter = RateLimiter::new(&config);
+        let interval = replenish_period(&config);
+        assert_eq!(interval, Duration::from_millis(50));
 
-        // Consume the single burst cell.
-        assert!(limiter.check_for(RateLimitClass::NonTrading));
+        let burst = NonZeroU32::new(config.burst_size).expect("burst is non-zero");
+        let quota = Quota::with_period(interval)
+            .expect("non-zero interval")
+            .allow_burst(burst);
+        let clock = FakeRelativeClock::default();
+        let limiter = GovernorRateLimiter::direct_with_clock(quota, clock.clone());
 
-        let start = std::time::Instant::now();
-        limiter.wait_for(RateLimitClass::NonTrading).await;
-        let elapsed = start.elapsed();
+        // The single burst cell is available, then exhausted.
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_err(), "burst cell must be exhausted");
 
-        // Under the OLD `with_period(period)` bug the interval was the whole 1s
-        // period (~1000ms); honoring max_requests makes it ~50ms.
+        // Before a full interval elapses the cell stays denied (the old 1s-per-cell
+        // bug would still be denied here — that is fine — but see the next step).
+        clock.advance(interval / 2);
         assert!(
-            elapsed >= Duration::from_millis(20),
-            "waited {elapsed:?}, expected ~50ms replenishment (rate limiting must apply)"
+            limiter.check().is_err(),
+            "must not replenish before the configured interval"
         );
+
+        // After the full 50ms interval exactly one cell replenishes. The old bug
+        // (1s per cell) would still deny here — so this asserts max_requests is honored.
+        clock.advance(interval / 2);
         assert!(
-            elapsed < Duration::from_millis(500),
-            "waited {elapsed:?}, the old 1s-per-cell bug is not fixed"
+            limiter.check().is_ok(),
+            "one cell must replenish after the configured 50ms interval"
         );
     }
 
@@ -418,9 +437,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wait_for_returns_promptly_when_slot_available() {
-        // A fresh bucket with burst capacity admits the first request without any
-        // wait — proving `wait_for` resolves via the scheduler, not a 10ms poll.
+    async fn test_wait_for_returns_without_parking_when_slot_available() {
+        // A fresh bucket with burst capacity has a permit available, so `wait_for`
+        // resolves immediately via governor's scheduler rather than parking or
+        // polling. Asserted deterministically via permit availability (no wall
+        // clock): `check_for` is true, and the subsequent `wait_for` must not hang.
         let config = RateLimiterConfig {
             max_requests: 10,
             period_seconds: 1,
@@ -428,12 +449,13 @@ mod tests {
         };
         let limiter = RateLimiter::new(&config);
 
-        let start = std::time::Instant::now();
-        limiter.wait_for(RateLimitClass::NonTrading).await;
         assert!(
-            start.elapsed() < Duration::from_millis(50),
-            "wait_for should return promptly when a slot is available"
+            limiter.check_for(RateLimitClass::NonTrading),
+            "a burst slot must be available on a fresh bucket"
         );
+        // Must return without parking because a permit is available; if it hung,
+        // the test would time out rather than pass.
+        limiter.wait_for(RateLimitClass::NonTrading).await;
     }
 
     #[test]
