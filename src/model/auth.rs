@@ -196,18 +196,22 @@ impl OAuthToken {
     /// Parses the IG `expires_in` field (seconds, delivered as a JSON string)
     /// into an integer count of seconds.
     ///
-    /// On a malformed value this emits a single `WARN` (with the offending
-    /// value, never the token itself) and falls back to `0`, which makes the
-    /// token read as already expired and forces a refresh — an observable,
-    /// safe degradation rather than a silent one.
+    /// On a malformed value this falls back to `0`, which makes the token read
+    /// as already expired and forces a refresh — an observable, safe degradation
+    /// rather than a silent one. Because this is called on every expiry check, a
+    /// `WARN` (with the offending value, never the token itself) is emitted at
+    /// most **once per process** to surface the problem without spamming logs.
     #[must_use]
     #[inline]
     fn expires_in_secs(&self) -> i64 {
         self.expires_in.parse::<i64>().unwrap_or_else(|_| {
-            warn!(
-                expires_in = %self.expires_in,
-                "malformed expires_in; treating token as expired"
-            );
+            static MALFORMED_EXPIRES_IN_WARNED: std::sync::Once = std::sync::Once::new();
+            MALFORMED_EXPIRES_IN_WARNED.call_once(|| {
+                warn!(
+                    expires_in = %self.expires_in,
+                    "malformed expires_in; treating token as expired (further occurrences suppressed)"
+                );
+            });
             0
         })
     }
