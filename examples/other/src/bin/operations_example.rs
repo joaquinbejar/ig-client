@@ -30,7 +30,7 @@ async fn main() -> Result<(), AppError> {
 
     match client.get_client_apps().await {
         Ok(app) => {
-            println!("API Key: {}", app.api_key);
+            println!("API Key: <redacted>");
             println!("Name: {}", app.name.as_deref().unwrap_or("N/A"));
             println!("Status: {}", app.status);
             if let Some(overall) = app.allowance_account_overall {

@@ -6,6 +6,7 @@
 use crate::application::auth::Session;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tracing::warn;
 
 /// Response from session creation endpoint
@@ -120,7 +121,11 @@ pub struct V3Response {
 }
 
 /// OAuth token information returned by API v3
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+///
+/// `Deserialize` / `Serialize` behaviour is unchanged so real IG payloads still
+/// round-trip; only the `Debug` representation is overridden to redact the
+/// `access_token` and `refresh_token`.
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 pub struct OAuthToken {
     /// OAuth access token
     pub access_token: String,
@@ -135,6 +140,21 @@ pub struct OAuthToken {
     /// Timestamp when this token was created (for expiry calculation)
     #[serde(skip, default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<Utc>,
+}
+
+// Manual redacting `Debug` — `access_token` / `refresh_token` are credentials
+// and must never appear in logs, panics or `Debug` output.
+impl fmt::Debug for OAuthToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthToken")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 impl OAuthToken {
@@ -251,7 +271,7 @@ impl V2Response {
 }
 
 /// Security headers for API v2 authentication
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SecurityHeaders {
     /// Client Session Token
     pub cst: String,
@@ -259,6 +279,18 @@ pub struct SecurityHeaders {
     pub x_security_token: String,
     /// API key for the application
     pub x_ig_api_key: String,
+}
+
+// Manual redacting `Debug` — every field here (CST, X-SECURITY-TOKEN and the
+// API key) is a credential, so all three are masked.
+impl fmt::Debug for SecurityHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecurityHeaders")
+            .field("cst", &"<redacted>")
+            .field("x_security_token", &"<redacted>")
+            .field("x_ig_api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Account balance information
@@ -287,4 +319,44 @@ pub struct Account {
     pub preferred: bool,
     /// Account type (e.g., "CFD", "SPREADBET")
     pub account_type: String,
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn test_oauth_token_debug_redacts_tokens() {
+        let token = OAuthToken {
+            access_token: "SECRET-ACCESS-VALUE".to_string(),
+            refresh_token: "SECRET-REFRESH-VALUE".to_string(),
+            scope: "read write".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: "60".to_string(),
+            created_at: Utc::now(),
+        };
+        let rendered = format!("{token:?}");
+
+        assert!(!rendered.contains("SECRET-ACCESS-VALUE"));
+        assert!(!rendered.contains("SECRET-REFRESH-VALUE"));
+        assert!(rendered.contains("<redacted>"));
+        // Non-secret fields stay visible.
+        assert!(rendered.contains("Bearer"));
+        assert!(rendered.contains("read write"));
+    }
+
+    #[test]
+    fn test_security_headers_debug_redacts_tokens() {
+        let headers = SecurityHeaders {
+            cst: "SECRET-CST-VALUE".to_string(),
+            x_security_token: "SECRET-XST-VALUE".to_string(),
+            x_ig_api_key: "SECRET-API-KEY-VALUE".to_string(),
+        };
+        let rendered = format!("{headers:?}");
+
+        assert!(!rendered.contains("SECRET-CST-VALUE"));
+        assert!(!rendered.contains("SECRET-XST-VALUE"));
+        assert!(!rendered.contains("SECRET-API-KEY-VALUE"));
+        assert!(rendered.contains("<redacted>"));
+    }
 }

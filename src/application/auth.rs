@@ -18,11 +18,10 @@ use crate::error::AppError;
 pub(crate) use crate::model::auth::{OAuthToken, SecurityHeaders, SessionResponse};
 use crate::model::http::make_http_request;
 use crate::model::retry::RetryConfig;
-use crate::prelude::Deserialize;
 use chrono::Utc;
-use pretty_simple_display::{DebugPretty, DisplaySimple};
 use reqwest::{Client, Method};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -33,7 +32,7 @@ const USER_AGENT: &str = "ig-client/0.6.0";
 ///
 /// Contains the necessary credentials and endpoint information
 /// to establish a WebSocket connection to IG's Lightstreamer service.
-#[derive(DebugPretty, Clone, Default, Serialize, Deserialize, DisplaySimple)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct WebsocketInfo {
     /// Lightstreamer endpoint URL
     pub server: String,
@@ -43,6 +42,48 @@ pub struct WebsocketInfo {
     pub x_security_token: Option<String>,
     /// Account ID for the WebSocket connection
     pub account_id: String,
+}
+
+/// Renders an optional secret as `Some(<redacted>)` / `None`, never exposing
+/// the underlying token value in `Debug` / `Display` output or logs.
+struct RedactedOption<'a>(&'a Option<String>);
+
+impl fmt::Debug for RedactedOption<'_> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("Some(<redacted>)"),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+// Manual redacting `Debug` — `cst` / `x_security_token` are credentials and
+// must never reach logs or panics. All non-secret fields stay visible.
+impl fmt::Debug for WebsocketInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebsocketInfo")
+            .field("server", &self.server)
+            .field("cst", &RedactedOption(&self.cst))
+            .field("x_security_token", &RedactedOption(&self.x_security_token))
+            .field("account_id", &self.account_id)
+            .finish()
+    }
+}
+
+// Manual redacting `Display` — the derived `DisplaySimple` serializes via serde
+// and would leak the tokens, so it is replaced with a masking implementation.
+impl fmt::Display for WebsocketInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WebsocketInfo {{ server: {}, cst: {:?}, x_security_token: {:?}, account_id: {} }}",
+            self.server,
+            RedactedOption(&self.cst),
+            RedactedOption(&self.x_security_token),
+            self.account_id,
+        )
+    }
 }
 
 impl WebsocketInfo {
@@ -63,7 +104,7 @@ impl WebsocketInfo {
 }
 
 /// Session information for authenticated requests
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Session {
     /// Account ID
     pub account_id: String,
@@ -83,6 +124,24 @@ pub struct Session {
     /// - OAuth (v3): expires in 30 seconds
     /// - API v2: expires in 6 hours (21600 seconds)
     pub expires_at: u64,
+}
+
+// Manual redacting `Debug` — `cst`, `x_security_token` and the OAuth token are
+// credentials. The `OAuthToken` `Debug` impl is itself redacting, so printing
+// `oauth_token` here stays safe. All non-secret fields remain visible.
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("account_id", &self.account_id)
+            .field("client_id", &self.client_id)
+            .field("lightstreamer_endpoint", &self.lightstreamer_endpoint)
+            .field("cst", &RedactedOption(&self.cst))
+            .field("x_security_token", &RedactedOption(&self.x_security_token))
+            .field("oauth_token", &self.oauth_token)
+            .field("api_version", &self.api_version)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl Session {
@@ -341,8 +400,13 @@ impl Auth {
 
         // Parse the JSON
         let mut response: SessionResponse = serde_json::from_str(&body_text).map_err(|e| {
-            error!("Failed to parse login response JSON: {}", e);
-            error!("Response body: {}", body_text);
+            // Never log the body: the `/session` response carries credentials.
+            error!(
+                endpoint = %url,
+                body_len = body_text.len(),
+                "failed to parse login response: {}",
+                e
+            );
             AppError::Deserialization(format!("Failed to parse login response: {}", e))
         })?;
         let session = response.get_session_v2(&security_headers);
@@ -536,4 +600,86 @@ fn test_v2_response_deserialization_prod() -> Result<(), serde_json::Error> {
     assert_eq!(response.account_type, "CFD");
     assert_eq!(response.current_account_id, "BS0Y3");
     Ok(())
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    fn secret_session() -> Session {
+        Session {
+            account_id: "ACC123".to_string(),
+            client_id: "CLIENT1".to_string(),
+            lightstreamer_endpoint: "https://ls.example.com".to_string(),
+            cst: Some("SECRET-CST-VALUE".to_string()),
+            x_security_token: Some("SECRET-XST-VALUE".to_string()),
+            oauth_token: Some(OAuthToken {
+                access_token: "SECRET-ACCESS-VALUE".to_string(),
+                refresh_token: "SECRET-REFRESH-VALUE".to_string(),
+                scope: "read write".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: "60".to_string(),
+                created_at: chrono::Utc::now(),
+            }),
+            api_version: 3,
+            expires_at: 0,
+        }
+    }
+
+    #[test]
+    fn test_session_debug_redacts_tokens() {
+        let session = secret_session();
+        let rendered = format!("{session:?}");
+
+        assert!(!rendered.contains("SECRET-CST-VALUE"));
+        assert!(!rendered.contains("SECRET-XST-VALUE"));
+        assert!(!rendered.contains("SECRET-ACCESS-VALUE"));
+        assert!(!rendered.contains("SECRET-REFRESH-VALUE"));
+        assert!(rendered.contains("<redacted>"));
+        // Non-secret fields stay visible.
+        assert!(rendered.contains("ACC123"));
+        assert!(rendered.contains("ls.example.com"));
+    }
+
+    #[test]
+    fn test_websocket_info_debug_redacts_tokens() {
+        let ws = WebsocketInfo {
+            server: "https://ls.example.com/lightstreamer".to_string(),
+            cst: Some("SECRET-CST-VALUE".to_string()),
+            x_security_token: Some("SECRET-XST-VALUE".to_string()),
+            account_id: "ACC123".to_string(),
+        };
+        let rendered = format!("{ws:?}");
+
+        assert!(!rendered.contains("SECRET-CST-VALUE"));
+        assert!(!rendered.contains("SECRET-XST-VALUE"));
+        assert!(rendered.contains("Some(<redacted>)"));
+        assert!(rendered.contains("ACC123"));
+        assert!(rendered.contains("ls.example.com"));
+    }
+
+    #[test]
+    fn test_websocket_info_display_redacts_tokens() {
+        let ws = WebsocketInfo {
+            server: "https://ls.example.com/lightstreamer".to_string(),
+            cst: Some("SECRET-CST-VALUE".to_string()),
+            x_security_token: Some("SECRET-XST-VALUE".to_string()),
+            account_id: "ACC123".to_string(),
+        };
+        let rendered = format!("{ws}");
+
+        assert!(!rendered.contains("SECRET-CST-VALUE"));
+        assert!(!rendered.contains("SECRET-XST-VALUE"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("ACC123"));
+
+        // `None` tokens render as `None`, not as a redacted placeholder.
+        let ws_none = WebsocketInfo {
+            server: "https://ls.example.com/lightstreamer".to_string(),
+            cst: None,
+            x_security_token: None,
+            account_id: "ACC123".to_string(),
+        };
+        assert!(format!("{ws_none}").contains("None"));
+    }
 }

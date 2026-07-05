@@ -49,7 +49,11 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     let ws_info = client.get_ws_info().await;
     let password = ws_info.get_ws_password();
 
-    debug!("{ws_info:?}");
+    debug!(
+        server = %ws_info.server,
+        account_id = %ws_info.account_id,
+        "WebSocket info obtained"
+    );
     // Create a new Lightstreamer client instance and wrap it in an Arc<Mutex<>> so it can be shared across threads.
     let client = Arc::new(Mutex::new(LightstreamerClient::new(
         Some(ws_info.server.as_str()),

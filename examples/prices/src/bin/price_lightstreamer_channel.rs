@@ -82,7 +82,11 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     let http_client = Client::default();
     let ws_info = http_client.get_ws_info().await;
     let password = ws_info.get_ws_password();
-    debug!("{ws_info:?}");
+    debug!(
+        server = %ws_info.server,
+        account_id = %ws_info.account_id,
+        "WebSocket info obtained"
+    );
 
     // Create a channel for receiving updates
     let (sender, receiver) = mpsc::channel::<ItemUpdate>(CHANNEL_BUFFER_SIZE);
