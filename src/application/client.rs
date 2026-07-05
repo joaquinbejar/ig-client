@@ -104,11 +104,12 @@ impl Client {
     /// A new Client with default configuration
     ///
     /// # Panics
-    /// Panics only if the underlying [`HttpClient`] cannot be constructed,
-    /// which happens exclusively when the system TLS backend fails to
-    /// initialize at startup — an unrecoverable environment invariant. For
-    /// graceful handling of that case use [`Client::try_new`], which returns a
-    /// typed [`AppError`] instead of panicking.
+    /// Panics if the underlying [`HttpClient`] cannot be constructed at
+    /// startup — typically a missing TLS backend, but also invalid proxy or
+    /// certificate configuration. This is an unrecoverable environment
+    /// invariant at construction time. For graceful handling use
+    /// [`Client::try_new`], which returns a typed [`AppError`] instead of
+    /// panicking.
     pub fn new() -> Self {
         Self::try_new().expect("failed to create HTTP client")
     }

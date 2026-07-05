@@ -341,11 +341,12 @@ impl Auth {
     /// * `config` - Configuration containing credentials and API settings
     ///
     /// # Panics
-    /// Panics only if the underlying `reqwest` client cannot be constructed,
-    /// which happens exclusively when the system TLS backend fails to
-    /// initialize at startup — an unrecoverable environment invariant. For
-    /// graceful handling of that case use [`Auth::try_new`], which returns a
-    /// typed [`AppError`] instead of panicking.
+    /// Panics if the underlying `reqwest` client cannot be constructed at
+    /// startup — typically a missing TLS backend, but also invalid proxy or
+    /// certificate configuration. This is an unrecoverable environment
+    /// invariant at construction time. For graceful handling use
+    /// [`Auth::try_new`], which returns a typed [`AppError`] instead of
+    /// panicking.
     pub fn new(config: Arc<Config>) -> Self {
         Self::try_new(config).expect("Failed to create HTTP client")
     }

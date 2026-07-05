@@ -79,8 +79,9 @@ impl HttpClient {
             .build()?;
         let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(&config.rate_limiter)));
 
-        // Create Auth instance
-        let auth = Arc::new(Auth::new(config.clone()));
+        // Create Auth instance via the fallible constructor so the whole
+        // `new_lazy` path (and `Client::try_new` built on it) never panics.
+        let auth = Arc::new(Auth::try_new(config.clone())?);
 
         Ok(Self {
             auth,
@@ -371,15 +372,16 @@ impl Default for HttpClient {
     ///
     /// # Panics
     /// Panics if the underlying HTTP client cannot be constructed via
-    /// [`HttpClient::new_lazy`], which happens only when the system TLS backend
-    /// fails to initialize — an unrecoverable startup invariant. Callers that
-    /// need to handle that case gracefully should call
-    /// [`HttpClient::new_lazy`] directly and propagate the returned
+    /// [`HttpClient::new_lazy`] — typically a missing TLS backend, but also
+    /// invalid proxy or certificate configuration. This is an unrecoverable
+    /// startup invariant. Callers that need to handle that case gracefully
+    /// should call [`HttpClient::new_lazy`] directly and propagate the returned
     /// [`AppError`] with `?`.
     fn default() -> Self {
         let config = Config::default();
-        // The default TLS configuration should always succeed; this only fails
-        // if the system has no usable TLS backend, which is unrecoverable.
+        // Construction normally succeeds; it fails only if the reqwest client
+        // cannot be built (no usable TLS backend, or invalid proxy/certificate
+        // configuration), which is an unrecoverable startup invariant.
         Self::new_lazy(config).expect("failed to create default HTTP client")
     }
 }
