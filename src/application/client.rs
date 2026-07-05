@@ -106,12 +106,32 @@ impl Client {
         Self { http_client }
     }
 
+    /// Gets WebSocket connection information for Lightstreamer, reusing the
+    /// cached session.
+    ///
+    /// Delegates to [`HttpClient::ws_info`], which returns the cached session
+    /// when it is valid and only logs in when needed.
+    ///
+    /// # Returns
+    /// * `Ok(WebsocketInfo)` - Server endpoint, authentication tokens, and
+    ///   account ID for the current session.
+    /// * `Err(AppError)` - If session retrieval (login / refresh) fails.
+    ///
+    /// # Errors
+    /// Returns [`AppError`] when the session cannot be retrieved.
+    pub async fn ws_info(&self) -> Result<WebsocketInfo, AppError> {
+        self.http_client.ws_info().await
+    }
+
     /// Gets WebSocket connection information for Lightstreamer
     ///
     /// # Returns
     /// * `WebsocketInfo` containing server endpoint, authentication tokens, and account ID
+    #[deprecated(
+        note = "use ws_info() which reuses the cached session and returns a typed error instead of a default-on-error WebsocketInfo"
+    )]
     pub async fn get_ws_info(&self) -> WebsocketInfo {
-        self.http_client.get_ws_info().await
+        self.ws_info().await.unwrap_or_default()
     }
 }
 
@@ -1131,7 +1151,7 @@ impl StreamerClient {
     pub async fn new() -> Result<Self, AppError> {
         let http_client_raw = Arc::new(RwLock::new(Client::new()));
         let http_client = http_client_raw.read().await;
-        let ws_info = http_client.get_ws_info().await;
+        let ws_info = http_client.ws_info().await?;
         let password = ws_info.get_ws_password();
 
         // Market data client (no adapter specified - uses default)

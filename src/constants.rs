@@ -80,3 +80,10 @@ pub const DEFAULT_ORDER_SELL_LEVEL: f64 = 0.0;
 /// Developers can use this constant to ensure uniformity and consistency when working with order buy levels
 /// across the application.
 pub const DEFAULT_ORDER_BUY_LEVEL: f64 = 10000.0;
+
+/// Sentinel value used for `account_id` when `IG_ACCOUNT_ID` is not configured.
+///
+/// This is not a real IG account id: it signals "no account was explicitly
+/// configured, use whatever account the session lands on". Auth flows must not
+/// attempt to switch to this value.
+pub const DEFAULT_ACCOUNT_ID: &str = "default_account_id";

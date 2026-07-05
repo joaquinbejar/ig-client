@@ -125,7 +125,10 @@ impl Config {
             credentials: Credentials {
                 username,
                 password,
-                account_id: get_env_or_default("IG_ACCOUNT_ID", String::from("default_account_id")),
+                account_id: get_env_or_default(
+                    "IG_ACCOUNT_ID",
+                    String::from(crate::constants::DEFAULT_ACCOUNT_ID),
+                ),
                 api_key,
                 client_token: None,
                 account_token: None,
