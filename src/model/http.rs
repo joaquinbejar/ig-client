@@ -494,6 +494,10 @@ pub async fn make_http_request<B: Serialize>(
             }
             other => match classify_status(other) {
                 StatusClass::Retryable => {
+                    // Drain the body (without logging it) so reqwest can return
+                    // the connection to the pool; an undrained body forces the
+                    // connection closed and amplifies load during retry storms.
+                    let _ = response.bytes().await;
                     if other == StatusCode::TOO_MANY_REQUESTS {
                         warn!(status = ?other, "rate limit (429) hit");
                         AppError::RateLimitExceeded

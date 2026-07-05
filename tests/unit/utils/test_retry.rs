@@ -56,8 +56,11 @@ fn test_retry_config_deprecated_with_delay_is_finite() {
 fn test_retry_config_default_has_positive_delay() {
     let config = RetryConfig::default();
     assert!(config.delay_secs() > 0);
-    // The retry count is always finite regardless of environment.
-    assert!(config.max_retries() >= 1 || config.max_retries() == 0);
+    // The retry count is always finite: bounded by the deprecated-infinite cap
+    // regardless of the MAX_RETRY_COUNT environment override. The exact
+    // unset-default value (DEFAULT_MAX_RETRIES) is asserted env-independently in
+    // test_retry_config_max_retries_getter via direct field construction.
+    assert!(config.max_retries() <= DEPRECATED_INFINITE_RETRY_CAP);
 }
 
 #[test]
