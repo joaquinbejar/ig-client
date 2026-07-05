@@ -51,17 +51,87 @@ use lightstreamer_rs::client::{LightstreamerClient, LogType, Transport};
 use lightstreamer_rs::subscription::{
     ChannelSubscriptionListener, Snapshot, Subscription, SubscriptionMode,
 };
-use lightstreamer_rs::utils::setup_signal_hook;
+use lightstreamer_rs::utils::{LightstreamerError, setup_signal_hook};
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const MAX_CONNECTION_ATTEMPTS: u64 = 3;
+
+/// Server-supplied close reason IG sends on a streaming session once it has no
+/// active subscriptions left to serve.
+///
+/// This is not a dedicated error discriminant: `lightstreamer-rs` surfaces it
+/// as free-form text embedded in a server error payload, so it can only be
+/// matched best-effort (see [`is_graceful_close`]).
+const GRACEFUL_CLOSE_MARKER: &str = "No more requests to fulfill";
+
+/// Returns `true` if `error` represents a graceful, server-initiated close
+/// rather than a real connection failure.
+///
+/// IG closes a streaming session with the server reason
+/// "No more requests to fulfill" once it has no active subscriptions. The
+/// upstream [`LightstreamerError`] exposes no graceful-close discriminant — the
+/// reason arrives as free-form text embedded in a server error message
+/// (`conerr` is wrapped into [`LightstreamerError::Connection`]). We therefore
+/// classify the typed error on the variants that can carry a server-supplied
+/// reason and match [`GRACEFUL_CLOSE_MARKER`] against the variant's message
+/// payload directly — never against the `Debug` representation.
+#[must_use]
+#[inline]
+fn is_graceful_close(error: &LightstreamerError) -> bool {
+    match error {
+        LightstreamerError::Connection(msg)
+        | LightstreamerError::Protocol(msg)
+        | LightstreamerError::InvalidState(msg) => msg.contains(GRACEFUL_CLOSE_MARKER),
+        _ => false,
+    }
+}
+
+/// Spawns a task that waits for `source` to be notified once and then wakes
+/// every signal in `targets`.
+///
+/// This fans a single shutdown signal out to each per-connection signal so that
+/// *all* streaming connections stop. It works around `Notify::notify_one`
+/// waking only a single waiter: a shared `Notify` cannot shut down both the
+/// market and price connections, so each connection gets its own dedicated
+/// signal woken here.
+///
+/// Each per-connection signal has exactly one waiter, so `notify_one` (which
+/// stores a permit when no waiter is currently parked) wakes it reliably even
+/// if the connection is momentarily busy processing a frame.
+///
+/// The returned [`JoinHandle`] must be aborted once all connections have
+/// finished so the forwarder does not outlive them.
+#[must_use]
+fn spawn_shutdown_fanout(source: Arc<Notify>, targets: Vec<Arc<Notify>>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        source.notified().await;
+        for target in &targets {
+            target.notify_one();
+        }
+    })
+}
+
+/// Aborts every task in `tasks` and awaits its termination, then clears the
+/// list.
+///
+/// Awaiting after `abort` guarantees each task has fully stopped before we
+/// return; the [`tokio::task::JoinError`] produced by cancellation is expected
+/// and ignored.
+async fn abort_and_drain_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    for handle in tasks.drain(..) {
+        handle.abort();
+        // Ignore the cancellation `JoinError`; we only need the task to stop.
+        let _ = handle.await;
+    }
+}
 
 /// Returns `true` if an error from the order-confirmation endpoint is transient
 /// and worth polling again.
@@ -1164,6 +1234,12 @@ pub struct StreamerClient {
     // Flags indicating whether there is at least one active subscription for each client
     has_market_stream_subs: bool,
     has_price_stream_subs: bool,
+    // Handles for the per-subscription `ItemUpdate` -> DTO converter tasks. Each
+    // `*_subscribe` call spawns one; `disconnect` aborts and drains them so they
+    // do not idle for the process lifetime. This field is private and only ever
+    // populated inside this type's methods, so adding it does not change the
+    // constructed-via-`new` public surface.
+    converter_tasks: Vec<JoinHandle<()>>,
 }
 
 impl StreamerClient {
@@ -1219,6 +1295,7 @@ impl StreamerClient {
             price_streamer_client: Some(price_streamer_client),
             has_market_stream_subs: false,
             has_price_stream_subs: false,
+            converter_tasks: Vec::new(),
         })
     }
 
@@ -1295,7 +1372,7 @@ impl StreamerClient {
 
         // Create a channel for PriceData and spawn a task to convert ItemUpdate to PriceData
         let (price_tx, price_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut receiver = item_receiver;
             while let Some(item_update) = receiver.recv().await {
                 let price_data = PriceData::from(&item_update);
@@ -1305,6 +1382,8 @@ impl StreamerClient {
                 }
             }
         });
+        // Track the converter task so `disconnect` can tear it down.
+        self.converter_tasks.push(handle);
 
         info!(
             "Market subscription created for {} instruments",
@@ -1375,7 +1454,7 @@ impl StreamerClient {
 
         // Create a channel for TradeFields and spawn a task to convert ItemUpdate to TradeFields
         let (trade_tx, trade_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut receiver = item_receiver;
             while let Some(item_update) = receiver.recv().await {
                 let trade_data = crate::presentation::trade::TradeData::from(&item_update);
@@ -1385,6 +1464,8 @@ impl StreamerClient {
                 }
             }
         });
+        // Track the converter task so `disconnect` can tear it down.
+        self.converter_tasks.push(handle);
 
         info!("Trade subscription created for account: {}", account_id);
         Ok(trade_rx)
@@ -1453,7 +1534,7 @@ impl StreamerClient {
 
         // Create a channel for AccountFields and spawn a task to convert ItemUpdate to AccountFields
         let (account_tx, account_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut receiver = item_receiver;
             while let Some(item_update) = receiver.recv().await {
                 let account_data = crate::presentation::account::AccountData::from(&item_update);
@@ -1463,6 +1544,8 @@ impl StreamerClient {
                 }
             }
         });
+        // Track the converter task so `disconnect` can tear it down.
+        self.converter_tasks.push(handle);
 
         info!("Account subscription created for account: {}", account_id);
         Ok(account_rx)
@@ -1547,7 +1630,7 @@ impl StreamerClient {
 
         // Create a channel for PriceData and spawn a task to convert ItemUpdate to PriceData
         let (price_tx, price_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut receiver = item_receiver;
             while let Some(item_update) = receiver.recv().await {
                 let price_data = PriceData::from(&item_update);
@@ -1557,6 +1640,8 @@ impl StreamerClient {
                 }
             }
         });
+        // Track the converter task so `disconnect` can tear it down.
+        self.converter_tasks.push(handle);
 
         info!(
             "Price subscription created for {} instruments (account: {})",
@@ -1646,7 +1731,7 @@ impl StreamerClient {
 
         // Create a channel for ChartData and spawn a task to convert ItemUpdate to ChartData
         let (chart_tx, chart_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut receiver = item_receiver;
             while let Some(item_update) = receiver.recv().await {
                 let chart_data = ChartData::from(&item_update);
@@ -1656,6 +1741,8 @@ impl StreamerClient {
                 }
             }
         });
+        // Track the converter task so `disconnect` can tear it down.
+        self.converter_tasks.push(handle);
 
         info!(
             "Chart subscription created for {} instruments (scale: {})",
@@ -1693,16 +1780,21 @@ impl StreamerClient {
         };
 
         let mut tasks = Vec::new();
+        // Each connection gets its own dedicated shutdown signal. A single shared
+        // `Notify` cannot stop both connections: `notify_one` wakes only one
+        // waiter, so the other connection would never observe the shutdown. The
+        // external `signal` is fanned out to these per-connection signals below.
+        let mut connection_signals: Vec<Arc<Notify>> = Vec::new();
 
         // Connect market streamer only if there are active subscriptions
         if self.has_market_stream_subs {
             if let Some(client) = self.market_streamer_client.as_ref() {
                 let client = Arc::clone(client);
-                let signal = Arc::clone(&signal);
-                let task =
-                    tokio::spawn(
-                        async move { Self::connect_client(client, signal, "Market").await },
-                    );
+                let conn_signal = Arc::new(Notify::new());
+                connection_signals.push(Arc::clone(&conn_signal));
+                let task = tokio::spawn(async move {
+                    Self::connect_client(client, conn_signal, "Market").await
+                });
                 tasks.push(task);
             }
         } else {
@@ -1713,11 +1805,11 @@ impl StreamerClient {
         if self.has_price_stream_subs {
             if let Some(client) = self.price_streamer_client.as_ref() {
                 let client = Arc::clone(client);
-                let signal = Arc::clone(&signal);
-                let task =
-                    tokio::spawn(
-                        async move { Self::connect_client(client, signal, "Price").await },
-                    );
+                let conn_signal = Arc::new(Notify::new());
+                connection_signals.push(Arc::clone(&conn_signal));
+                let task = tokio::spawn(async move {
+                    Self::connect_client(client, conn_signal, "Price").await
+                });
                 tasks.push(task);
             }
         } else {
@@ -1731,8 +1823,17 @@ impl StreamerClient {
 
         info!("Connecting {} streaming client(s)...", tasks.len());
 
+        // Fan the single external shutdown signal out to every per-connection
+        // signal so all connections stop together. Aborted once every connection
+        // has finished so the forwarder cannot outlive them.
+        let fanout = spawn_shutdown_fanout(Arc::clone(&signal), connection_signals);
+
         // Wait for all tasks to complete
         let results = futures::future::join_all(tasks).await;
+
+        // All connections finished (via shutdown or on their own): the fan-out
+        // forwarder is no longer needed.
+        fanout.abort();
 
         // Check if any task failed
         let mut has_error = false;
@@ -1777,29 +1878,32 @@ impl StreamerClient {
                 client.connect_direct(Arc::clone(&signal)).await
             };
 
-            // Convert error to String immediately to avoid Send issues
-            let result_with_string_error = connect_result.map_err(|e| format!("{:?}", e));
-
-            match result_with_string_error {
-                Ok(_) => {
+            match connect_result {
+                Ok(()) => {
                     info!("{} streamer connected successfully", client_type);
                     break;
                 }
-                Err(error_msg) => {
-                    // If server closed because there are no active subscriptions, treat as graceful
-                    if error_msg.contains("No more requests to fulfill") {
+                Err(e) => {
+                    // Classify on the typed error BEFORE stringifying: IG closes
+                    // the session with the server reason "No more requests to
+                    // fulfill" once it has no active subscriptions. That is a
+                    // graceful close, not a failure.
+                    if is_graceful_close(&e) {
                         info!(
-                            "{} streamer closed gracefully: no active subscriptions (server reason: No more requests to fulfill)",
-                            client_type
+                            "{} streamer closed gracefully: no active subscriptions (server reason: {})",
+                            client_type, GRACEFUL_CLOSE_MARKER
                         );
                         return Ok(());
                     }
 
+                    // Not graceful: log the `Display` form (never `Debug`;
+                    // `LightstreamerError` carries no credentials) and schedule a
+                    // bounded retry.
+                    let error_msg = e.to_string();
                     error!("{} streamer connection failed: {}", client_type, error_msg);
 
                     if retry_counter < MAX_CONNECTION_ATTEMPTS - 1 {
-                        tokio::time::sleep(std::time::Duration::from_millis(retry_interval_millis))
-                            .await;
+                        sleep(Duration::from_millis(retry_interval_millis)).await;
                         retry_interval_millis =
                             (retry_interval_millis + (200 * retry_counter)).min(5000);
                         retry_counter += 1;
@@ -1834,7 +1938,13 @@ impl StreamerClient {
 
     /// Disconnects all active Lightstreamer clients.
     ///
-    /// This method gracefully closes all streaming connections (market and price).
+    /// This method gracefully closes all streaming connections (market and
+    /// price) and tears down the per-subscription converter tasks so they do
+    /// not idle for the process lifetime. Closing the Lightstreamer session
+    /// closes the item channels feeding the converters, so they would exit on
+    /// their own; aborting and awaiting them here guarantees a deterministic,
+    /// leak-free shutdown. Calling `disconnect` more than once is safe: the
+    /// converter list is drained and the client `disconnect` is idempotent.
     ///
     /// # Returns
     ///
@@ -1856,8 +1966,27 @@ impl StreamerClient {
             disconnected += 1;
         }
 
+        // Tear down the converter tasks now that their upstream item channels
+        // are closed.
+        let converter_count = self.converter_tasks.len();
+        abort_and_drain_tasks(&mut self.converter_tasks).await;
+        if converter_count > 0 {
+            debug!("Aborted {} converter task(s)", converter_count);
+        }
+
         info!("Disconnected {} streaming client(s)", disconnected);
         Ok(())
+    }
+}
+
+impl Drop for StreamerClient {
+    /// Aborts any converter tasks that were not already torn down by
+    /// [`StreamerClient::disconnect`], so dropping the client never orphans a
+    /// spawned task. Abort is synchronous, so no runtime is required here.
+    fn drop(&mut self) {
+        for handle in self.converter_tasks.drain(..) {
+            handle.abort();
+        }
     }
 }
 
@@ -1912,5 +2041,119 @@ mod tests {
         assert!(!is_transient_confirmation_error(&AppError::Unexpected(
             StatusCode::BAD_REQUEST
         )));
+    }
+
+    use super::{
+        GRACEFUL_CLOSE_MARKER, abort_and_drain_tasks, is_graceful_close, spawn_shutdown_fanout,
+    };
+    use lightstreamer_rs::utils::LightstreamerError;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+
+    // --- Task 3: graceful-close classification -----------------------------
+
+    #[test]
+    fn test_is_graceful_close_connection_variant_with_marker_is_true() {
+        // "No more requests to fulfill" arrives wrapped in a server `conerr`
+        // message, which `lightstreamer-rs` surfaces as `Connection`.
+        let err = LightstreamerError::Connection(format!(
+            "connection error from server: conerr,-2,{GRACEFUL_CLOSE_MARKER}"
+        ));
+        assert!(is_graceful_close(&err));
+    }
+
+    #[test]
+    fn test_is_graceful_close_protocol_and_invalid_state_with_marker_is_true() {
+        let protocol = LightstreamerError::Protocol(format!("closing: {GRACEFUL_CLOSE_MARKER}"));
+        let invalid_state =
+            LightstreamerError::InvalidState(format!("state: {GRACEFUL_CLOSE_MARKER}"));
+        assert!(is_graceful_close(&protocol));
+        assert!(is_graceful_close(&invalid_state));
+    }
+
+    #[test]
+    fn test_is_graceful_close_connection_variant_without_marker_is_false() {
+        let err = LightstreamerError::Connection("no message received within 5000 ms".to_string());
+        assert!(!is_graceful_close(&err));
+    }
+
+    #[test]
+    fn test_is_graceful_close_other_variant_with_marker_is_false() {
+        // Variants that never carry a server close reason must not match, even
+        // if the marker text somehow appears in them.
+        let err = LightstreamerError::Timeout(GRACEFUL_CLOSE_MARKER.to_string());
+        assert!(!is_graceful_close(&err));
+    }
+
+    // --- Task 5: one shutdown signal must wake both connections ------------
+
+    #[tokio::test]
+    async fn test_shutdown_fanout_wakes_all_connection_waiters() {
+        // Two dedicated per-connection signals stand in for the market and
+        // price connections, both waiting to be shut down.
+        let source = Arc::new(Notify::new());
+        let market_signal = Arc::new(Notify::new());
+        let price_signal = Arc::new(Notify::new());
+
+        let fanout = spawn_shutdown_fanout(
+            Arc::clone(&source),
+            vec![Arc::clone(&market_signal), Arc::clone(&price_signal)],
+        );
+
+        let market_waiter = tokio::spawn(async move { market_signal.notified().await });
+        let price_waiter = tokio::spawn(async move { price_signal.notified().await });
+
+        // A single `notify_one` on the shared source (as `setup_signal_hook`
+        // and `DynamicMarketStreamer` do) must reach BOTH connections. Because
+        // each per-connection signal has a single waiter and `notify_one`
+        // stores a permit, the wake is race-free.
+        source.notify_one();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), market_waiter)
+                .await
+                .is_ok(),
+            "market connection did not observe the shutdown signal"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), price_waiter)
+                .await
+                .is_ok(),
+            "price connection did not observe the shutdown signal"
+        );
+
+        fanout.abort();
+    }
+
+    // --- Task 2: converter-task teardown ----------------------------------
+
+    #[tokio::test]
+    async fn test_abort_and_drain_tasks_stops_and_clears() {
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        for _ in 0..3 {
+            // A task that never completes on its own; only an abort stops it.
+            tasks.push(tokio::spawn(async { std::future::pending::<()>().await }));
+        }
+        assert!(tasks.iter().all(|h| !h.is_finished()));
+
+        abort_and_drain_tasks(&mut tasks).await;
+
+        // The helper awaits each aborted task, so returning proves every task
+        // terminated; the list is drained.
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_abort_makes_pending_task_finish() {
+        let handle: JoinHandle<()> = tokio::spawn(async { std::future::pending::<()>().await });
+        assert!(!handle.is_finished());
+        handle.abort();
+        let join_result = handle.await;
+        assert!(
+            join_result.is_err(),
+            "aborted task should yield a cancellation JoinError"
+        );
     }
 }
