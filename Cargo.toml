@@ -1,6 +1,6 @@
 [package]
 name = "ig-client"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "This crate provides a client for the IG Markets API"
@@ -86,7 +86,7 @@ members = [
 
 [workspace.dependencies]
 ig-client=  { path = "." }
-tokio = { version = "1.50", features = ["rt", "rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "time", "signal"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -94,13 +94,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.13", features = ["json"] }
 criterion = "0.8"
-sqlx = { version = "0.8", features = [ "postgres","macros","chrono","runtime-tokio-native-tls"]}
+sqlx = { version = "0.9", features = [ "postgres","macros","chrono","runtime-tokio","tls-native-tls"]}
 async-trait = "0.1"
 regex = "1.12"
 dotenv = "0.15"
-lightstreamer-rs = "0.3.1"
+lightstreamer-rs = "0.3.3"
 lazy_static = "1.5"
-nanoid = "0.4"
+nanoid = "0.5"
 pretty-simple-display = "0.1"
 governor = "0.10"
 prettytable-rs = "0.10"

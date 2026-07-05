@@ -1,7 +1,7 @@
 use crate::prelude::{MarketData, MarketNode};
 use crate::storage::market_persistence::{MarketHierarchyNode, MarketInstrument};
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, PgPool, Row};
+use sqlx::{AssertSqlSafe, Executor, PgPool, Row};
 use std::collections::HashMap;
 use std::future::Future;
 use tracing::info;
@@ -237,7 +237,10 @@ impl MarketDatabaseService {
             table_name
         );
 
-        tx.execute(sqlx::query(&create_table_sql)).await?;
+        // SQL only varies by `table_name`, an identifier chosen by the library
+        // caller (identifiers cannot be bind parameters in Postgres).
+        tx.execute(sqlx::query(AssertSqlSafe(create_table_sql)))
+            .await?;
 
         // Note: No DELETE operation - using UPSERT to update existing records
 
@@ -353,7 +356,8 @@ impl MarketDatabaseService {
         );
 
         tx.execute(
-            sqlx::query(&insert_sql)
+            // SQL only varies by `table_name` (see above); all values are bound.
+            sqlx::query(AssertSqlSafe(insert_sql))
                 .bind(&market.epic)
                 .bind(&market.instrument_name)
                 .bind(format!("{:?}", market.instrument_type))
