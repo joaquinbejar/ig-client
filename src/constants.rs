@@ -36,6 +36,39 @@ pub const BASE_DELAY_MS: u64 = 1000;
 pub const SAFETY_BUFFER_MS: u64 = 1000;
 /// User agent string used in HTTP requests to identify this client to the IG Markets API
 pub const USER_AGENT: &str = "Rust-IG-Client/0.1.9";
+/// Conservative per-app trading request budget, in requests per second,
+/// enforced by the rate limiter for order / position mutations
+/// (`positions/otc`, `workingorders/otc`).
+///
+/// IG applies account-level bans for trading rate violations and the published
+/// per-app trading limit is roughly one request per second, so this budget is
+/// fixed independently of the configured non-trading budget: a permissive
+/// `RateLimiterConfig` can never loosen it.
+pub const TRADING_RATE_LIMIT_PER_SECOND: u32 = 1;
+/// Conservative per-app historical-price request budget, in requests per second,
+/// enforced by the rate limiter for endpoints under `prices/`.
+///
+/// Historical price fetches also draw down a weekly data-point allowance (default
+/// 10,000 points), so the per-second rate is kept low to avoid exhausting the
+/// allowance in bursts. Like the trading budget, it is fixed independently of the
+/// configured non-trading budget.
+pub const HISTORICAL_RATE_LIMIT_PER_SECOND: u32 = 1;
+/// Burst capacity for the derived trading and historical rate-limit buckets.
+///
+/// Kept at one so the derived per-second budgets admit no burst beyond a single
+/// in-flight request, matching IG's strict trading / historical limits.
+pub const TRADING_HISTORICAL_BURST_SIZE: u32 = 1;
+/// Fallback replenishment budget (requests per period) used when
+/// [`crate::application::config::RateLimiterConfig::max_requests`] is configured
+/// as zero, which is structurally invalid.
+///
+/// One request per configured period is the safe floor and avoids a
+/// divide-by-zero when computing the per-cell replenishment interval.
+pub const FALLBACK_RATE_LIMIT_MAX_REQUESTS: u32 = 1;
+/// Fallback burst capacity used when
+/// [`crate::application::config::RateLimiterConfig::burst_size`] is configured as
+/// zero. Preserves the historical default of allowing a small burst.
+pub const DEFAULT_RATE_LIMIT_BURST_SIZE: u32 = 10;
 /// A constant representing the default sell level for orders.
 ///
 /// This value is set to `0.0` by default and can be used to indicate an initial or

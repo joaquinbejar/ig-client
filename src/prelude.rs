@@ -32,7 +32,7 @@ pub use crate::application::config::{
 };
 
 // Rate limiter
-pub use crate::application::rate_limiter::RateLimiter;
+pub use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
 
 // Service interfaces
 pub use crate::application::interfaces::account::AccountService;
