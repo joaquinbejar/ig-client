@@ -7,7 +7,60 @@ use serde_json;
 use sqlx::{Executor, PgPool};
 use tracing::info;
 
-/// Stores a list of transactions in the database
+/// Initializes the `ig_options` table used by [`store_transactions`].
+///
+/// Ships the DDL in code (like the other storage tables) so persistence works
+/// against a fresh database. The `raw_hash` column is the deduplication key:
+/// it stores the MD5 digest of the raw transaction JSON and carries a `UNIQUE`
+/// constraint so re-ingesting an identical payload is a no-op. Call this once
+/// before [`store_transactions`].
+///
+/// # Arguments
+/// * `pool` - PostgreSQL connection pool
+///
+/// # Errors
+/// Returns [`AppError`] if the `CREATE TABLE` statement fails.
+#[must_use = "table initialization can fail and must be handled"]
+pub async fn initialize_ig_options_table(pool: &PgPool) -> Result<(), AppError> {
+    info!("Initializing ig_options table...");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS ig_options (
+            id BIGSERIAL PRIMARY KEY,
+            reference TEXT NOT NULL,
+            deal_date TIMESTAMPTZ NOT NULL,
+            underlying TEXT,
+            strike DOUBLE PRECISION,
+            option_type TEXT,
+            expiry DATE,
+            transaction_type TEXT NOT NULL,
+            pnl_eur DOUBLE PRECISION NOT NULL,
+            is_fee BOOLEAN NOT NULL,
+            raw TEXT NOT NULL,
+            raw_hash TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_ig_options_reference ON ig_options(reference)")
+        .execute(pool)
+        .await?;
+
+    info!("ig_options table initialized successfully");
+    Ok(())
+}
+
+/// Stores a list of transactions in the database.
+///
+/// Requires the `ig_options` table to exist; call
+/// [`initialize_ig_options_table`] first. Deduplication is keyed on
+/// `raw_hash`, which is computed database-side as `md5(raw)` from the bound
+/// raw JSON (a stable, dependency-free digest); `ON CONFLICT (raw_hash) DO
+/// NOTHING` makes re-ingesting an identical payload a no-op.
 ///
 /// # Arguments
 /// * `pool` - PostgreSQL connection pool
@@ -15,6 +68,7 @@ use tracing::info;
 ///
 /// # Returns
 /// * `Result<usize, AppError>` - Number of transactions inserted or an error
+#[must_use = "storage writes can fail and the inserted count must be handled"]
 pub async fn store_transactions(
     pool: &sqlx::PgPool,
     txs: &[StoreTransaction],
@@ -23,15 +77,19 @@ pub async fn store_transactions(
     let mut inserted = 0;
 
     for t in txs {
+        // `raw_hash` is derived from the raw JSON via Postgres' built-in
+        // `md5()` on the bound `$10` value (no string interpolation), giving a
+        // deterministic dedup key without an extra dependency.
         let result = tx
             .execute(
                 sqlx::query(
                     r#"
                     INSERT INTO ig_options (
                         reference, deal_date, underlying, strike,
-                        option_type, expiry, transaction_type, pnl_eur, is_fee, raw
+                        option_type, expiry, transaction_type, pnl_eur, is_fee, raw,
+                        raw_hash
                     )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, md5($10))
                     ON CONFLICT (raw_hash) DO NOTHING
                     "#,
                 )
