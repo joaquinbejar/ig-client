@@ -319,7 +319,7 @@ impl CreateOrderRequest {
     /// - `epic`: A `String` that specifies the EPIC
     ///   (Exchanged Product Information Code) of the instrument for which the sell order is created.
     /// - `size`: A `f64` that represents the size of the sell
-    ///   order. The size is rounded to two decimal places.
+    ///   order. The size is rounded to the nearest two decimal places.
     /// - `expiry`: An optional `String` that indicates the expiry date or period for
     ///   the sell order. If `None`, no expiry date will be set for the order.
     /// - `deal_reference`: An optional `String` that contains a reference or identifier
@@ -343,7 +343,7 @@ impl CreateOrderRequest {
     ///     `limit_distance`): Set to `None` by default.
     ///
     /// # Notes
-    /// - The input `size` is automatically rounded down to two decimal places before being stored.
+    /// - The input `size` is automatically rounded to the nearest two decimal places before being stored.
     #[must_use]
     pub fn sell_option_to_market_w_force(
         epic: String,
@@ -456,7 +456,7 @@ impl CreateOrderRequest {
     ///
     /// # Behavior
     ///
-    /// * The size of the order will be rounded down to two decimal places for precision.
+    /// * The size of the order will be rounded to the nearest two decimal places for precision.
     /// * If a `currency_code` is not provided, the default currency code "EUR" is used.
     /// * Other parameters are directly mapped into the returned instance.
     ///
