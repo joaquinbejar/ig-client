@@ -157,6 +157,20 @@ pub struct CreateOrderRequest {
     pub trailing_stop_increment: Option<f64>,
 }
 
+/// Rounds an order size to two decimal places (nearest, half away from zero).
+///
+/// IG accepts order sizes to two decimals. Rounding must go through the nearest
+/// value, not `floor`: `0.29 * 100.0` is `28.999999999999996` in `f64`, so a
+/// `floor`-based `(size * 100.0).floor() / 100.0` silently yields `0.28` and the
+/// order is placed with a smaller size than the caller requested. `round` maps
+/// it back to `0.29`. The rounding direction (nearest) is deliberate and applies
+/// uniformly to every order constructor.
+#[must_use]
+#[inline]
+fn round_order_size(size: f64) -> f64 {
+    (size * 100.0).round() / 100.0
+}
+
 impl CreateOrderRequest {
     /// Creates a new market order, typically used for CFD (Contract for Difference) accounts
     #[must_use]
@@ -167,7 +181,7 @@ impl CreateOrderRequest {
         currency_code: Option<String>,
         deal_reference: Option<String>,
     ) -> Self {
-        let rounded_size = (size * 100.0).floor() / 100.0;
+        let rounded_size = round_order_size(size);
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
@@ -203,7 +217,7 @@ impl CreateOrderRequest {
         currency_code: Option<String>,
         deal_reference: Option<String>,
     ) -> Self {
-        let rounded_size = (size * 100.0).floor() / 100.0;
+        let rounded_size = round_order_size(size);
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
@@ -269,7 +283,7 @@ impl CreateOrderRequest {
         deal_reference: Option<String>,
         currency_code: Option<String>,
     ) -> Self {
-        let rounded_size = (size * 100.0).floor() / 100.0;
+        let rounded_size = round_order_size(size);
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
@@ -305,7 +319,7 @@ impl CreateOrderRequest {
     /// - `epic`: A `String` that specifies the EPIC
     ///   (Exchanged Product Information Code) of the instrument for which the sell order is created.
     /// - `size`: A `f64` that represents the size of the sell
-    ///   order. The size is rounded to two decimal places.
+    ///   order. The size is rounded to the nearest two decimal places.
     /// - `expiry`: An optional `String` that indicates the expiry date or period for
     ///   the sell order. If `None`, no expiry date will be set for the order.
     /// - `deal_reference`: An optional `String` that contains a reference or identifier
@@ -329,7 +343,7 @@ impl CreateOrderRequest {
     ///     `limit_distance`): Set to `None` by default.
     ///
     /// # Notes
-    /// - The input `size` is automatically rounded down to two decimal places before being stored.
+    /// - The input `size` is automatically rounded to the nearest two decimal places before being stored.
     #[must_use]
     pub fn sell_option_to_market_w_force(
         epic: String,
@@ -339,7 +353,7 @@ impl CreateOrderRequest {
         currency_code: Option<String>,
         force_open: bool, // Compensate position if it is already open
     ) -> Self {
-        let rounded_size = (size * 100.0).floor() / 100.0;
+        let rounded_size = round_order_size(size);
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
@@ -395,7 +409,7 @@ impl CreateOrderRequest {
         deal_reference: Option<String>,
         currency_code: Option<String>,
     ) -> Self {
-        let rounded_size = (size * 100.0).floor() / 100.0;
+        let rounded_size = round_order_size(size);
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
@@ -442,7 +456,7 @@ impl CreateOrderRequest {
     ///
     /// # Behavior
     ///
-    /// * The size of the order will be rounded down to two decimal places for precision.
+    /// * The size of the order will be rounded to the nearest two decimal places for precision.
     /// * If a `currency_code` is not provided, the default currency code "EUR" is used.
     /// * Other parameters are directly mapped into the returned instance.
     ///
@@ -460,7 +474,7 @@ impl CreateOrderRequest {
         currency_code: Option<String>,
         force_open: bool,
     ) -> Self {
-        let rounded_size = (size * 100.0).floor() / 100.0;
+        let rounded_size = round_order_size(size);
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
