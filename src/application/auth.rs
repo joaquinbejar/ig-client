@@ -680,7 +680,7 @@ impl Auth {
     ///
     /// It cannot loop back through the 401 handler: [`login`](Self::login) issues
     /// its HTTP requests through
-    /// [`make_http_request`](crate::model::http::make_http_request) directly, not
+    /// [`make_http_request`] directly, not
     /// through the [`HttpClient`](crate::model::http::HttpClient) refresh-and-replay
     /// path, so a 401 encountered *during* login surfaces as a typed error rather
     /// than recursing into `force_refresh`.

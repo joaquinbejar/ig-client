@@ -3,9 +3,11 @@
 // Financial calculation utilities for the IG client
 
 use crate::presentation::account::Position;
-use crate::presentation::order::Direction;
 
 /// Calculate the Profit and Loss (P&L) for a position based on current market prices
+///
+/// Thin wrapper over [`Position::pnl_checked`], the single source of truth for
+/// position P&L, kept for backwards compatibility.
 ///
 /// # Arguments
 ///
@@ -17,22 +19,7 @@ use crate::presentation::order::Direction;
 ///
 #[must_use]
 pub fn calculate_pnl(position: &Position) -> Option<f64> {
-    let (bid, offer) = (position.market.bid, position.market.offer);
-
-    // Get the appropriate price based on direction
-    let current_price = match position.position.direction {
-        Direction::Buy => bid?,
-        Direction::Sell => offer?,
-    };
-
-    // Calculate price difference
-    let price_diff = match position.position.direction {
-        Direction::Buy => current_price - position.position.level,
-        Direction::Sell => position.position.level - current_price,
-    };
-
-    // Return P&L
-    Some(price_diff * position.position.size)
+    position.pnl_checked()
 }
 
 /// Calculate the percentage return for a position

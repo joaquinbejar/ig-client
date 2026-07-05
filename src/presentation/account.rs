@@ -251,83 +251,61 @@ impl Position {
     ///
     /// # Logic
     ///
-    /// - If `self.pnl` is available, it directly returns the cached value.
-    /// - If not, the PnL is calculated based on the direction of the position:
-    ///   - For a Buy position:
-    ///     - The PnL is calculated as the difference between the `current_value`
-    ///       (based on the `market.bid` price or fallback value) and the original
-    ///       `value` (based on the position's size and level).
-    ///   - For a Sell position:
-    ///     - The PnL is calculated as the difference between the original
-    ///       `value` and the `current_value` (based on the `market.offer`
-    ///       price or fallback value).
-    ///
-    /// # Assumptions
-    /// - The `market.bid` and `market.offer` values are optional, so fallback
-    ///   to the original position value is used if they are unavailable.
-    /// - `self.position.direction` must be either `Direction::Buy` or
-    ///   `Direction::Sell`.
+    /// - If `self.pnl` is set, the cached value is returned directly.
+    /// - Otherwise it delegates to [`Position::pnl_checked`], which marks a Buy
+    ///   against `market.bid` and a Sell against `market.offer`. When the
+    ///   direction's market price is unavailable there is no basis for a P&L, so
+    ///   this returns `0.0` (use [`Position::pnl_checked`] to distinguish the
+    ///   unknown case as `None`).
     ///
     #[must_use]
     pub fn pnl(&self) -> f64 {
-        if let Some(pnl) = self.pnl {
-            pnl
-        } else {
-            match self.position.direction {
-                Direction::Buy => {
-                    let value = self.position.size * self.position.level;
-                    let current_value = self.position.size * self.market.bid.unwrap_or(value);
-                    current_value - value
-                }
-                Direction::Sell => {
-                    let value = self.position.size * self.position.level;
-                    let current_value = self.position.size * self.market.offer.unwrap_or(value);
-                    value - current_value
-                }
-            }
-        }
+        self.pnl
+            .unwrap_or_else(|| self.pnl_checked().unwrap_or(0.0))
     }
 
-    /// Updates the profit and loss (PnL) for the current position in the market.
+    /// Computes P&L from current market prices, or `None` when the required
+    /// price for the position's direction is unavailable.
     ///
-    /// The method calculates the PnL based on the position's direction (Buy or Sell),
-    /// size, level (entry price), and the current bid or offer price from the market data.
-    /// The result is stored in the `pnl` field.
+    /// This is the single source of truth for position P&L: a Buy is marked
+    /// against `market.bid`, a Sell against `market.offer`, as
+    /// `(price - level) * size` (sign flipped for a Sell). When that price is
+    /// missing there is no basis for a P&L, so this returns `None` rather than
+    /// fabricating a value — callers that need a number use `pnl()`, which
+    /// treats the unknown case as `0.0`. Unlike the pre-`pnl()` field override,
+    /// this ignores any cached `self.pnl`.
     ///
-    /// # Calculation:
-    /// - If the position is a Buy:
-    ///     - Calculate the initial value of the position as `size * level`.
-    ///     - Calculate the current value of the position using the current `bid` price from the market,
-    ///       or use the initial value if the `bid` price is not available.
-    ///     - PnL is the difference between the current value and the initial value.
-    /// - If the position is a Sell:
-    ///     - Calculate the initial value of the position as `size * level`.
-    ///     - Calculate the current value of the position using the current `offer` price from the market,
-    ///       or use the initial value if the `offer` price is not available.
-    ///     - PnL is the difference between the initial value and the current value.
+    /// # Returns
+    /// `Some(pnl)` when the direction's market price is present, else `None`.
+    #[must_use]
+    pub fn pnl_checked(&self) -> Option<f64> {
+        let current_price = match self.position.direction {
+            Direction::Buy => self.market.bid?,
+            Direction::Sell => self.market.offer?,
+        };
+        let price_diff = match self.position.direction {
+            Direction::Buy => current_price - self.position.level,
+            Direction::Sell => self.position.level - current_price,
+        };
+        Some(price_diff * self.position.size)
+    }
+
+    /// Updates the cached profit and loss (PnL) for the current position from
+    /// current market prices.
     ///
-    /// # Fields Updated:
-    /// - `self.pnl`: The calculated profit or loss is updated in this field. If no valid market price
-    ///   (bid/offer) is available, `pnl` will be calculated based on the initial value.
+    /// Delegates to [`Position::pnl_checked`] (a Buy marked against `market.bid`,
+    /// a Sell against `market.offer`) and stores the result in `self.pnl`. When
+    /// the direction's market price is unavailable there is no basis for a P&L,
+    /// so `0.0` is stored.
     ///
-    /// # Panics:
-    /// This function does not explicitly panic but relies on the `unwrap_or` method to handle cases
-    /// where the `bid` or `offer` is unavailable. It assumes that the market or position data are initialized correctly.
+    /// # Fields Updated
+    /// - `self.pnl`: set to `Some(pnl)`, or `Some(0.0)` when the required market
+    ///   price is missing.
     ///
     pub fn update_pnl(&mut self) {
-        let pnl = match self.position.direction {
-            Direction::Buy => {
-                let value = self.position.size * self.position.level;
-                let current_value = self.position.size * self.market.bid.unwrap_or(value);
-                current_value - value
-            }
-            Direction::Sell => {
-                let value = self.position.size * self.position.level;
-                let current_value = self.position.size * self.market.offer.unwrap_or(value);
-                value - current_value
-            }
-        };
-        self.pnl = Some(pnl);
+        // Store the market-derived P&L (0.0 when the direction's price is
+        // unavailable), through the single `pnl_checked` implementation.
+        self.pnl = Some(self.pnl_checked().unwrap_or(0.0));
     }
 }
 
@@ -445,15 +423,25 @@ impl Add for PositionDetails {
     type Output = PositionDetails;
 
     fn add(self, other: PositionDetails) -> PositionDetails {
-        let (contract_size, size) = if self.direction != other.direction {
+        let (contract_size, size, direction) = if self.direction != other.direction {
+            // Netting opposite directions: the surviving position takes the
+            // direction of the larger size (e.g. Buy 2 + Sell 3 -> Sell 1). On a
+            // tie the net is flat and the direction is immaterial; keep `self`.
+            let direction = if other.size > self.size {
+                other.direction
+            } else {
+                self.direction
+            };
             (
                 (self.contract_size - other.contract_size).abs(),
                 (self.size - other.size).abs(),
+                direction,
             )
         } else {
             (
                 self.contract_size + other.contract_size,
                 self.size + other.size,
+                self.direction,
             )
         };
 
@@ -463,7 +451,7 @@ impl Add for PositionDetails {
             created_date_utc: self.created_date_utc,
             deal_id: self.deal_id,
             deal_reference: self.deal_reference,
-            direction: self.direction,
+            direction,
             limit_level: other.limit_level.or(self.limit_level),
             level: (self.level + other.level) / 2.0, // Average level
             size,
@@ -982,6 +970,7 @@ impl From<&ItemUpdate> for AccountData {
 mod tests {
     use super::*;
     use crate::presentation::order::Direction;
+    use crate::utils::finance::calculate_pnl;
 
     fn sample_position_details(direction: Direction, level: f64, size: f64) -> PositionDetails {
         PositionDetails {
@@ -1095,5 +1084,56 @@ mod tests {
             pnl: None,
         };
         assert!((position.pnl() - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pnl_missing_price_with_size_two_is_zero_not_inflated() {
+        // Regression: the old fallback substituted the notional (size*level) as
+        // the price, giving size^2*level - size*level. With size != 1 that is
+        // non-zero garbage; the correct answer with no market price is 0.
+        for direction in [Direction::Buy, Direction::Sell] {
+            let details = sample_position_details(direction, 155.14, 2.0);
+            let market = sample_market(None, None);
+            let position = Position {
+                position: details,
+                market,
+                pnl: None,
+            };
+            assert!(position.pnl_checked().is_none());
+            assert!(
+                position.pnl().abs() < 1e-12,
+                "size-2 missing-price pnl must be 0, got {}",
+                position.pnl()
+            );
+        }
+    }
+
+    #[test]
+    fn pnl_size_two_with_price_scales_with_size() {
+        // Buy 2 @ 100, bid 105 => (105-100)*2 = 10.
+        let details = sample_position_details(Direction::Buy, 100.0, 2.0);
+        let market = sample_market(Some(105.0), None);
+        let position = Position {
+            position: details,
+            market,
+            pnl: None,
+        };
+        assert!((position.pnl() - 10.0).abs() < 1e-12);
+        assert!((calculate_pnl(&position).expect("has bid") - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn netting_opposite_directions_takes_larger_side() {
+        // Buy 2 + Sell 3 => Sell 1 (net short).
+        let buy = sample_position_details(Direction::Buy, 100.0, 2.0);
+        let sell = sample_position_details(Direction::Sell, 102.0, 3.0);
+        let net = buy.clone() + sell.clone();
+        assert_eq!(net.direction, Direction::Sell);
+        assert!((net.size - 1.0).abs() < 1e-12);
+
+        // Symmetric: Sell 3 + Buy 2 => Sell 1 as well.
+        let net2 = sell + buy;
+        assert_eq!(net2.direction, Direction::Sell);
+        assert!((net2.size - 1.0).abs() < 1e-12);
     }
 }
