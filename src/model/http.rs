@@ -6,7 +6,7 @@
 
 use crate::application::auth::{Auth, Session, WebsocketInfo};
 use crate::application::config::Config;
-use crate::application::rate_limiter::RateLimiter;
+use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
 use crate::error::AppError;
 use crate::model::retry::RetryConfig;
 use reqwest::Client as HttpInternalClient;
@@ -423,16 +423,22 @@ pub async fn make_http_request<B: Serialize>(
 ) -> Result<Response, AppError> {
     let max_retries = retry_config.max_retries();
 
+    // Pace this request against the bucket for its endpoint class (trading /
+    // historical / non-trading) so trading calls never queue behind bulk
+    // non-trading traffic. The class is derived purely from the method + URL.
+    let class = classify_endpoint(&method, url);
+
     // Bounded loop: `attempt` ranges over [0, max_retries]. Attempt 0 is the
     // first try; each further attempt is a retry. This can never loop forever.
     for attempt in 0..=max_retries {
-        // Wait for rate limiter before making request
-        {
-            let limiter = rate_limiter.read().await;
-            limiter.wait().await;
-        }
+        // Wait for rate limiter before making request. Clone the limiter (cheap
+        // `Arc` copy) out of the read guard and drop the guard before awaiting,
+        // so a pending config swap on the write side is never blocked behind an
+        // in-flight rate-limit wait.
+        let limiter = rate_limiter.read().await.clone();
+        limiter.wait_for(class).await;
 
-        debug!(%method, %url, "http request");
+        debug!(%method, %url, class = ?class, "http request");
 
         // Build request
         let mut request = client.request(method.clone(), url);
@@ -561,10 +567,96 @@ pub(crate) fn classify_status(status: StatusCode) -> StatusClass {
     }
 }
 
+/// Classifies an IG endpoint into its `RateLimitClass` from the HTTP method
+/// and request path (or full URL).
+///
+/// Mapping:
+/// - `POST` / `PUT` / `DELETE` on `positions/otc` or `workingorders/otc`
+///   (order and position mutations, including position close via
+///   `POST` + `_method: DELETE`) → `RateLimitClass::Trading`.
+/// - Any path under `prices/` (historical price fetches) →
+///   `RateLimitClass::Historical`.
+/// - Everything else (market data, account queries, sentiment, watchlists,
+///   working-order / position *reads*, …) → `RateLimitClass::NonTrading`.
+///
+/// `path` may be a bare path or a full URL; matching is by path substring, so
+/// both `positions/otc` and `.../positions/otc/{deal_id}` classify as trading.
+/// A `GET` on `positions` or `workingorders` is a read and stays non-trading.
+#[must_use]
+#[inline]
+pub(crate) fn classify_endpoint(method: &Method, path: &str) -> RateLimitClass {
+    let is_mutation = matches!(*method, Method::POST | Method::PUT | Method::DELETE);
+    let is_trading_path = path.contains("positions/otc") || path.contains("workingorders/otc");
+
+    if is_mutation && is_trading_path {
+        RateLimitClass::Trading
+    } else if path.contains("prices/") {
+        RateLimitClass::Historical
+    } else {
+        RateLimitClass::NonTrading
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StatusClass, classify_status};
-    use reqwest::StatusCode;
+    use super::{StatusClass, classify_endpoint, classify_status};
+    use crate::application::rate_limiter::RateLimitClass;
+    use reqwest::{Method, StatusCode};
+
+    const BASE: &str = "https://demo-api.ig.com/gateway/deal";
+
+    #[test]
+    fn test_classify_endpoint_post_positions_otc_is_trading() {
+        assert_eq!(
+            classify_endpoint(&Method::POST, &format!("{BASE}/positions/otc")),
+            RateLimitClass::Trading
+        );
+    }
+
+    #[test]
+    fn test_classify_endpoint_get_prices_is_historical() {
+        assert_eq!(
+            classify_endpoint(&Method::GET, &format!("{BASE}/prices/CS.D.EURUSD.MINI.IP")),
+            RateLimitClass::Historical
+        );
+    }
+
+    #[test]
+    fn test_classify_endpoint_get_markets_is_non_trading() {
+        assert_eq!(
+            classify_endpoint(&Method::GET, &format!("{BASE}/markets/CS.D.EURUSD.MINI.IP")),
+            RateLimitClass::NonTrading
+        );
+    }
+
+    #[test]
+    fn test_classify_endpoint_put_position_update_is_trading() {
+        // Position amend: PUT positions/otc/{deal_id}.
+        assert_eq!(
+            classify_endpoint(&Method::PUT, &format!("{BASE}/positions/otc/DIAAAABBBCCC")),
+            RateLimitClass::Trading
+        );
+    }
+
+    #[test]
+    fn test_classify_endpoint_delete_working_order_is_trading() {
+        assert_eq!(
+            classify_endpoint(
+                &Method::DELETE,
+                &format!("{BASE}/workingorders/otc/DIAAAABBBCCC")
+            ),
+            RateLimitClass::Trading
+        );
+    }
+
+    #[test]
+    fn test_classify_endpoint_get_positions_read_is_non_trading() {
+        // A GET on positions is a read, not a mutation, so it stays non-trading.
+        assert_eq!(
+            classify_endpoint(&Method::GET, &format!("{BASE}/positions")),
+            RateLimitClass::NonTrading
+        );
+    }
 
     #[test]
     fn test_classify_status_429_is_retryable() {
