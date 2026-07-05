@@ -46,7 +46,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     subscription.add_listener(Box::new(listener));
 
     let client = Client::default();
-    let ws_info = client.get_ws_info().await;
+    let ws_info = client.ws_info().await?;
     let password = ws_info.get_ws_password();
 
     debug!(

@@ -80,7 +80,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
     // Initialize the IG client and get WebSocket credentials
     let http_client = Client::default();
-    let ws_info = http_client.get_ws_info().await;
+    let ws_info = http_client.ws_info().await?;
     let password = ws_info.get_ws_password();
     debug!(
         server = %ws_info.server,
