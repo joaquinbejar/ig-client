@@ -80,8 +80,8 @@ fn create_order_limit_and_chainers() {
     assert_eq!(order.time_in_force, TimeInForce::GoodTillCancelled);
     assert_eq!(order.level, Some(16000.5));
     assert_eq!(order.currency_code, "USD");
-    // rounded down
-    assert!((order.size - 2.99).abs() < 1e-9);
+    // rounded to nearest two decimals: 2.999 -> 3.00
+    assert!((order.size - 3.0).abs() < 1e-9);
 
     assert_eq!(order.stop_level, Some(15900.0));
     assert_eq!(order.limit_level, Some(15000.0));
@@ -105,7 +105,8 @@ fn create_option_helpers_sell_and_buy_default_levels() {
     assert_eq!(sell.direction, Direction::Sell);
     assert_eq!(sell.order_type, OrderType::Limit);
     assert_eq!(sell.level, Some(DEFAULT_ORDER_SELL_LEVEL));
-    assert!((sell.size - 5.55).abs() < 1e-9);
+    // rounded to nearest two decimals: 5.555 -> 5.56
+    assert!((sell.size - 5.56).abs() < 1e-9);
     assert_eq!(sell.currency_code, "EUR");
     assert!(sell.deal_reference.is_some()); // auto generated when None
 
@@ -211,4 +212,58 @@ fn create_working_order_builders() {
     );
     assert_eq!(ws.order_type, OrderType::Stop);
     assert_eq!(ws.time_in_force, TimeInForce::GoodTillCancelled);
+}
+
+/// Regression for the floor-rounding bug: `(size * 100.0).floor() / 100.0`
+/// silently shrank sizes (0.29 -> 0.28) because `0.29 * 100.0` is
+/// `28.999999999999996` in f64. Every `CreateOrderRequest` constructor must send
+/// the requested size back unchanged for values with a clean two-decimal form.
+#[test]
+fn create_order_constructors_preserve_two_decimal_sizes() {
+    // Values whose `* 100.0` product falls just below an integer in f64, which
+    // `floor` truncated downward.
+    let sizes = [0.29_f64, 0.57, 0.58, 1.13, 2.29, 10.57];
+
+    for &s in &sizes {
+        let expect = |got: f64| {
+            assert!(
+                (got - s).abs() < 1e-9,
+                "size {s} was corrupted to {got} by the constructor"
+            );
+        };
+
+        expect(CreateOrderRequest::market("EPIC".to_string(), Direction::Buy, s, None, None).size);
+        expect(
+            CreateOrderRequest::limit("EPIC".to_string(), Direction::Buy, s, 100.0, None, None)
+                .size,
+        );
+        expect(
+            CreateOrderRequest::sell_option_to_market("EPIC".to_string(), s, None, None, None).size,
+        );
+        expect(
+            CreateOrderRequest::sell_option_to_market_w_force(
+                "EPIC".to_string(),
+                s,
+                None,
+                None,
+                None,
+                true,
+            )
+            .size,
+        );
+        expect(
+            CreateOrderRequest::buy_option_to_market("EPIC".to_string(), s, None, None, None).size,
+        );
+        expect(
+            CreateOrderRequest::buy_option_to_market_w_force(
+                "EPIC".to_string(),
+                s,
+                None,
+                None,
+                None,
+                true,
+            )
+            .size,
+        );
+    }
 }
