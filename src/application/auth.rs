@@ -346,7 +346,7 @@ impl Auth {
             &url,
             headers,
             &Some(body),
-            RetryConfig::infinite(),
+            RetryConfig::default(),
         )
         .await?;
 
@@ -437,7 +437,7 @@ impl Auth {
             &url,
             headers,
             &Some(body),
-            RetryConfig::infinite(),
+            RetryConfig::default(),
         )
         .await?;
 
@@ -550,7 +550,7 @@ impl Auth {
             &url,
             headers,
             &Some(body),
-            RetryConfig::infinite(),
+            RetryConfig::default(),
         )
         .await?;
 

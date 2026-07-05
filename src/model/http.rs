@@ -369,10 +369,16 @@ impl Default for HttpClient {
 /// * `Ok(Response)` - Successful HTTP response
 /// * `Err(AppError)` - Error if request fails (excluding rate limit errors which are retried)
 ///
+/// Retry is always finite: transient failures (429, 5xx, and IG allowance
+/// rate limits) are retried with exponential backoff up to
+/// `retry_config.max_retries()`; everything else fails fast. The 401
+/// token-refresh path is handled by the caller, not here.
+///
 /// # Example
 ///
 /// ```ignore
-/// use ig_client::model::http::{make_http_request, RetryConfig};
+/// use ig_client::model::http::make_http_request;
+/// use ig_client::model::retry::RetryConfig;
 /// use reqwest::{Client, Method};
 /// use std::sync::Arc;
 /// use tokio::sync::RwLock;
@@ -384,7 +390,7 @@ impl Default for HttpClient {
 ///     ("Content-Type", "application/json"),
 /// ];
 ///
-/// // Infinite retries with 10 second delay (default)
+/// // Finite defaults (DEFAULT_MAX_RETRIES retries, exponential backoff)
 /// let response = make_http_request(
 ///     &client,
 ///     rate_limiter.clone(),
@@ -392,32 +398,10 @@ impl Default for HttpClient {
 ///     "https://demo-api.ig.com/gateway/deal/markets/EPIC",
 ///     headers.clone(),
 ///     &None::<()>,
-///     RetryConfig::infinite(),
+///     RetryConfig::default(),
 /// ).await?;
 ///
-/// // Maximum 3 retries with default 10 second delay
-/// let response = make_http_request(
-///     &client,
-///     rate_limiter.clone(),
-///     Method::GET,
-///     "https://demo-api.ig.com/gateway/deal/markets/EPIC",
-///     headers.clone(),
-///     &None::<()>,
-///     RetryConfig::with_max_retries(3),
-/// ).await?;
-///
-/// // Infinite retries with custom 5 second delay
-/// let response = make_http_request(
-///     &client,
-///     rate_limiter.clone(),
-///     Method::GET,
-///     "https://demo-api.ig.com/gateway/deal/markets/EPIC",
-///     headers.clone(),
-///     &None::<()>,
-///     RetryConfig::with_delay(5),
-/// ).await?;
-///
-/// // Maximum 3 retries with custom 5 second delay
+/// // Maximum 3 retries with a 5 second base delay
 /// let response = make_http_request(
 ///     &client,
 ///     rate_limiter,
@@ -437,18 +421,18 @@ pub async fn make_http_request<B: Serialize>(
     body: &Option<B>,
     retry_config: RetryConfig,
 ) -> Result<Response, AppError> {
-    let mut retry_count = 0;
     let max_retries = retry_config.max_retries();
-    let delay_secs = retry_config.delay_secs();
 
-    loop {
+    // Bounded loop: `attempt` ranges over [0, max_retries]. Attempt 0 is the
+    // first try; each further attempt is a retry. This can never loop forever.
+    for attempt in 0..=max_retries {
         // Wait for rate limiter before making request
         {
             let limiter = rate_limiter.read().await;
             limiter.wait().await;
         }
 
-        debug!("{} {}", method, url);
+        debug!(%method, %url, "http request");
 
         // Build request
         let mut request = client.request(method.clone(), url);
@@ -466,23 +450,23 @@ pub async fn make_http_request<B: Serialize>(
         // Send request
         let response = request.send().await?;
         let status = response.status();
-        debug!("Response status: {}", status);
+        debug!(status = ?status, "http response");
 
         if status.is_success() {
             return Ok(response);
         }
 
-        match status {
+        // Classify the failure into a retryable error or an immediate return.
+        // Body-dependent statuses (401, 403) are handled inline; everything
+        // else goes through the pure `classify_status` helper.
+        let retryable_err: AppError = match status {
             StatusCode::FORBIDDEN => {
                 let body_text = response.text().await.unwrap_or_default();
 
                 // Historical data allowance is a weekly quota (default 10,000 data points).
                 // Retrying is pointless — fail fast and let the caller decide.
                 if body_text.contains("exceeded-account-historical-data-allowance") {
-                    error!(
-                        "Historical data allowance exceeded (weekly quota exhausted): {}",
-                        body_text
-                    );
+                    error!("historical data allowance exceeded (weekly quota exhausted)");
                     return Err(AppError::HistoricalDataAllowanceExceeded {
                         allowance_expiry: 0,
                     });
@@ -492,41 +476,133 @@ pub async fn make_http_request<B: Serialize>(
                     || body_text.contains("exceeded-account-allowance")
                     || body_text.contains("exceeded-account-trading-allowance")
                 {
-                    retry_count += 1;
-
-                    // Check if we've exceeded max retries (0 = infinite)
-                    if max_retries > 0 && retry_count > max_retries {
-                        error!(
-                            "Rate limit exceeded after {} attempts. Max retries ({}) reached.",
-                            retry_count - 1,
-                            max_retries
-                        );
-                        return Err(AppError::RateLimitExceeded);
-                    }
-
-                    warn!(
-                        "Rate limit exceeded (attempt {}): {}. Waiting {} seconds before retry...",
-                        retry_count, body_text, delay_secs
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
-                    continue; // Retry the request
+                    warn!(status = ?status, "allowance rate limit hit");
+                    AppError::RateLimitExceeded
+                } else {
+                    error!(status = ?status, "forbidden");
+                    return Err(AppError::Unexpected(status));
                 }
-                error!("Forbidden: {}", body_text);
-                return Err(AppError::Unexpected(status));
             }
             StatusCode::UNAUTHORIZED => {
                 let body_text = response.text().await.unwrap_or_default();
                 if body_text.contains("oauth-token-invalid") {
+                    // Surface to the caller so it can refresh the token and replay.
                     return Err(AppError::OAuthTokenExpired);
                 }
-                error!("Unauthorized: {}", body_text);
+                error!(status = ?status, "unauthorized");
                 return Err(AppError::Unauthorized);
             }
-            _ => {
-                let body = response.text().await.unwrap_or_default();
-                error!("Request failed with status {}: {}", status, body);
-                return Err(AppError::Unexpected(status));
-            }
+            other => match classify_status(other) {
+                StatusClass::Retryable => {
+                    // Drain the body (without logging it) so reqwest can return
+                    // the connection to the pool; an undrained body forces the
+                    // connection closed and amplifies load during retry storms.
+                    let _ = response.bytes().await;
+                    if other == StatusCode::TOO_MANY_REQUESTS {
+                        warn!(status = ?other, "rate limit (429) hit");
+                        AppError::RateLimitExceeded
+                    } else {
+                        warn!(status = ?other, "server error");
+                        AppError::Unexpected(other)
+                    }
+                }
+                StatusClass::Permanent => {
+                    error!(status = ?other, "request failed");
+                    return Err(AppError::Unexpected(other));
+                }
+            },
+        };
+
+        // We have a transient failure. Retry with exponential backoff unless the
+        // budget is exhausted (`attempt` here is < max_retries only when retrying).
+        if attempt < max_retries {
+            let delay = retry_config.delay_for_attempt(attempt);
+            let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+            warn!(
+                attempt = attempt.saturating_add(1),
+                max_retries, delay_ms, "retrying after transient failure"
+            );
+            tokio::time::sleep(delay).await;
+            continue;
         }
+
+        error!(max_retries, "retries exhausted after transient failures");
+        return Err(retryable_err);
+    }
+
+    // Unreachable: `0..=max_retries` always yields at least one iteration and the
+    // final iteration returns. Kept to satisfy the type checker without a panic.
+    Err(AppError::RateLimitExceeded)
+}
+
+/// Classification of an HTTP status code for retry decisions.
+///
+/// Body-dependent statuses (401, 403) are handled separately in
+/// [`make_http_request`]; this covers the status-only decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusClass {
+    /// Transient failure: retry with backoff.
+    Retryable,
+    /// Permanent failure: return immediately.
+    Permanent,
+}
+
+/// Classifies a non-success HTTP status as transient (retryable) or permanent.
+///
+/// Transient: `429 Too Many Requests` and any `5xx` server error. Everything
+/// else (client errors other than 429) is permanent and fails fast.
+#[must_use]
+#[inline]
+pub(crate) fn classify_status(status: StatusCode) -> StatusClass {
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        StatusClass::Retryable
+    } else {
+        StatusClass::Permanent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StatusClass, classify_status};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn test_classify_status_429_is_retryable() {
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS),
+            StatusClass::Retryable
+        );
+    }
+
+    #[test]
+    fn test_classify_status_500_is_retryable() {
+        assert_eq!(
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusClass::Retryable
+        );
+        assert_eq!(
+            classify_status(StatusCode::BAD_GATEWAY),
+            StatusClass::Retryable
+        );
+        assert_eq!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE),
+            StatusClass::Retryable
+        );
+    }
+
+    #[test]
+    fn test_classify_status_400_is_permanent() {
+        assert_eq!(
+            classify_status(StatusCode::BAD_REQUEST),
+            StatusClass::Permanent
+        );
+        assert_eq!(
+            classify_status(StatusCode::NOT_FOUND),
+            StatusClass::Permanent
+        );
+        assert_eq!(
+            classify_status(StatusCode::CONFLICT),
+            StatusClass::Permanent
+        );
     }
 }
