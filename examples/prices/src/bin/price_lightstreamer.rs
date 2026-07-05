@@ -24,7 +24,11 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     let http_client = Client::default();
     let ws_info = http_client.get_ws_info().await;
     let password = ws_info.get_ws_password();
-    debug!("{ws_info:?}");
+    debug!(
+        server = %ws_info.server,
+        account_id = %ws_info.account_id,
+        "WebSocket info obtained"
+    );
 
     // Create a subscription for a market
     let epic = format!("PRICE:{}:OP.D.OTCSPXWK.6720C.IP", ws_info.account_id);

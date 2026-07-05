@@ -1033,7 +1033,12 @@ impl OperationsService for Client {
             .http_client
             .get("operations/application", Some(1))
             .await?;
-        debug!("Client application obtained: {}", result.api_key);
+        // Never log `api_key`: it is a live credential.
+        debug!(
+            name = ?result.name,
+            status = %result.status,
+            "Client application obtained"
+        );
         Ok(result)
     }
 
