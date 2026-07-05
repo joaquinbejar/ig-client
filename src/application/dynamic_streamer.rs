@@ -15,6 +15,7 @@ use crate::model::streaming::StreamingMarketField;
 use crate::presentation::price::PriceData;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tracing::{debug, info, warn};
 
@@ -80,6 +81,11 @@ pub struct DynamicMarketStreamer {
     is_connected: Arc<RwLock<bool>>,
     /// Shutdown signal for current connection
     shutdown_signal: Arc<RwLock<Option<Arc<Notify>>>>,
+    /// Monotonic connection generation. Bumped on every `start_internal`; a
+    /// connection task only clears `is_connected` on exit if its captured
+    /// generation is still current, so a superseded task tearing down its old
+    /// connection cannot clobber the state of the newer one that replaced it.
+    generation: Arc<AtomicU64>,
 }
 
 impl DynamicMarketStreamer {
@@ -113,6 +119,7 @@ impl DynamicMarketStreamer {
             price_rx: Arc::new(RwLock::new(Some(price_rx))),
             is_connected: Arc::new(RwLock::new(false)),
             shutdown_signal: Arc::new(RwLock::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -195,12 +202,18 @@ impl DynamicMarketStreamer {
 
     /// Clears all market EPICs from the subscription list.
     ///
-    /// Note: Due to Lightstreamer limitations, this does not unsubscribe from
-    /// the server immediately. All EPICs will be removed from the internal list.
+    /// If the streamer is connected, the live connection is shut down so it
+    /// stops forwarding updates for the cleared EPICs, mirroring [`remove`]:
+    /// the current connection is signalled and, because reconnection no-ops on
+    /// an empty EPIC set, no new connection is started. After this call the
+    /// streamer reports as disconnected.
+    ///
+    /// [`remove`]: DynamicMarketStreamer::remove
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` when all EPICs have been cleared.
+    /// Returns `Ok(())` when all EPICs have been cleared and, if it was
+    /// connected, the connection has been signalled to stop.
     ///
     /// # Examples
     ///
@@ -212,6 +225,20 @@ impl DynamicMarketStreamer {
         let count = epics.len();
         epics.clear();
         info!("Cleared {} EPICs from subscription list", count);
+        drop(epics); // Release lock before touching connection state
+
+        // If connected, shut the live connection down so data flow actually
+        // stops. `reconnect` signals the current connection; `start_internal`
+        // no-ops on the now-empty EPIC set, so nothing reconnects.
+        let is_connected = *self.is_connected.read().await;
+        if is_connected {
+            self.reconnect().await?;
+            // No new connection is started for an empty EPIC set, so make the
+            // stopped state explicit and immediate instead of waiting for the
+            // connection task to flip it asynchronously.
+            *self.is_connected.write().await = false;
+        }
+
         Ok(())
     }
 
@@ -296,6 +323,11 @@ impl DynamicMarketStreamer {
 
         info!("Starting connection with {} EPICs", epics.len());
 
+        // Claim a new connection generation. The task spawned below owns this
+        // number; a later `start_internal` bumps it, marking any earlier task as
+        // superseded so it will not clobber `is_connected` on teardown.
+        let my_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+
         // Create new client
         let mut new_client = StreamerClient::new().await?;
 
@@ -331,19 +363,40 @@ impl DynamicMarketStreamer {
         // Spawn connection task in background
         let client = Arc::clone(&self.client);
         let is_connected = Arc::clone(&self.is_connected);
+        let generation = Arc::clone(&self.generation);
 
         tokio::spawn(async move {
-            let result = {
-                let mut client_guard = client.write().await;
-                if let Some(ref mut c) = *client_guard {
-                    c.connect(Some(signal)).await
-                } else {
-                    Ok(())
-                }
+            // Move the client out of the shared lock under a short-lived guard,
+            // then run the long-lived connection WITHOUT holding any lock. This
+            // is the core of the fix: previously the write guard was held across
+            // the whole `connect().await`, so any concurrent `add`/`remove`/
+            // `disconnect` that needs the client lock hung until disconnect.
+            let taken = {
+                let mut guard = client.write().await;
+                guard.take()
             };
 
-            // Mark as disconnected
-            *is_connected.write().await = false;
+            let result = if let Some(mut c) = taken {
+                let r = c.connect(Some(signal)).await;
+                // The connection has ended (shutdown signal or error): close the
+                // Lightstreamer session and drain its converter tasks, then drop
+                // the owned client so it is never left half-open.
+                if let Err(e) = c.disconnect().await {
+                    tracing::error!("Error closing streamer session: {}", e);
+                }
+                r
+            } else {
+                Ok(())
+            };
+
+            // Mark as disconnected only if we are still the current generation.
+            // A newer `start_internal` (from reconnect on add/remove/clear) may
+            // have already brought up a fresh connection while this superseded
+            // task was still tearing its old one down; clobbering the flag here
+            // would leave the streamer reporting disconnected while live.
+            if generation.load(Ordering::SeqCst) == my_generation {
+                *is_connected.write().await = false;
+            }
 
             match result {
                 Ok(_) => info!("Connection task completed successfully"),
@@ -421,7 +474,8 @@ impl DynamicMarketStreamer {
     /// streamer.disconnect().await?;
     /// ```
     pub async fn disconnect(&mut self) -> Result<(), AppError> {
-        // Signal shutdown
+        // Signal shutdown to the current connection task; once its `connect`
+        // returns it closes the Lightstreamer session itself.
         {
             let shutdown_lock = self.shutdown_signal.read().await;
             if let Some(signal) = shutdown_lock.as_ref() {
@@ -429,12 +483,18 @@ impl DynamicMarketStreamer {
             }
         }
 
-        // Disconnect client
-        let mut client_lock = self.client.write().await;
-        if let Some(ref mut client) = *client_lock {
+        // If the client is still owned here (the connection task has not taken
+        // it yet, or no connection was ever started), close it directly. During
+        // a live connection the task owns the client, so this take yields `None`
+        // and the task performs the close after being signalled above. The guard
+        // is scoped so it is never held across the `disconnect().await`.
+        let taken = {
+            let mut client_lock = self.client.write().await;
+            client_lock.take()
+        };
+        if let Some(mut client) = taken {
             client.disconnect().await?;
         }
-        *client_lock = None;
 
         *self.is_connected.write().await = false;
         info!("Disconnected from Lightstreamer server");
@@ -452,6 +512,113 @@ impl Clone for DynamicMarketStreamer {
             price_rx: Arc::clone(&self.price_rx),
             is_connected: Arc::clone(&self.is_connected),
             shutdown_signal: Arc::clone(&self.shutdown_signal),
+            generation: Arc::clone(&self.generation),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DynamicMarketStreamer;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    const TEST_EPIC: &str = "IX.D.DAX.DAILY.IP";
+
+    // --- Task 4: clear() must stop data flow when connected ----------------
+
+    #[tokio::test]
+    async fn test_clear_when_not_connected_empties_epics() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+        streamer.epics.write().await.insert(TEST_EPIC.to_string());
+
+        let result = streamer.clear().await;
+
+        assert!(result.is_ok(), "clear should succeed: {result:?}");
+        assert!(
+            streamer.get_epics().await.is_empty(),
+            "EPIC set should be empty after clear"
+        );
+        assert!(
+            !*streamer.is_connected.read().await,
+            "should not report connected when it never was"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_when_connected_signals_shutdown_and_reports_stopped() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        // Simulate a live connection: one EPIC, connected, and a shutdown
+        // signal that a connection task would be parked on.
+        streamer.epics.write().await.insert(TEST_EPIC.to_string());
+        *streamer.is_connected.write().await = true;
+        let signal = Arc::new(Notify::new());
+        *streamer.shutdown_signal.write().await = Some(Arc::clone(&signal));
+
+        // Stand-in for the live connection waiting to be shut down.
+        let waiter = tokio::spawn(async move { signal.notified().await });
+
+        let result = streamer.clear().await;
+
+        assert!(result.is_ok(), "clear should succeed: {result:?}");
+        assert!(
+            streamer.get_epics().await.is_empty(),
+            "EPIC set should be empty after clear"
+        );
+        assert!(
+            !*streamer.is_connected.read().await,
+            "clear must mark the streamer disconnected so data flow stops"
+        );
+        // clear() must have signalled the live connection to shut down. With a
+        // stored permit the waiter wakes deterministically.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .is_ok(),
+            "live connection did not observe the shutdown signal from clear()"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_superseded_generation_does_not_clear_is_connected() {
+        // Models the connection-task teardown race: a newer generation is live
+        // (is_connected == true) while an older, superseded task finishes tearing
+        // its connection down. The superseded task must NOT clear the flag.
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        // A newer connection has come up: bump the generation and mark connected.
+        let newer = streamer.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *streamer.is_connected.write().await = true;
+
+        // An older task captured an earlier generation.
+        let older = newer - 1;
+
+        // Replicate the task's exit guard for the superseded (older) generation.
+        if streamer.generation.load(Ordering::SeqCst) == older {
+            *streamer.is_connected.write().await = false;
+        }
+        assert!(
+            *streamer.is_connected.read().await,
+            "a superseded generation must not clear is_connected on the newer one"
+        );
+
+        // The current generation's own teardown still clears it.
+        if streamer.generation.load(Ordering::SeqCst) == newer {
+            *streamer.is_connected.write().await = false;
+        }
+        assert!(
+            !*streamer.is_connected.read().await,
+            "the current generation's teardown must clear is_connected"
+        );
     }
 }
