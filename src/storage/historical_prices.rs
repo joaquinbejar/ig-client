@@ -53,22 +53,49 @@ pub async fn initialize_historical_prices_table(pool: &PgPool) -> Result<(), sql
         );
     }
 
-    // Attempt to drop the old unique constraint
-    let _ = sqlx::query(
-        r#"
-        ALTER TABLE historical_prices 
-        DROP CONSTRAINT IF EXISTS historical_prices_epic_snapshot_time_key;
-        
-        ALTER TABLE historical_prices
-        DROP CONSTRAINT IF EXISTS historical_prices_epic_resolution_snapshot_time_key;
-        
-        ALTER TABLE historical_prices 
-        ADD CONSTRAINT historical_prices_epic_resolution_snapshot_time_key 
-        UNIQUE (epic, resolution, snapshot_time);
-        "#,
+    // Migrate the unique constraint to (epic, resolution, snapshot_time).
+    //
+    // Postgres' extended/prepared protocol rejects multiple statements in a
+    // single query, so each DDL statement must be issued on its own. Errors
+    // are surfaced rather than silently discarded.
+
+    // Drop the legacy two-column constraint if a pre-migration database has it.
+    // `IF EXISTS` makes this idempotent. The target three-column constraint is
+    // NOT dropped here: `CREATE TABLE ... UNIQUE(epic, resolution, snapshot_time)`
+    // above already creates it (auto-named `historical_prices_epic_resolution_snapshot_time_key`),
+    // so dropping and re-adding it on every startup would churn an
+    // AccessExclusive lock for nothing. The tolerant ADD below handles both the
+    // fresh case (constraint already present → 42710 → skipped) and the migration
+    // case (old two-column DB whose legacy constraint was just dropped).
+    sqlx::query(
+        "ALTER TABLE historical_prices \
+         DROP CONSTRAINT IF EXISTS historical_prices_epic_snapshot_time_key",
     )
     .execute(pool)
-    .await;
+    .await?;
+
+    // Add the three-column unique constraint. There is no `IF NOT EXISTS` for
+    // `ADD CONSTRAINT`, so tolerate a duplicate-object error (SQLSTATE 42710)
+    // when it already exists while surfacing any other failure.
+    if let Err(e) = sqlx::query(
+        "ALTER TABLE historical_prices \
+         ADD CONSTRAINT historical_prices_epic_resolution_snapshot_time_key \
+         UNIQUE (epic, resolution, snapshot_time)",
+    )
+    .execute(pool)
+    .await
+    {
+        match e.as_database_error().and_then(|db| db.code()) {
+            // 42710 = duplicate_object: the constraint already exists.
+            Some(code) if code == "42710" => {
+                warn!(
+                    constraint = "historical_prices_epic_resolution_snapshot_time_key",
+                    "unique constraint already exists, skipping add"
+                );
+            }
+            _ => return Err(e),
+        }
+    }
 
     // Create index for better query performance
     sqlx::query(
@@ -167,8 +194,13 @@ pub async fn store_historical_prices(
             }
         };
 
-        // Use UPSERT (INSERT ... ON CONFLICT ... DO UPDATE)
-        let result = sqlx::query(
+        // Use UPSERT (INSERT ... ON CONFLICT ... DO UPDATE) and classify the
+        // outcome from the SAME statement via `RETURNING (xmax = 0)`:
+        // `xmax = 0` on the returned tuple means a fresh insert, while a
+        // non-zero `xmax` means the conflicting row was updated. This avoids a
+        // second round trip and is correct for same-batch duplicates (the older
+        // `created_at = updated_at` heuristic double-counted them as inserts).
+        let row = sqlx::query(
             r#"
             INSERT INTO historical_prices (
                 epic, resolution, snapshot_time,
@@ -178,7 +210,7 @@ pub async fn store_historical_prices(
                 close_bid, close_ask, close_last_traded,
                 last_traded_volume
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-            ON CONFLICT (epic, resolution, snapshot_time) 
+            ON CONFLICT (epic, resolution, snapshot_time)
             DO UPDATE SET
                 open_bid = EXCLUDED.open_bid,
                 open_ask = EXCLUDED.open_ask,
@@ -194,6 +226,7 @@ pub async fn store_historical_prices(
                 close_last_traded = EXCLUDED.close_last_traded,
                 last_traded_volume = EXCLUDED.last_traded_volume,
                 updated_at = NOW()
+            RETURNING (xmax = 0) AS inserted
             "#,
         )
         .bind(epic)
@@ -212,28 +245,15 @@ pub async fn store_historical_prices(
         .bind(price.close_price.ask)
         .bind(price.close_price.last_traded)
         .bind(price.last_traded_volume)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
-        // Check if it was an insert or update
-        if result.rows_affected() > 0 {
-            // Query to check if this was an insert or update
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM historical_prices WHERE epic = $1 AND resolution = $2 AND snapshot_time = $3 AND created_at = updated_at"
-            )
-                .bind(epic)
-                .bind(resolution)
-                .bind(snapshot_time)
-                .fetch_one(&mut *tx)
-                .await?;
-
-            if count > 0 {
-                stats.inserted += 1;
-            } else {
-                stats.updated += 1;
-            }
+        // `DO UPDATE` always returns exactly one row, so classification is
+        // unambiguous.
+        if row.get::<bool, _>("inserted") {
+            stats.inserted += 1;
         } else {
-            stats.skipped += 1;
+            stats.updated += 1;
         }
 
         // Log progress every 100 records
@@ -334,10 +354,30 @@ pub async fn get_table_statistics(
         .await?
     };
 
+    // `COUNT(*)` is never NULL, but the aggregate columns
+    // (`MIN`/`MAX`/`AVG`, and the `::text` date bounds) are all NULL for an
+    // epic with no rows. Read every nullable column as an `Option` so a
+    // zero-row epic returns zeroed stats instead of panicking in `Row::get`.
+    let total_records: i64 = row.get("total_records");
+    if total_records == 0 {
+        return Ok(TableStats {
+            total_records: 0,
+            earliest_date: String::new(),
+            latest_date: String::new(),
+            avg_close_price: 0.0,
+            min_price: 0.0,
+            max_price: 0.0,
+        });
+    }
+
     Ok(TableStats {
-        total_records: row.get("total_records"),
-        earliest_date: row.get("earliest_date"),
-        latest_date: row.get("latest_date"),
+        total_records,
+        earliest_date: row
+            .get::<Option<String>, _>("earliest_date")
+            .unwrap_or_default(),
+        latest_date: row
+            .get::<Option<String>, _>("latest_date")
+            .unwrap_or_default(),
         avg_close_price: row.get::<Option<f64>, _>("avg_close_price").unwrap_or(0.0),
         min_price: row.get::<Option<f64>, _>("min_price").unwrap_or(0.0),
         max_price: row.get::<Option<f64>, _>("max_price").unwrap_or(0.0),

@@ -437,10 +437,23 @@ impl MarketDatabaseService {
         market: &MarketData,
         node_id: &str,
     ) -> MarketInstrument {
+        // Persist the serde wire value of the instrument type (e.g.
+        // `OPT_CURRENCIES`, `INDICES`) WITHOUT surrounding quotes. Using
+        // `format!("{:?}", ..)` would emit the `DebugPretty` (serde_json)
+        // rendering, which includes literal quotes (e.g. `"\"OPT_CURRENCIES\""`).
+        // `instrument_type` is NOT NULL and used for filtering, so never store an
+        // empty string: fall back to an explicit `UNKNOWN` sentinel if the enum
+        // ever fails to serialize to a string (structurally unreachable today,
+        // but a wrong-but-visible value beats a silent empty one).
+        let instrument_type = serde_json::to_value(market.instrument_type)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+
         let mut instrument = MarketInstrument::new(
             market.epic.clone(),
             market.instrument_name.clone(),
-            format!("{:?}", market.instrument_type).to_uppercase(),
+            instrument_type,
             node_id.to_string(),
             self.exchange_name.clone(),
         );
@@ -678,22 +691,23 @@ impl DatabaseStatistics {
 mod tests {
     use super::*;
     use crate::presentation::instrument::InstrumentType;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-    #[tokio::test]
-    #[ignore]
-    async fn test_convert_market_data_to_instrument() {
-        let service = MarketDatabaseService::new(
-            // This would be a real pool in actual tests
-            PgPool::connect("postgresql://test")
-                .await
-                .unwrap_or_else(|_| panic!("Test requires a PostgreSQL connection")),
-            "IG".to_string(),
-        );
+    /// Builds a `MarketDatabaseService` backed by a lazily-connected pool.
+    ///
+    /// `connect_lazy_with` never opens a socket (it only needs a Tokio
+    /// context), so pure conversion helpers (which do not touch the pool) can
+    /// be unit-tested without a live database and therefore run in CI.
+    fn lazy_service() -> MarketDatabaseService {
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        MarketDatabaseService::new(pool, "IG".to_string())
+    }
 
-        let market_data = MarketData {
+    fn market_data_with_type(instrument_type: InstrumentType) -> MarketData {
+        MarketData {
             epic: "IX.D.DAX.DAILY.IP".to_string(),
             instrument_name: "Germany 40".to_string(),
-            instrument_type: InstrumentType::Indices,
+            instrument_type,
             expiry: "DFB".to_string(),
             high_limit_price: Some(20000.0),
             low_limit_price: Some(5000.0),
@@ -704,7 +718,13 @@ mod tests {
             update_time_utc: Some("2023-12-01T10:30:00Z".to_string()),
             bid: Some(15450.2),
             offer: Some(15451.8),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convert_market_data_to_instrument_maps_fields() {
+        let service = lazy_service();
+        let market_data = market_data_with_type(InstrumentType::Indices);
 
         let instrument = service.convert_market_data_to_instrument(&market_data, "node_123");
 
@@ -717,5 +737,30 @@ mod tests {
         assert_eq!(instrument.high_limit_price, Some(20000.0));
         assert_eq!(instrument.bid, Some(15450.2));
         assert_eq!(instrument.offer, Some(15451.8));
+    }
+
+    #[tokio::test]
+    async fn test_convert_market_data_to_instrument_type_is_unquoted_wire_value() {
+        let service = lazy_service();
+
+        // Renamed variant: must persist the serde wire value with no quotes.
+        let opt = service
+            .convert_market_data_to_instrument(
+                &market_data_with_type(InstrumentType::OptCurrencies),
+                "node_1",
+            )
+            .instrument_type;
+        assert_eq!(opt, "OPT_CURRENCIES");
+        assert!(!opt.contains('"'), "wire value must not contain quotes");
+
+        // UPPERCASE-renamed variant.
+        let currencies = service
+            .convert_market_data_to_instrument(
+                &market_data_with_type(InstrumentType::Currencies),
+                "node_2",
+            )
+            .instrument_type;
+        assert_eq!(currencies, "CURRENCIES");
+        assert!(!currencies.contains('"'));
     }
 }
