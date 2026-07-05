@@ -600,6 +600,25 @@ pub struct CategoryInstrument {
     /// Multiplying factor to determine actual pip value
     #[serde(rename = "scalingFactor")]
     pub scaling_factor: Option<i64>,
+    /// Real expiry instant as Unix epoch in milliseconds (UTC).
+    ///
+    /// IG returns this as `expiryTimestamp` on the category-instruments list
+    /// endpoint. It is the authoritative expiry moment (date **and** time) and
+    /// is always UTC, so consumers should prefer it over parsing the
+    /// human-readable `expiry` string, which carries no time-of-day.
+    #[serde(rename = "expiryTimestamp")]
+    pub expiry_timestamp: Option<i64>,
+    /// Name of the underlying asset (e.g. "AUD/USD" for an FX option)
+    #[serde(rename = "underlyingName")]
+    pub underlying_name: Option<String>,
+    /// Popularity ranking value; can exceed `i32` range
+    pub popularity: Option<i64>,
+    /// Market type of the underlying (e.g. "FX_PAIR")
+    #[serde(rename = "marketType")]
+    pub market_type: Option<String>,
+    /// Market subtype of the underlying (e.g. "Fiat")
+    #[serde(rename = "marketSubtype")]
+    pub market_subtype: Option<String>,
 }
 
 /// Paging metadata for category instruments response
@@ -811,6 +830,69 @@ mod tests {
         assert!(inst.epic.is_empty());
         assert!(inst.instrument_name.is_empty());
         assert_eq!(inst.market_status, CategoryMarketStatus::Offline);
+        assert!(inst.expiry_timestamp.is_none());
+        assert!(inst.underlying_name.is_none());
+        assert!(inst.popularity.is_none());
+        assert!(inst.market_type.is_none());
+        assert!(inst.market_subtype.is_none());
+    }
+
+    #[test]
+    fn test_category_instrument_deserialization_full_payload() {
+        let json = r#"{
+            "epic": "OD.D.OTCWK2AUD.28.IP",
+            "instrumentName": "Weekly AUDUSD ($1) 7200 Call",
+            "expiry": "17-JUL-26",
+            "instrumentType": "OPT_CURRENCIES",
+            "lotSize": 1.0,
+            "otcTradeable": true,
+            "marketStatus": "EDITS_ONLY",
+            "delayTime": 0,
+            "bid": 0.0,
+            "offer": 4.0,
+            "high": 4.0,
+            "low": 0.0,
+            "netChange": 6936.2,
+            "percentageChange": 0.0,
+            "updateTime": "06:53:51",
+            "scalingFactor": 1,
+            "underlyingName": "AUD/USD",
+            "popularity": 91783089620,
+            "marketType": "FX_PAIR",
+            "marketSubtype": "Fiat",
+            "expiryTimestamp": 1784300400000
+        }"#;
+
+        let inst: CategoryInstrument = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(inst.epic, "OD.D.OTCWK2AUD.28.IP");
+        assert_eq!(inst.instrument_name, "Weekly AUDUSD ($1) 7200 Call");
+        assert_eq!(inst.expiry, "17-JUL-26");
+        assert_eq!(inst.market_status, CategoryMarketStatus::EditsOnly);
+        assert_eq!(inst.expiry_timestamp, Some(1784300400000));
+        assert_eq!(inst.underlying_name.as_deref(), Some("AUD/USD"));
+        assert_eq!(inst.popularity, Some(91783089620));
+        assert_eq!(inst.market_type.as_deref(), Some("FX_PAIR"));
+        assert_eq!(inst.market_subtype.as_deref(), Some("Fiat"));
+    }
+
+    #[test]
+    fn test_category_instrument_deserialization_without_optional_fields() {
+        let json = r#"{
+            "epic": "IX.D.FTSE.DAILY.IP",
+            "instrumentName": "FTSE 100",
+            "expiry": "-",
+            "instrumentType": "INDICES",
+            "otcTradeable": false,
+            "marketStatus": "TRADEABLE"
+        }"#;
+
+        let inst: CategoryInstrument = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(inst.epic, "IX.D.FTSE.DAILY.IP");
+        assert!(inst.expiry_timestamp.is_none());
+        assert!(inst.underlying_name.is_none());
+        assert!(inst.popularity.is_none());
+        assert!(inst.market_type.is_none());
+        assert!(inst.market_subtype.is_none());
     }
 
     #[test]
