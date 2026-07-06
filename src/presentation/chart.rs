@@ -2,6 +2,7 @@ use crate::presentation::serialization::string_as_float_opt;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt};
+use tracing::warn;
 
 /// Time scale for chart data aggregation
 #[repr(u8)]
@@ -52,9 +53,9 @@ pub struct ChartData {
     pub item_name: String,
     /// The 1-based position of the item in the subscription
     pub item_pos: usize,
-    /// Resolved chart scale for this update (derived from item name or `scale`)
+    /// Resolved chart scale for this update (derived from the item name)
     #[serde(default)]
-    pub scale: ChartScale, // Derived from the item name or the {scale} field
+    pub scale: ChartScale, // Derived from the third segment of the item name
     /// All current field values for the item
     pub fields: ChartFields,
     /// Only the fields that changed in this update
@@ -227,7 +228,7 @@ impl ChartData {
     /// Lightstreamer `ItemUpdate`, so the presentation layer carries no
     /// dependency on the streaming transport. The `ItemUpdate` adapter lives in
     /// [`crate::application::streaming_convert`]. The chart scale is derived from
-    /// the item name suffix (or the `{scale}` field as a fallback).
+    /// the third `:`-separated segment of the item name (`CHART:{epic}:{scale}`).
     ///
     /// # Arguments
     /// * `item_name` - Subscription item name (`None` when subscribed by position)
@@ -245,30 +246,28 @@ impl ChartData {
         fields: &HashMap<String, Option<String>>,
         changed_fields: &HashMap<String, Option<String>>,
     ) -> Result<Self, String> {
-        // Determine the chart scale from the item name
-        let scale = if let Some(name) = item_name {
-            if name.ends_with(":TICK") {
-                ChartScale::Tick
-            } else if name.ends_with(":SECOND") {
-                ChartScale::Second
-            } else if name.ends_with(":1MINUTE") {
-                ChartScale::OneMinute
-            } else if name.ends_with(":5MINUTE") {
-                ChartScale::FiveMinute
-            } else if name.ends_with(":HOUR") {
-                ChartScale::Hour
-            } else {
-                // Try to determine the scale from a {scale} field if it exists
-                match fields.get("{scale}").and_then(|s| s.as_ref()) {
-                    Some(s) if s == "SECOND" => ChartScale::Second,
-                    Some(s) if s == "1MINUTE" => ChartScale::OneMinute,
-                    Some(s) if s == "5MINUTE" => ChartScale::FiveMinute,
-                    Some(s) if s == "HOUR" => ChartScale::Hour,
-                    _ => ChartScale::Tick, // Default
+        // Determine the chart scale from the third `:`-separated segment of the
+        // item name (`CHART:{epic}:{scale}`). IG epics never contain `:`, so the
+        // scale is always the third segment. An unrecognized scale is logged and
+        // falls back to the default rather than silently defaulting.
+        let scale = match item_name {
+            Some(name) => match name.split(':').nth(2) {
+                Some("TICK") => ChartScale::Tick,
+                Some("SECOND") => ChartScale::Second,
+                Some("1MINUTE") => ChartScale::OneMinute,
+                Some("5MINUTE") => ChartScale::FiveMinute,
+                Some("HOUR") => ChartScale::Hour,
+                other => {
+                    warn!(
+                        item_name = %name,
+                        scale = ?other,
+                        "unrecognized chart scale in item name; defaulting to {:?}",
+                        ChartScale::default()
+                    );
+                    ChartScale::default()
                 }
-            }
-        } else {
-            ChartScale::default()
+            },
+            None => ChartScale::default(),
         };
 
         // Convert fields
@@ -470,5 +469,42 @@ mod tests {
         set.insert(ChartScale::Tick);
         set.insert(ChartScale::Tick);
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_from_fields_derives_known_scale_from_item_name() {
+        let fields = HashMap::new();
+        let changed = HashMap::new();
+        let data = ChartData::from_fields(Some("CHART:EPIC:SECOND"), 1, false, &fields, &changed)
+            .expect("from_fields should succeed");
+        assert_eq!(data.scale, ChartScale::Second);
+        assert_eq!(data.item_name, "CHART:EPIC:SECOND");
+
+        let data =
+            ChartData::from_fields(Some("CHART:IX.D.DAX.IP:HOUR"), 1, false, &fields, &changed)
+                .expect("from_fields should succeed");
+        assert_eq!(data.scale, ChartScale::Hour);
+    }
+
+    #[test]
+    fn test_from_fields_unknown_scale_defaults_to_tick() {
+        let fields = HashMap::new();
+        let changed = HashMap::new();
+        // An unrecognized scale segment falls back to the default (Tick) and
+        // logs a warning.
+        let data = ChartData::from_fields(Some("CHART:EPIC:WEEKLY"), 1, false, &fields, &changed)
+            .expect("from_fields should succeed");
+        assert_eq!(data.scale, ChartScale::default());
+        assert_eq!(data.scale, ChartScale::Tick);
+    }
+
+    #[test]
+    fn test_from_fields_no_item_name_defaults_to_tick() {
+        let fields = HashMap::new();
+        let changed = HashMap::new();
+        let data = ChartData::from_fields(None, 1, false, &fields, &changed)
+            .expect("from_fields should succeed");
+        assert_eq!(data.scale, ChartScale::default());
+        assert!(data.item_name.is_empty());
     }
 }

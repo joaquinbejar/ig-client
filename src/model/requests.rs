@@ -291,8 +291,7 @@ impl CreateOrderRequest {
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
-        let deal_reference =
-            deal_reference.or_else(|| Some(nanoid::nanoid!(30, &nanoid::alphabet::SAFE)));
+        let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
 
         Self {
             epic,
@@ -361,8 +360,7 @@ impl CreateOrderRequest {
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
-        let deal_reference =
-            deal_reference.or_else(|| Some(nanoid::nanoid!(30, &nanoid::alphabet::SAFE)));
+        let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
 
         Self {
             epic,
@@ -417,8 +415,7 @@ impl CreateOrderRequest {
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
-        let deal_reference =
-            deal_reference.or_else(|| Some(nanoid::nanoid!(30, &nanoid::alphabet::SAFE)));
+        let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
 
         Self {
             epic,
@@ -482,8 +479,7 @@ impl CreateOrderRequest {
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
-        let deal_reference =
-            deal_reference.or_else(|| Some(nanoid::nanoid!(30, &nanoid::alphabet::SAFE)));
+        let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
 
         Self {
             epic,
