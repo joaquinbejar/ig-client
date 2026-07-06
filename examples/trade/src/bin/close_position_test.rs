@@ -9,7 +9,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG Close Position Test ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     let epic = "DO.D.OTCDSTXE.GG.IP"; // Example epic for testing
     let expiry = Some(

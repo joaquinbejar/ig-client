@@ -26,7 +26,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting working order update example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let args: Vec<String> = std::env::args().collect();
 

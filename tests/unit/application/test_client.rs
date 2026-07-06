@@ -4,7 +4,7 @@ use ig_client::error::AppError;
 
 #[tokio::test]
 async fn get_multiple_market_details_empty_returns_default() {
-    let client = Client::new();
+    let client = Client::try_new().expect("client construction should succeed");
     let resp = client
         .get_multiple_market_details(&[])
         .await
@@ -14,7 +14,7 @@ async fn get_multiple_market_details_empty_returns_default() {
 
 #[tokio::test]
 async fn get_multiple_market_details_more_than_50_returns_error() {
-    let client = Client::new();
+    let client = Client::try_new().expect("client construction should succeed");
     // Build 51 dummy EPICs
     let epics: Vec<String> = (0..51).map(|i| format!("EPIC{}", i)).collect();
     let err = client
@@ -30,8 +30,9 @@ async fn get_multiple_market_details_more_than_50_returns_error() {
 }
 
 #[test]
-fn client_default_new_equivalence() {
-    let _c1 = Client::new();
-    let _c2: Client = Default::default();
-    // Construction should not panic; no further assertions needed
+fn client_try_new_succeeds() {
+    // `try_new` is the sole constructor and must not panic; it returns the
+    // built client on a healthy TLS backend.
+    let result = Client::try_new();
+    assert!(result.is_ok(), "client try_new should succeed");
 }

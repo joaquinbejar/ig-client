@@ -8,7 +8,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG Working Orders Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
     let epic = "DO.D.OTCDDAX.107.IP";
     let epic_info = client.get_market_details(epic).await?;
     let currency: String = epic_info

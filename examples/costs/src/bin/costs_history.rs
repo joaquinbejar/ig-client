@@ -25,7 +25,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting costs history example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let from = "2024-01-01";
     let to = "2024-12-31";

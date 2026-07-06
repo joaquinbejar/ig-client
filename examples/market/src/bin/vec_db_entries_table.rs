@@ -28,7 +28,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG Vec DB Entries Table Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Get vec DB entries
     info!("\n=== Fetching Vec DB Entries ===");

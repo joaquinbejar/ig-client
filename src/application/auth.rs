@@ -141,26 +141,10 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Creates a new Auth instance
-    ///
-    /// # Arguments
-    /// * `config` - Configuration containing credentials and API settings
-    ///
-    /// # Panics
-    /// Panics if the underlying `reqwest` client cannot be constructed at
-    /// startup — typically a missing TLS backend, but also invalid proxy or
-    /// certificate configuration. This is an unrecoverable environment
-    /// invariant at construction time. For graceful handling use
-    /// [`Auth::try_new`], which returns a typed [`AppError`] instead of
-    /// panicking.
-    pub fn new(config: Arc<Config>) -> Self {
-        Self::try_new(config).expect("Failed to create HTTP client")
-    }
-
     /// Creates a new Auth instance, returning an error if the HTTP client
     /// cannot be constructed.
     ///
-    /// This is the fallible counterpart to [`Auth::new`]: it surfaces a TLS /
+    /// This is the sole constructor for [`Auth`]: it surfaces a TLS /
     /// client-builder failure as a typed [`AppError`] instead of panicking, so
     /// callers can handle a broken TLS backend gracefully.
     ///
@@ -802,7 +786,8 @@ mod session_lifecycle_tests {
 
     #[tokio::test]
     async fn test_ws_info_uses_cached_session_without_login() {
-        let auth = Auth::new(Arc::new(Config::default()));
+        let auth =
+            Auth::try_new(Arc::new(Config::default())).expect("auth construction should succeed");
 
         // Seed a valid (non-expired) v2 session with known tokens. Because the
         // session is valid, `ws_info` -> `get_session` must return it without a
@@ -942,7 +927,8 @@ mod expiry_and_refresh_tests {
         // refresh_token has an expiry gate: a comfortably-valid session is
         // returned unchanged, so no network login is attempted. This is the
         // behaviour that differs from force_refresh (which always re-logs in).
-        let auth = Auth::new(Arc::new(Config::default()));
+        let auth =
+            Auth::try_new(Arc::new(Config::default())).expect("auth construction should succeed");
         let future = u64::try_from(Utc::now().timestamp())
             .unwrap_or(0)
             .saturating_add(3600);

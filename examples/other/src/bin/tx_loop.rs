@@ -67,7 +67,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
                 info!("Starting scheduled transaction fetch");
 
                 // Create client
-                let client = Client::default();
+                let client = Client::try_new()?;
 
                 // Calculate date range
                 let to = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();

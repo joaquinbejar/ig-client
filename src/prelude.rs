@@ -13,7 +13,7 @@
 //! ```rust,ignore
 //! use ig_client::prelude::*;
 //!
-//! let client = Client::default();
+//! let client = Client::try_new()?;
 //! let markets = client.search_markets("EUR").await?;
 //! ```
 

@@ -53,6 +53,11 @@ impl HttpClient {
     /// # Returns
     /// * `Ok(Client)` - Authenticated client ready to use
     /// * `Err(AppError)` - If authentication fails
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
+    /// be built (e.g. the system TLS backend fails to initialize), or any
+    /// [`AppError`] surfaced by the initial [`Auth::login`] call.
     pub async fn new(config: Config) -> Result<Self, AppError> {
         let config = Arc::new(config);
 
@@ -62,8 +67,9 @@ impl HttpClient {
             .build()?;
         let rate_limiter = RateLimiter::new(&config.rate_limiter);
 
-        // Create Auth instance
-        let auth = Arc::new(Auth::new(config.clone()));
+        // Create Auth instance via the fallible constructor so this path never
+        // panics on a broken TLS backend.
+        let auth = Arc::new(Auth::try_new(config.clone())?);
 
         // Perform initial login
         auth.login().await?;
@@ -373,25 +379,6 @@ impl HttpClient {
     /// Gets Auth reference
     pub fn auth(&self) -> &Auth {
         &self.auth
-    }
-}
-
-impl Default for HttpClient {
-    /// Creates a lazily-authenticated client with the default configuration.
-    ///
-    /// # Panics
-    /// Panics if the underlying HTTP client cannot be constructed via
-    /// [`HttpClient::new_lazy`] — typically a missing TLS backend, but also
-    /// invalid proxy or certificate configuration. This is an unrecoverable
-    /// startup invariant. Callers that need to handle that case gracefully
-    /// should call [`HttpClient::new_lazy`] directly and propagate the returned
-    /// [`AppError`] with `?`.
-    fn default() -> Self {
-        let config = Config::default();
-        // Construction normally succeeds; it fails only if the reqwest client
-        // cannot be built (no usable TLS backend, or invalid proxy/certificate
-        // configuration), which is an unrecoverable startup invariant.
-        Self::new_lazy(config).expect("failed to create default HTTP client")
     }
 }
 
@@ -840,7 +827,8 @@ mod tests {
             .await
             .expect("request should reach the mock server");
 
-        let client = HttpClient::default();
+        let client = HttpClient::new_lazy(crate::application::config::Config::default())
+            .expect("lazy HTTP client construction should succeed");
         let result: Result<RequiredFieldDto, AppError> = client.parse_response(response).await;
 
         let msg = match result {
@@ -893,7 +881,8 @@ mod tests {
             .await
             .expect("request should reach the mock server");
 
-        let client = HttpClient::default();
+        let client = HttpClient::new_lazy(crate::application::config::Config::default())
+            .expect("lazy HTTP client construction should succeed");
         let result: Result<RequiredFieldDto, AppError> = client.parse_response(response).await;
 
         let msg = match result {

@@ -38,7 +38,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
     // Create HTTP client and main client
     let http_client = Arc::new(HttpClient::new(config).await?);
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Step 1: Login
     info!("\n1. Logging in...");

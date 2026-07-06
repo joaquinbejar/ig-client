@@ -6,7 +6,7 @@ use tracing::info;
 
 /// Creates a test client
 pub fn create_test_client() -> Client {
-    Client::default()
+    Client::try_new().expect("client construction should succeed")
 }
 
 /// Performs login and optionally switches to the account specified in the config
@@ -29,7 +29,8 @@ pub fn login_with_account_switch() -> Session {
 /// Note: Account switching is now automatic during Client initialization
 pub async fn login_with_account_switch_async() -> Result<Session, String> {
     setup_logger();
-    let http_client = HttpClient::default();
+    let http_client = HttpClient::new_lazy(Config::default())
+        .expect("lazy HTTP client construction should succeed");
 
     // Login and get a session
     // The Client automatically handles account switching during initialization

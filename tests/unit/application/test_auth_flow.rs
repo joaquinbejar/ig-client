@@ -111,7 +111,8 @@ async fn test_login_v2_returns_session_with_cst_and_security_token() {
         .mount(&server)
         .await;
 
-    let auth = Auth::new(Arc::new(test_config(&server.uri(), 2)));
+    let auth = Auth::try_new(Arc::new(test_config(&server.uri(), 2)))
+        .expect("auth construction should succeed");
     let session = auth.login().await.expect("v2 login should succeed");
 
     assert!(!session.is_oauth());
@@ -131,7 +132,8 @@ async fn test_login_v2_missing_cst_header_yields_missing_session_token() {
         .mount(&server)
         .await;
 
-    let auth = Auth::new(Arc::new(test_config(&server.uri(), 2)));
+    let auth = Auth::try_new(Arc::new(test_config(&server.uri(), 2)))
+        .expect("auth construction should succeed");
     // A rejected / malformed auth response maps to a typed auth error naming
     // the missing header — NOT AppError::InvalidInput (which means bad caller
     // input).
@@ -151,7 +153,8 @@ async fn test_login_v2_missing_security_token_header_yields_missing_session_toke
         .mount(&server)
         .await;
 
-    let auth = Auth::new(Arc::new(test_config(&server.uri(), 2)));
+    let auth = Auth::try_new(Arc::new(test_config(&server.uri(), 2)))
+        .expect("auth construction should succeed");
     match auth.login().await {
         Err(AppError::Auth(AuthError::MissingSessionToken(header))) => {
             assert_eq!(header, "x-security-token");
@@ -170,7 +173,8 @@ async fn test_login_v3_returns_oauth_session() {
         .mount(&server)
         .await;
 
-    let auth = Auth::new(Arc::new(test_config(&server.uri(), 3)));
+    let auth = Auth::try_new(Arc::new(test_config(&server.uri(), 3)))
+        .expect("auth construction should succeed");
     let session = auth.login().await.expect("v3 login should succeed");
 
     assert!(session.is_oauth());
@@ -191,7 +195,8 @@ async fn test_get_session_refreshes_expired_session_with_relogin() {
         .mount(&server)
         .await;
 
-    let auth = Auth::new(Arc::new(test_config(&server.uri(), 3)));
+    let auth = Auth::try_new(Arc::new(test_config(&server.uri(), 3)))
+        .expect("auth construction should succeed");
     let first = auth.login().await.expect("initial login should succeed");
     assert!(first.is_oauth());
 

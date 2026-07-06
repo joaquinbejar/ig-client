@@ -24,7 +24,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting watchlist list example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let watchlists = client.get_watchlists().await?;
 

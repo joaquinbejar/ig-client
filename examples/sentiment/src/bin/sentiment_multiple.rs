@@ -25,7 +25,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting sentiment multiple markets example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let market_ids = vec![
         "EURUSD".to_string(),

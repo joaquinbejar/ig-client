@@ -45,7 +45,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
     subscription.add_listener(Box::new(listener));
 
-    let client = Client::default();
+    let client = Client::try_new()?;
     let ws_info = client.ws_info().await?;
     let password = ws_info.get_ws_password();
 

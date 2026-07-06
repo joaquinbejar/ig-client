@@ -9,7 +9,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG Market Table Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Create a directory for the output file if it doesn't exist
     std::fs::create_dir_all("Data")?;

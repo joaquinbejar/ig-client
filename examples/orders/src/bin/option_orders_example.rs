@@ -9,7 +9,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG Option Orders Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     let epic = "DO.D.OTCDDAX.68.IP"; // Example epic for testing
     let expiry = Some(

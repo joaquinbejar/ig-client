@@ -10,7 +10,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG Transactions Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Get config for database connection
     let config = Config::default();

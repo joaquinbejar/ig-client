@@ -27,7 +27,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting costs open example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let request = OpenCostsRequest::new("CS.D.EURUSD.CFD.IP", Direction::Buy, 1.0, "EUR");
 
