@@ -59,6 +59,74 @@ pub mod string_as_float_opt {
     }
 }
 
+/// Module for handling the conversion between string and optional integer values
+///
+/// This module provides serialization and deserialization functions for converting
+/// between `Option<i64>` and string representations used in the IG Markets API.
+/// It is the integer counterpart of [`string_as_float_opt`] and is intended for
+/// wire values that are conceptually integers (for example epoch-millisecond
+/// timestamps) where float parsing would risk silent rounding.
+pub mod string_as_int_opt {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+    use serde_json::Value;
+
+    /// Serializes an optional integer value to a JSON number
+    ///
+    /// # Arguments
+    /// * `value` - The optional integer value to serialize
+    /// * `serializer` - The serializer to use
+    ///
+    /// # Returns
+    /// A Result containing the serialized value or an error
+    pub fn serialize<S>(value: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(v) => serializer.serialize_i64(*v), // Serialize as a number
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Deserializes a string or number representation to an optional integer value
+    ///
+    /// Accepts a JSON `null` (mapped to `None`), a JSON integer, or a string
+    /// holding an integer (an empty string maps to `None`). A non-integer or
+    /// otherwise malformed value yields a deserialization error.
+    ///
+    /// # Arguments
+    /// * `deserializer` - The deserializer to use
+    ///
+    /// # Returns
+    /// A Result containing the deserialized optional integer value or an error
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        match value {
+            Value::Null => Ok(None),
+            Value::Number(num) => {
+                if let Some(int) = num.as_i64() {
+                    Ok(Some(int))
+                } else {
+                    Err(serde::de::Error::custom("Expected an integer"))
+                }
+            }
+            Value::String(s) => {
+                if s.is_empty() {
+                    return Ok(None);
+                }
+                s.parse::<i64>().map(Some).map_err(|_| {
+                    serde::de::Error::custom(format!("Failed to parse string as integer: {s}"))
+                })
+            }
+            _ => Err(serde::de::Error::custom("Expected null, number or string")),
+        }
+    }
+}
+
 /// Module for handling the conversion between string and optional boolean values
 ///
 /// This module provides serialization and deserialization functions for converting
