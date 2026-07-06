@@ -68,7 +68,7 @@ const MAX_CONNECTION_ATTEMPTS: u64 = 3;
 /// Maximum number of concurrent `get_market_details` requests issued while
 /// resolving per-symbol expiry dates in [`Client::get_vec_db_entries`].
 ///
-/// Kept small so the shared [`RateLimiter`] stays in control: this only overlaps
+/// Kept small so the shared rate limiter stays in control: this only overlaps
 /// network latency, it does not widen the request budget.
 const MARKET_DETAILS_CONCURRENCY: usize = 6;
 
