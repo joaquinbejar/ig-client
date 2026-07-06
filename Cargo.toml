@@ -48,7 +48,7 @@ futures = { workspace = true}
 thiserror = { workspace = true}
 
 [dev-dependencies]
-
+wiremock = "0.6"
 
 [[test]]
 name = "unit_tests"

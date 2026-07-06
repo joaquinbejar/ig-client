@@ -505,6 +505,199 @@ mod tests {
     use tokio::sync::Notify;
 
     const TEST_EPIC: &str = "IX.D.DAX.DAILY.IP";
+    const OTHER_EPIC: &str = "IX.D.FTSE.DAILY.IP";
+
+    // --- EPIC-set mutation while disconnected (no network required) --------
+
+    #[tokio::test]
+    async fn test_add_inserts_epic_when_not_connected() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        let result = streamer.add(TEST_EPIC.to_string()).await;
+
+        assert!(result.is_ok(), "add should succeed: {result:?}");
+        assert_eq!(
+            streamer.get_epics().await,
+            vec![TEST_EPIC.to_string()],
+            "add must insert the EPIC into the subscription set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_is_idempotent_for_duplicate_epic() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        for _ in 0..3 {
+            let result = streamer.add(TEST_EPIC.to_string()).await;
+            assert!(result.is_ok(), "repeated add should succeed: {result:?}");
+        }
+
+        assert_eq!(
+            streamer.get_epics().await.len(),
+            1,
+            "adding the same EPIC repeatedly must not create duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_absent_epic_is_noop() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+        streamer.epics.write().await.insert(TEST_EPIC.to_string());
+
+        let result = streamer.remove(OTHER_EPIC.to_string()).await;
+
+        assert!(
+            result.is_ok(),
+            "removing an absent EPIC should succeed: {result:?}"
+        );
+        assert_eq!(
+            streamer.get_epics().await,
+            vec![TEST_EPIC.to_string()],
+            "removing an absent EPIC must leave the set unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_existing_epic_when_not_connected_empties_set() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+        streamer.epics.write().await.insert(TEST_EPIC.to_string());
+
+        let result = streamer.remove(TEST_EPIC.to_string()).await;
+
+        assert!(result.is_ok(), "remove should succeed: {result:?}");
+        assert!(
+            streamer.get_epics().await.is_empty(),
+            "removing the only EPIC must empty the set"
+        );
+    }
+
+    // --- get_receiver() is single-take -------------------------------------
+
+    #[tokio::test]
+    async fn test_get_receiver_can_only_be_taken_once() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        let first = streamer.get_receiver().await;
+        assert!(
+            first.is_ok(),
+            "first get_receiver should hand out the receiver: {first:?}"
+        );
+
+        let second = streamer.get_receiver().await;
+        assert!(
+            second.is_err(),
+            "second get_receiver must fail once the receiver has been taken"
+        );
+    }
+
+    // --- is_connected transitions & disconnect shutdown handshake ----------
+
+    #[tokio::test]
+    async fn test_is_connected_transitions_on_disconnect() {
+        let mut streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        // A freshly constructed streamer starts disconnected.
+        assert!(
+            !*streamer.is_connected.read().await,
+            "a new streamer must start disconnected"
+        );
+
+        // Simulate the connected state that `start_internal` establishes on a
+        // successful connection (offline: we set the same internal fields a live
+        // connection would).
+        *streamer.is_connected.write().await = true;
+        let signal = Arc::new(Notify::new());
+        *streamer.shutdown_signal.write().await = Some(Arc::clone(&signal));
+        assert!(
+            *streamer.is_connected.read().await,
+            "streamer should report connected once a connection is live"
+        );
+
+        // Disconnecting transitions it back.
+        let result = streamer.disconnect().await;
+        assert!(result.is_ok(), "disconnect should succeed: {result:?}");
+        assert!(
+            !*streamer.is_connected.read().await,
+            "disconnect must transition the streamer back to disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_signals_shutdown_and_marks_disconnected() {
+        let mut streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        // Simulate a live connection with a parked shutdown waiter.
+        *streamer.is_connected.write().await = true;
+        let signal = Arc::new(Notify::new());
+        *streamer.shutdown_signal.write().await = Some(Arc::clone(&signal));
+        let waiter = tokio::spawn(async move { signal.notified().await });
+
+        let result = streamer.disconnect().await;
+
+        assert!(result.is_ok(), "disconnect should succeed: {result:?}");
+        assert!(
+            !*streamer.is_connected.read().await,
+            "disconnect must mark the streamer disconnected"
+        );
+        // With a stored permit the waiter wakes deterministically.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .is_ok(),
+            "the parked connection did not observe the shutdown signal from disconnect()"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_last_epic_while_connected_signals_reconnect() {
+        let streamer = DynamicMarketStreamer::new(HashSet::new())
+            .await
+            .expect("streamer construction should succeed");
+
+        // Simulate a live connection subscribed to a single EPIC, with a
+        // shutdown signal a connection task would be parked on.
+        streamer.epics.write().await.insert(TEST_EPIC.to_string());
+        *streamer.is_connected.write().await = true;
+        let signal = Arc::new(Notify::new());
+        *streamer.shutdown_signal.write().await = Some(Arc::clone(&signal));
+
+        // Stand-in for the live connection waiting to be told to reconnect.
+        let waiter = tokio::spawn(async move { signal.notified().await });
+
+        // Removing the last EPIC while connected is an EPIC change: it must
+        // signal the current connection. Because the resulting EPIC set is
+        // empty, `reconnect` no-ops on the restart and never touches the
+        // network, keeping this test fully offline.
+        let result = streamer.remove(TEST_EPIC.to_string()).await;
+
+        assert!(result.is_ok(), "remove should succeed: {result:?}");
+        assert!(
+            streamer.get_epics().await.is_empty(),
+            "removing the last EPIC must empty the subscription set"
+        );
+        // The old connection's signal must have fired. With a stored permit the
+        // waiter wakes deterministically.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .is_ok(),
+            "the live connection did not observe the reconnect signal from remove()"
+        );
+    }
 
     // --- Task 4: clear() must stop data flow when connected ----------------
 
