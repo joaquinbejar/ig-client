@@ -1,35 +1,34 @@
-/// Generates a unique identifier as an optional `String`.
+/// Character set used for generated deal references.
 ///
-/// This function creates a 30-character long unique identifier composed of
-/// uppercase English letters (`A-Z`) and numbers (`0-9`) using the `nanoid`
+/// This is nanoid's URL-safe alphabet (`[A-Za-z0-9_-]`), which is within IG's
+/// permitted deal-reference charset. Defining it here — and routing every
+/// deal-reference builder through [`get_id`] — keeps the charset in a single
+/// place.
+const DEAL_REF_ALPHABET: [char; 64] = nanoid::alphabet::SAFE;
+
+/// Length, in characters, of a generated deal reference.
+///
+/// IG limits deal references to 30 characters.
+const DEAL_REF_LENGTH: usize = 30;
+
+/// Generates a unique deal reference as a `String`.
+///
+/// This function creates a `DEAL_REF_LENGTH`-character unique identifier drawn
+/// from `DEAL_REF_ALPHABET` (nanoid's URL-safe alphabet) using the `nanoid`
 /// library. The generated identifier is securely random and designed to be
-/// collision-resistant.
+/// collision-resistant, and stays within IG's permitted deal-reference charset.
 ///
 /// # Returns
-/// - `Some(String)`: A generated identifier as a `String` if successful.
-/// - `None`: This function is designed to always return `Some`, but this is
-///   wrapped in an `Option` for potential extension or compatibility with
-///   other code.
+/// A freshly generated deal reference.
 ///
 /// # Examples
 /// ```
 /// use ig_client::utils::id::get_id;
-/// let unique_id = get_id();
-/// if let Some(id) = unique_id {
-///     println!("Generated ID: {}", id);
-/// }
-/// ```
 ///
-/// # Dependencies
-/// - This function relies on the `nanoid` crate, which must be added to your
-///   project dependencies in `Cargo.toml`:
-///
-/// ```toml
-/// [dependencies]
-/// nanoid = "0.4"
+/// let deal_reference = get_id();
+/// assert_eq!(deal_reference.len(), 30);
 /// ```
 #[must_use]
-pub fn get_id() -> Option<String> {
-    let alphabet: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".chars().collect();
-    Some(nanoid::nanoid!(30, &alphabet))
+pub fn get_id() -> String {
+    nanoid::nanoid!(DEAL_REF_LENGTH, &DEAL_REF_ALPHABET)
 }

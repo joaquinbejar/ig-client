@@ -112,7 +112,7 @@ pub fn build_market_hierarchy<'a>(
                 }
                 Err(e) => {
                     error!("Error building hierarchy for node {}: {:?}", node.id, e);
-                    // Continuar con otros nodos incluso si uno falla
+                    // Continue with other nodes even if one fails
                     if depth < 7 {
                         nodes.push(MarketNode {
                             id: node.id.clone(),

@@ -119,11 +119,10 @@ pub fn parse_instrument_name(instrument_name: &str) -> ParsedOptionInfo {
     // Create regex patterns for different instrument name formats
     // Lazy initialization of regex patterns
     lazy_static::lazy_static! {
-        // Pattern for standard options like "US Tech 100 19200 CALL ($1)"
+        // Pattern for standard options like "US Tech 100 19200 CALL ($1)".
+        // The strike group accepts an optional decimal part, so this pattern
+        // already covers decimal strikes like "Volatility Index 10.5 PUT ($1)".
         static ref OPTION_PATTERN: Regex = Regex::new(r"^(.*?)\s+(\d+(?:\.\d+)?)\s+(CALL|PUT)(?:\s+\(.*?\))?$").expect("valid option regex");
-
-        // Pattern for options with decimal strikes like "Volatility Index 10.5 PUT ($1)"
-        static ref DECIMAL_OPTION_PATTERN: Regex = Regex::new(r"^(.*?)\s+(\d+\.\d+)\s+(CALL|PUT)(?:\s+\(.*?\))?$").expect("valid decimal option regex");
 
         // Pattern for options with no space between parenthesis and strike like "Weekly Germany 40 (Wed)27500 PUT"
         static ref SPECIAL_OPTION_PATTERN: Regex = Regex::new(r"^(.*?)\s+\(([^)]+)\)(\d+)\s+(CALL|PUT)(?:\s+\(.*?\))?$").expect("valid special option regex");
@@ -194,14 +193,6 @@ pub fn parse_instrument_name(instrument_name: &str) -> ParsedOptionInfo {
             strike: captures.get(2).map(|m| m.as_str().to_string()),
             option_type: captures.get(3).map(|m| m.as_str().to_string()),
         }
-    } else if let Some(captures) = DECIMAL_OPTION_PATTERN.captures(instrument_name) {
-        // This is an option with decimal strike
-        let asset_name = captures.get(1).map_or("", |m| m.as_str()).trim();
-        ParsedOptionInfo {
-            asset_name: clean_asset_name(asset_name),
-            strike: captures.get(2).map(|m| m.as_str().to_string()),
-            option_type: captures.get(3).map(|m| m.as_str().to_string()),
-        }
     } else if let Some(captures) = GENERIC_PATTERN.captures(instrument_name) {
         // This is a generic instrument without strike or type
         let asset_name = captures.get(1).map_or("", |m| m.as_str()).trim();
@@ -255,10 +246,22 @@ mod tests {
 
     #[test]
     fn test_parse_instrument_name_decimal_strike() {
+        // Proves `OPTION_PATTERN` alone handles decimal strikes; there is no
+        // separate decimal-strike pattern.
         let info = parse_instrument_name("Volatility Index 10.5 PUT ($1)");
         assert_eq!(info.asset_name, "Volatility Index");
         assert_eq!(info.strike, Some("10.5".to_string()));
         assert_eq!(info.option_type, Some("PUT".to_string()));
+    }
+
+    #[test]
+    fn test_parse_instrument_name_decimal_strike_no_suffix() {
+        // A decimal strike without a trailing "($1)" suffix is still handled by
+        // `OPTION_PATTERN`.
+        let info = parse_instrument_name("Volatility Index 10.5 CALL");
+        assert_eq!(info.asset_name, "Volatility Index");
+        assert_eq!(info.strike, Some("10.5".to_string()));
+        assert_eq!(info.option_type, Some("CALL".to_string()));
     }
 
     #[test]

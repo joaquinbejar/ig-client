@@ -20,7 +20,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     );
     let size = 1.25; // Size of the order
     let currency_code = Some("EUR".to_string()); // Example currency code
-    let deal_reference = get_id();
+    let deal_reference = Some(get_id());
     info!("{:?}", deal_reference);
     let create_order = CreateOrderRequest::buy_option_to_market(
         epic.to_string(),

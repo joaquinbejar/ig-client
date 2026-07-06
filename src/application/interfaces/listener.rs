@@ -68,18 +68,6 @@ where
     fn callback(&self, data: &T) -> ListenerResult {
         (self.callback)(data)
     }
-
-    /// For testing purposes only - creates a listener that logs but doesn't call any callback
-    #[cfg(test)]
-    pub fn mock() -> Self
-    where
-        T: Display + Debug,
-    {
-        Self::new(|data| {
-            debug!("Mock trade callback received: {data}");
-            Ok(())
-        })
-    }
 }
 
 impl<T> SubscriptionListener for Listener<T>

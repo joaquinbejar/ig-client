@@ -19,7 +19,7 @@ pub mod string_as_float_opt {
         S: Serializer,
     {
         match value {
-            Some(v) => serializer.serialize_f64(*v), // Serializa como número
+            Some(v) => serializer.serialize_f64(*v), // Serialize as a number
             None => serializer.serialize_none(),
         }
     }
