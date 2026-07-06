@@ -608,12 +608,20 @@ fn is_auth_endpoint(path: &str) -> bool {
 #[must_use]
 #[inline]
 fn truncate_body_snippet(body: &str) -> String {
-    match body.char_indices().nth(BODY_SNIPPET_MAX_CHARS) {
+    let truncated = match body.char_indices().nth(BODY_SNIPPET_MAX_CHARS) {
         // `idx` is the byte offset of the (limit+1)-th char, so `..idx` keeps
         // exactly `BODY_SNIPPET_MAX_CHARS` chars on a valid boundary.
         Some((idx, _)) => format!("{}... (truncated)", &body[..idx]),
         None => body.to_string(),
-    }
+    };
+    // Keep the snippet on one line: the error string is logged, so raw
+    // newlines / control characters would fragment the log record and allow
+    // log-injection-style confusion. Escape CR/LF/TAB to their literal forms.
+    truncated
+        .replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }
 
 /// Classification of an HTTP status code for retry decisions.
