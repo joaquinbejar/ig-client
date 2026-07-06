@@ -61,7 +61,7 @@ pub struct ActivityMetadata {
 #[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize)]
 pub struct ActivityPaging {
     /// Number of items per page
-    pub size: Option<i32>,
+    pub size: Option<i64>,
     /// URL for the next page of results
     pub next: Option<String>,
 }
@@ -713,7 +713,7 @@ pub struct TransactionMetadata {
     #[serde(rename = "pageData")]
     pub page_data: PageData,
     /// Total number of transactions
-    pub size: i32,
+    pub size: i64,
 }
 
 /// Pagination information
@@ -721,13 +721,13 @@ pub struct TransactionMetadata {
 pub struct PageData {
     /// Current page number
     #[serde(rename = "pageNumber")]
-    pub page_number: i32,
+    pub page_number: i64,
     /// Number of items per page
     #[serde(rename = "pageSize")]
-    pub page_size: i32,
+    pub page_size: i64,
     /// Total number of pages
     #[serde(rename = "totalPages")]
-    pub total_pages: i32,
+    pub total_pages: i64,
 }
 
 /// Individual transaction
@@ -808,7 +808,7 @@ pub struct AccountData {
     /// Name of the item this data belongs to
     pub item_name: String,
     /// Position of the item in the subscription
-    pub item_pos: i32,
+    pub item_pos: usize,
     /// All account fields
     pub fields: AccountFields,
     /// Fields that have changed in this update
@@ -910,7 +910,7 @@ impl AccountData {
 
         Ok(AccountData {
             item_name: item_name.unwrap_or_default().to_string(),
-            item_pos: item_pos as i32,
+            item_pos,
             fields,
             changed_fields,
             is_snapshot,
@@ -1127,5 +1127,48 @@ mod tests {
         let net2 = sell + buy;
         assert_eq!(net2.direction, Direction::Sell);
         assert!((net2.size - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_transaction_metadata_deserialize_and_roundtrip() {
+        // Sanitized `metadata` object from `history/transactions`. `size` and
+        // all `pageData` fields are i64.
+        let json = r#"{
+            "pageData": { "pageNumber": 1, "pageSize": 20, "totalPages": 3 },
+            "size": 42
+        }"#;
+
+        let meta: TransactionMetadata = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(meta.size, 42);
+        assert_eq!(meta.page_data.page_number, 1);
+        assert_eq!(meta.page_data.page_size, 20);
+        assert_eq!(meta.page_data.total_pages, 3);
+
+        let serialized = serde_json::to_string(&meta).expect("serialize failed");
+        let re: TransactionMetadata =
+            serde_json::from_str(&serialized).expect("re-deserialize failed");
+        assert_eq!(re.size, 42);
+        assert_eq!(re.page_data.total_pages, 3);
+        assert!(serialized.contains("\"pageNumber\":1"));
+        assert!(serialized.contains("\"pageSize\":20"));
+        assert!(serialized.contains("\"totalPages\":3"));
+    }
+
+    #[test]
+    fn test_activity_paging_deserialize_and_roundtrip() {
+        // Sanitized `paging` object from `history/activity`. `size` is i64.
+        let json = r#"{ "size": 10, "next": "/history/activity?from=X&to=Y" }"#;
+
+        let paging: ActivityPaging = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(paging.size, Some(10));
+        assert_eq!(
+            paging.next.as_deref(),
+            Some("/history/activity?from=X&to=Y")
+        );
+
+        let serialized = serde_json::to_string(&paging).expect("serialize failed");
+        let re: ActivityPaging = serde_json::from_str(&serialized).expect("re-deserialize failed");
+        assert_eq!(re.size, Some(10));
+        assert_eq!(re.next.as_deref(), Some("/history/activity?from=X&to=Y"));
     }
 }

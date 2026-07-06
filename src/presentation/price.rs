@@ -36,7 +36,7 @@ pub struct PriceData {
     /// Name of the item (usually the market ID)
     pub item_name: String,
     /// Position of the item in the subscription
-    pub item_pos: i32,
+    pub item_pos: usize,
     /// All price fields for this market
     pub fields: PriceFields,
     /// Fields that have changed in this update
@@ -630,7 +630,7 @@ impl PriceData {
 
         Ok(PriceData {
             item_name: item_name.unwrap_or_default().to_string(),
-            item_pos: item_pos as i32,
+            item_pos,
             fields,
             changed_fields,
             is_snapshot,

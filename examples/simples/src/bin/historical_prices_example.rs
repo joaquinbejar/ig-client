@@ -18,7 +18,7 @@ const EPICS: &[&str] = &[
 const RESOLUTION: &str = "HOUR";
 
 /// Number of data points to request per EPIC (API v2).
-const NUM_POINTS: i32 = 10;
+const NUM_POINTS: u32 = 10;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
