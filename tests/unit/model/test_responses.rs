@@ -150,6 +150,7 @@ fn multiple_market_details_response_helpers_and_display() {
 fn historical_prices_response_helpers_and_display() {
     let p1 = HistoricalPrice {
         snapshot_time: "2025-10-19T10:00:00".into(),
+        snapshot_time_utc: Some("2025-10-19T09:00:00".into()),
         open_price: PricePoint {
             bid: Some(1.1234),
             ask: Some(1.1236),
@@ -174,6 +175,7 @@ fn historical_prices_response_helpers_and_display() {
     };
     let p2 = HistoricalPrice {
         snapshot_time: "2025-10-19T10:01:00".into(),
+        snapshot_time_utc: None,
         open_price: PricePoint {
             bid: Some(1.2234),
             ask: Some(1.2236),
