@@ -631,11 +631,15 @@ where
     let mut index: HashMap<String, usize> = HashMap::with_capacity(items.len());
     let mut deduped: Vec<T> = Vec::with_capacity(items.len());
     for item in items {
-        let k = key(&item).to_owned();
-        if let Some(&i) = index.get(&k) {
+        // Look up by the borrowed `&str` (HashMap<String, _> keys are
+        // `Borrow<str>`) and only allocate an owned key when inserting a new
+        // one, so duplicates cost no allocation.
+        let key_ref = key(&item);
+        if let Some(&i) = index.get(key_ref) {
             deduped[i] = item;
         } else {
-            index.insert(k, deduped.len());
+            let owned_key = key_ref.to_owned();
+            index.insert(owned_key, deduped.len());
             deduped.push(item);
         }
     }
