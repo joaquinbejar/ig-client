@@ -30,7 +30,7 @@ pub fn login_with_account_switch() -> Session {
 pub async fn login_with_account_switch_async() -> Result<Session, String> {
     setup_logger();
     let http_client = HttpClient::new_lazy(Config::default())
-        .expect("lazy HTTP client construction should succeed");
+        .map_err(|e| format!("lazy HTTP client construction failed: {e}"))?;
 
     // Login and get a session
     // The Client automatically handles account switching during initialization

@@ -1273,7 +1273,8 @@ impl StreamerClient {
     /// Returns [`AppError`] if the login / session lookup or Lightstreamer
     /// client initialization fails.
     pub async fn new() -> Result<Self, AppError> {
-        Self::with_client(&Client::try_new()?).await
+        let client = Client::try_new()?;
+        Self::with_client(&client).await
     }
 
     /// Creates a new streaming client that reuses the caller's existing REST
