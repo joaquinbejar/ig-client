@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 ///     ]);
 ///
 ///     // Create the dynamic streamer
-///     let mut streamer = DynamicMarketStreamer::new(fields).await?;
+///     let mut streamer = DynamicMarketStreamer::new(fields);
 ///
 ///     // Get the receiver for price updates
 ///     let mut receiver = streamer.get_receiver().await?;
@@ -89,13 +89,17 @@ pub struct DynamicMarketStreamer {
 impl DynamicMarketStreamer {
     /// Creates a new dynamic market streamer.
     ///
+    /// Construction only wires up in-memory channels and state, so it neither
+    /// awaits nor fails; establishing the network connection happens later in
+    /// [`start`](Self::start).
+    ///
     /// # Arguments
     ///
     /// * `fields` - Set of market data fields to receive (e.g., BID, OFFER, etc.)
     ///
     /// # Returns
     ///
-    /// Returns a new `DynamicMarketStreamer` instance or an error if initialization fails.
+    /// A new `DynamicMarketStreamer` instance.
     ///
     /// # Examples
     ///
@@ -104,12 +108,13 @@ impl DynamicMarketStreamer {
     ///     StreamingMarketField::Bid,
     ///     StreamingMarketField::Offer,
     /// ]);
-    /// let streamer = DynamicMarketStreamer::new(fields).await?;
+    /// let streamer = DynamicMarketStreamer::new(fields);
     /// ```
-    pub async fn new(fields: HashSet<StreamingMarketField>) -> Result<Self, AppError> {
+    #[must_use]
+    pub fn new(fields: HashSet<StreamingMarketField>) -> Self {
         let (price_tx, price_rx) = mpsc::unbounded_channel();
 
-        Ok(Self {
+        Self {
             epics: Arc::new(RwLock::new(HashSet::new())),
             fields,
             price_tx: Arc::new(RwLock::new(Some(price_tx))),
@@ -117,7 +122,7 @@ impl DynamicMarketStreamer {
             is_connected: Arc::new(RwLock::new(false)),
             shutdown_signal: Arc::new(RwLock::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
-        })
+        }
     }
 
     /// Adds a market EPIC to the subscription list.
@@ -511,9 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_inserts_epic_when_not_connected() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
 
         let result = streamer.add(TEST_EPIC.to_string()).await;
 
@@ -527,9 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_is_idempotent_for_duplicate_epic() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
 
         for _ in 0..3 {
             let result = streamer.add(TEST_EPIC.to_string()).await;
@@ -545,9 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_absent_epic_is_noop() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
         streamer.epics.write().await.insert(TEST_EPIC.to_string());
 
         let result = streamer.remove(OTHER_EPIC.to_string()).await;
@@ -565,9 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_existing_epic_when_not_connected_empties_set() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
         streamer.epics.write().await.insert(TEST_EPIC.to_string());
 
         let result = streamer.remove(TEST_EPIC.to_string()).await;
@@ -583,9 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_receiver_can_only_be_taken_once() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
 
         let first = streamer.get_receiver().await;
         assert!(
@@ -604,9 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_connected_transitions_on_disconnect() {
-        let mut streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let mut streamer = DynamicMarketStreamer::new(HashSet::new());
 
         // A freshly constructed streamer starts disconnected.
         assert!(
@@ -636,9 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_disconnect_signals_shutdown_and_marks_disconnected() {
-        let mut streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let mut streamer = DynamicMarketStreamer::new(HashSet::new());
 
         // Simulate a live connection with a parked shutdown waiter.
         *streamer.is_connected.write().await = true;
@@ -664,9 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_last_epic_while_connected_signals_reconnect() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
 
         // Simulate a live connection subscribed to a single EPIC, with a
         // shutdown signal a connection task would be parked on.
@@ -703,9 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear_when_not_connected_empties_epics() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
         streamer.epics.write().await.insert(TEST_EPIC.to_string());
 
         let result = streamer.clear().await;
@@ -723,9 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear_when_connected_signals_shutdown_and_reports_stopped() {
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
 
         // Simulate a live connection: one EPIC, connected, and a shutdown
         // signal that a connection task would be parked on.
@@ -763,9 +748,7 @@ mod tests {
         // Models the connection-task teardown race: a newer generation is live
         // (is_connected == true) while an older, superseded task finishes tearing
         // its connection down. The superseded task must NOT clear the flag.
-        let streamer = DynamicMarketStreamer::new(HashSet::new())
-            .await
-            .expect("streamer construction should succeed");
+        let streamer = DynamicMarketStreamer::new(HashSet::new());
 
         // A newer connection has come up: bump the generation and mark connected.
         let newer = streamer.generation.fetch_add(1, Ordering::SeqCst) + 1;

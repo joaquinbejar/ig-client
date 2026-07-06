@@ -216,6 +216,11 @@ impl Config {
         let page_size = get_env_or_default("TX_PAGE_SIZE", DEFAULT_PAGE_SIZE);
         let days_to_look_back = get_env_or_default("TX_DAYS_LOOKBACK", DAYS_TO_BACK_LOOK);
 
+        let database_url = get_env_or_default(
+            "DATABASE_URL",
+            String::from(crate::constants::DEFAULT_DATABASE_URL),
+        );
+
         // Check if we are using default values
         if username == "default_username" {
             error!("IG_USERNAME not found in environment variables or .env file");
@@ -225,6 +230,17 @@ impl Config {
         }
         if api_key == "default_api_key" {
             error!("IG_API_KEY not found in environment variables or .env file");
+        }
+        // Check the variable directly rather than comparing the resolved value
+        // to the placeholder: a user may intentionally set a credential-less URL
+        // equal to the placeholder, which is not the "unset" case we warn about.
+        if env::var("DATABASE_URL").is_err() {
+            // Falls back to the credential-less placeholder; persistence will not
+            // connect until DATABASE_URL is set. We never use a credentialed default.
+            error!(
+                "DATABASE_URL not found in environment variables or .env file; \
+                 using a credential-less placeholder and persistence will not connect"
+            );
         }
 
         Config {
@@ -254,10 +270,7 @@ impl Config {
                 reconnect_interval: get_env_or_default("IG_WS_RECONNECT_INTERVAL", 5),
             },
             database: DatabaseConfig {
-                url: get_env_or_default(
-                    "DATABASE_URL",
-                    String::from("postgres://postgres:postgres@localhost/ig"),
-                ),
+                url: database_url,
                 max_connections: get_env_or_default("DATABASE_MAX_CONNECTIONS", 5),
             },
             rate_limiter: RateLimiterConfig {

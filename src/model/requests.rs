@@ -287,27 +287,64 @@ impl CreateOrderRequest {
         deal_reference: Option<String>,
         currency_code: Option<String>,
     ) -> Self {
+        Self::option_to_market(
+            Direction::Sell,
+            true,
+            epic,
+            size,
+            expiry,
+            deal_reference,
+            currency_code,
+        )
+    }
+
+    /// Shared builder behind the four option-to-market limit-order constructors.
+    ///
+    /// The public `sell_option_to_market` / `buy_option_to_market` variants (with
+    /// and without an explicit `force_open`) differ only by `direction` and
+    /// `force_open`; every other field is identical, so the shared body lives
+    /// here to keep the four wrappers in lock-step. The aggressive limit `level`
+    /// is chosen from `direction` (`DEFAULT_ORDER_SELL_LEVEL` for a sell,
+    /// `DEFAULT_ORDER_BUY_LEVEL` for a buy) so the order fills at market. `size`
+    /// is rounded to two decimals via [`round_order_size`]; a missing
+    /// `deal_reference` is auto-generated, and a missing `currency_code` defaults
+    /// to `"EUR"`.
+    #[must_use]
+    fn option_to_market(
+        direction: Direction,
+        force_open: bool,
+        epic: String,
+        size: f64,
+        expiry: Option<String>,
+        deal_reference: Option<String>,
+        currency_code: Option<String>,
+    ) -> Self {
         let rounded_size = round_order_size(size);
 
         let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
 
         let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
 
+        let level = match direction {
+            Direction::Sell => DEFAULT_ORDER_SELL_LEVEL,
+            Direction::Buy => DEFAULT_ORDER_BUY_LEVEL,
+        };
+
         Self {
             epic,
-            direction: Direction::Sell,
+            direction,
             size: rounded_size,
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::FillOrKill,
-            level: Some(DEFAULT_ORDER_SELL_LEVEL),
+            level: Some(level),
             guaranteed_stop: false,
             stop_level: None,
             stop_distance: None,
             limit_level: None,
             limit_distance: None,
-            expiry: expiry.clone(),
-            deal_reference: deal_reference.clone(),
-            force_open: true,
+            expiry,
+            deal_reference,
+            force_open,
             currency_code,
             quote_id: None,
             trailing_stop: Some(false),
@@ -356,32 +393,15 @@ impl CreateOrderRequest {
         currency_code: Option<String>,
         force_open: bool, // Compensate position if it is already open
     ) -> Self {
-        let rounded_size = round_order_size(size);
-
-        let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
-
-        let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
-
-        Self {
-            epic,
-            direction: Direction::Sell,
-            size: rounded_size,
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::FillOrKill,
-            level: Some(DEFAULT_ORDER_SELL_LEVEL),
-            guaranteed_stop: false,
-            stop_level: None,
-            stop_distance: None,
-            limit_level: None,
-            limit_distance: None,
-            expiry: expiry.clone(),
-            deal_reference: deal_reference.clone(),
+        Self::option_to_market(
+            Direction::Sell,
             force_open,
+            epic,
+            size,
+            expiry,
+            deal_reference,
             currency_code,
-            quote_id: None,
-            trailing_stop: Some(false),
-            trailing_stop_increment: None,
-        }
+        )
     }
 
     /// Creates a new instance of an order to buy an option in the market with specified parameters.
@@ -411,32 +431,15 @@ impl CreateOrderRequest {
         deal_reference: Option<String>,
         currency_code: Option<String>,
     ) -> Self {
-        let rounded_size = round_order_size(size);
-
-        let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
-
-        let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
-
-        Self {
+        Self::option_to_market(
+            Direction::Buy,
+            true,
             epic,
-            direction: Direction::Buy,
-            size: rounded_size,
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::FillOrKill,
-            level: Some(DEFAULT_ORDER_BUY_LEVEL),
-            guaranteed_stop: false,
-            stop_level: None,
-            stop_distance: None,
-            limit_level: None,
-            limit_distance: None,
-            expiry: expiry.clone(),
-            deal_reference: deal_reference.clone(),
-            force_open: true,
-            currency_code: currency_code.clone(),
-            quote_id: None,
-            trailing_stop: Some(false),
-            trailing_stop_increment: None,
-        }
+            size,
+            expiry,
+            deal_reference,
+            currency_code,
+        )
     }
 
     /// Constructs a new instance of an order to buy an option in the market with optional force_open behavior.
@@ -475,32 +478,15 @@ impl CreateOrderRequest {
         currency_code: Option<String>,
         force_open: bool,
     ) -> Self {
-        let rounded_size = round_order_size(size);
-
-        let currency_code = currency_code.unwrap_or_else(|| "EUR".to_string());
-
-        let deal_reference = deal_reference.or_else(|| Some(crate::utils::id::get_id()));
-
-        Self {
-            epic,
-            direction: Direction::Buy,
-            size: rounded_size,
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::FillOrKill,
-            level: Some(DEFAULT_ORDER_BUY_LEVEL),
-            guaranteed_stop: false,
-            stop_level: None,
-            stop_distance: None,
-            limit_level: None,
-            limit_distance: None,
-            expiry: expiry.clone(),
-            deal_reference: deal_reference.clone(),
+        Self::option_to_market(
+            Direction::Buy,
             force_open,
-            currency_code: currency_code.clone(),
-            quote_id: None,
-            trailing_stop: Some(false),
-            trailing_stop_increment: None,
-        }
+            epic,
+            size,
+            expiry,
+            deal_reference,
+            currency_code,
+        )
     }
 
     /// Adds a stop loss to the order
@@ -726,7 +712,7 @@ impl ClosePositionRequest {
 }
 
 /// Model for creating a new working order
-#[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize, Default)]
+#[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize)]
 pub struct CreateWorkingOrderRequest {
     /// Instrument EPIC identifier
     pub epic: String,
@@ -989,7 +975,7 @@ pub struct AddToWatchlistRequest {
 // ============================================================================
 
 /// Request to update an existing working order
-#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, Default)]
+#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize)]
 pub struct UpdateWorkingOrderRequest {
     /// Good till date for the order (format: yyyy/MM/dd HH:mm:ss)
     #[serde(rename = "goodTillDate", skip_serializing_if = "Option::is_none")]
@@ -1063,7 +1049,7 @@ impl UpdateWorkingOrderRequest {
 // ============================================================================
 
 /// Request for indicative costs when opening a position
-#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, Default)]
+#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize)]
 pub struct OpenCostsRequest {
     /// Instrument epic
     pub epic: String,
@@ -1106,7 +1092,7 @@ impl OpenCostsRequest {
 }
 
 /// Request for indicative costs when closing a position
-#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, Default)]
+#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize)]
 pub struct CloseCostsRequest {
     /// Deal ID of the position to close
     #[serde(rename = "dealId")]
@@ -1134,7 +1120,7 @@ impl CloseCostsRequest {
 }
 
 /// Request for indicative costs when editing a position
-#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, Default)]
+#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize)]
 pub struct EditCostsRequest {
     /// Deal ID of the position to edit
     #[serde(rename = "dealId")]

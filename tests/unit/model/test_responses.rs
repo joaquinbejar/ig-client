@@ -291,7 +291,7 @@ fn positions_response_compact_by_epic_merges_positions() {
         instrument_name: "Germany 40".into(),
         expiry: "-".into(),
         epic: "IX.D.DAX.IFD.IP".into(),
-        instrument_type: "INDEX".into(),
+        instrument_type: InstrumentType::Indices,
         lot_size: 1.0,
         high: Some(100.0),
         low: Some(90.0),
@@ -303,7 +303,7 @@ fn positions_response_compact_by_epic_merges_positions() {
         update_time_utc: "08:00:00".into(),
         delay_time: 0,
         streaming_prices_available: true,
-        market_status: "OPEN".into(),
+        market_status: MarketState::Tradeable,
         scaling_factor: 1,
     };
 
@@ -362,6 +362,41 @@ fn positions_response_compact_by_epic_merges_positions() {
     assert!((m.position.level - 55.0).abs() < 1e-9);
     // PnL added
     assert_eq!(m.pnl, Some(6.0));
+}
+
+#[test]
+fn position_market_deserializes_typed_instrument_type_and_market_status() {
+    // Captured `market` object from a GET /positions (v2) response.
+    let json = r#"{
+        "instrumentName": "Germany 40 Cash (€1)",
+        "expiry": "-",
+        "epic": "IX.D.DAX.IFD.IP",
+        "instrumentType": "INDICES",
+        "lotSize": 1.0,
+        "high": 15900.0,
+        "low": 15800.0,
+        "percentageChange": 0.35,
+        "netChange": 55.0,
+        "bid": 15850.0,
+        "offer": 15851.0,
+        "updateTime": "10:00:00",
+        "updateTimeUTC": "08:00:00",
+        "delayTime": 0,
+        "streamingPricesAvailable": true,
+        "marketStatus": "TRADEABLE",
+        "scalingFactor": 1
+    }"#;
+
+    let pm: PositionMarket = serde_json::from_str(json).expect("valid positions market payload");
+    assert_eq!(pm.instrument_type, InstrumentType::Indices);
+    assert_eq!(pm.market_status, MarketState::Tradeable);
+
+    // Round-trip: re-serialize and re-parse yields the same typed values.
+    let round: PositionMarket =
+        serde_json::from_value(json_value(&pm)).expect("round-trip positions market");
+    assert_eq!(round.instrument_type, InstrumentType::Indices);
+    assert_eq!(round.market_status, MarketState::Tradeable);
+    assert_eq!(round.epic, "IX.D.DAX.IFD.IP");
 }
 
 #[test]
