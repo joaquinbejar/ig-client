@@ -510,3 +510,76 @@ mod expiry_tests {
         assert!(!resp.is_expired(300));
     }
 }
+
+#[cfg(test)]
+mod session_response_round_trip_tests {
+    use super::*;
+
+    // Captured demo-account `/session` v2 response body. Account and client
+    // identifiers are opaque IG references, not credentials; the CST /
+    // X-SECURITY-TOKEN secrets arrive in headers (see `login_v2`), never in this
+    // body, so nothing sensitive is embedded here.
+    const V2_DEMO_BODY: &str = r#"{"accountType":"CFD","accountInfo":{"balance":21065.86,"deposit":3033.31,"profitLoss":-285.27,"available":16659.01},"currencyIsoCode":"EUR","currencySymbol":"E","currentAccountId":"ZZZZZ","lightstreamerEndpoint":"https://demo-apd.marketdatasystems.com","accounts":[{"accountId":"Z405P5","accountName":"Turbo24","preferred":false,"accountType":"PHYSICAL"},{"accountId":"ZHJ5N","accountName":"DEMO_A","preferred":false,"accountType":"CFD"},{"accountId":"ZZZZZ","accountName":"Opciones","preferred":true,"accountType":"CFD"}],"clientId":"101290216","timezoneOffset":1,"hasActiveDemoAccounts":true,"hasActiveLiveAccounts":true,"trailingStopsEnabled":false,"reroutingEnvironment":null,"dealingEnabled":true}"#;
+
+    // Second captured v2 body with a distinct `currentAccountId`, pinning that
+    // the untagged enum resolves to `V2` and the field is read back correctly.
+    const V2_ALT_BODY: &str = r#"{"accountType":"CFD","accountInfo":{"balance":18791.56,"deposit":3300.18,"profitLoss":187.42,"available":14952.68},"currencyIsoCode":"EUR","currencySymbol":"E","currentAccountId":"BS0Y3","lightstreamerEndpoint":"https://apd.marketdatasystems.com","accounts":[{"accountId":"BS0Y3","accountName":"Opciones Prod","preferred":true,"accountType":"CFD"},{"accountId":"BSI1I","accountName":"Barreras y Opciones","preferred":false,"accountType":"CFD"},{"accountId":"BSU96","accountName":"Turbos","preferred":false,"accountType":"PHYSICAL"},{"accountId":"BTCKN","accountName":"CFD","preferred":false,"accountType":"CFD"},{"accountId":"BXNIZ","accountName":"Principal","preferred":false,"accountType":"CFD"}],"clientId":"102828353","timezoneOffset":1,"hasActiveDemoAccounts":true,"hasActiveLiveAccounts":true,"trailingStopsEnabled":false,"reroutingEnvironment":null,"dealingEnabled":true}"#;
+
+    // Captured v3 `/session` response shape (IG docs example). The `oauthToken`
+    // access/refresh values here are placeholders, never real secrets — the
+    // round-trip only needs the payload *shape*, and rule 7 forbids embedding
+    // real tokens in fixtures.
+    const V3_BODY: &str = r#"{"clientId":"101290216","accountId":"ZZZZZ","timezoneOffset":1,"lightstreamerEndpoint":"https://demo-apd.marketdatasystems.com","oauthToken":{"access_token":"placeholder-access","refresh_token":"placeholder-refresh","scope":"profile","token_type":"Bearer","expires_in":"60"}}"#;
+
+    #[test]
+    fn test_session_response_v2_demo_body_parses_as_v2() {
+        let response: SessionResponse =
+            serde_json::from_str(V2_DEMO_BODY).expect("v2 demo body should deserialize");
+        assert!(response.is_v2());
+        assert!(!response.is_v3());
+    }
+
+    #[test]
+    fn test_v2_response_demo_body_fields_round_trip() {
+        let response: V2Response =
+            serde_json::from_str(V2_DEMO_BODY).expect("v2 demo body should deserialize");
+        assert_eq!(response.account_type, "CFD");
+        assert_eq!(response.current_account_id, "ZZZZZ");
+        assert_eq!(response.accounts.len(), 3);
+        assert_eq!(response.currency_iso_code, "EUR");
+    }
+
+    #[test]
+    fn test_v2_response_alt_body_reads_current_account_id() {
+        let response: SessionResponse =
+            serde_json::from_str(V2_ALT_BODY).expect("v2 alt body should deserialize");
+        assert!(response.is_v2());
+
+        let response: V2Response =
+            serde_json::from_str(V2_ALT_BODY).expect("v2 alt body should deserialize");
+        assert_eq!(response.account_type, "CFD");
+        assert_eq!(response.current_account_id, "BS0Y3");
+        assert_eq!(response.accounts.len(), 5);
+    }
+
+    #[test]
+    fn test_session_response_v3_body_parses_as_v3() {
+        let response: SessionResponse =
+            serde_json::from_str(V3_BODY).expect("v3 body should deserialize");
+        assert!(response.is_v3());
+        assert!(!response.is_v2());
+    }
+
+    #[test]
+    fn test_v3_response_body_fields_round_trip() {
+        let response: V3Response =
+            serde_json::from_str(V3_BODY).expect("v3 body should deserialize");
+        assert_eq!(response.client_id, "101290216");
+        assert_eq!(response.account_id, "ZZZZZ");
+        assert_eq!(response.timezone_offset, 1);
+        assert_eq!(response.oauth_token.token_type, "Bearer");
+        assert_eq!(response.oauth_token.expires_in, "60");
+        // The freshly created token is not yet within its 10s expiry margin.
+        assert!(!response.oauth_token.is_expired(10));
+    }
+}

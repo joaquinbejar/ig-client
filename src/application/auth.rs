@@ -927,31 +927,6 @@ impl Auth {
     }
 }
 
-#[test]
-fn test_v2_response_deserialization() -> Result<(), serde_json::Error> {
-    let json = r#"{"accountType":"CFD","accountInfo":{"balance":21065.86,"deposit":3033.31,"profitLoss":-285.27,"available":16659.01},"currencyIsoCode":"EUR","currencySymbol":"E","currentAccountId":"ZZZZZ","lightstreamerEndpoint":"https://demo-apd.marketdatasystems.com","accounts":[{"accountId":"Z405P5","accountName":"Turbo24","preferred":false,"accountType":"PHYSICAL"},{"accountId":"ZHJ5N","accountName":"DEMO_A","preferred":false,"accountType":"CFD"},{"accountId":"ZZZZZ","accountName":"Opciones","preferred":true,"accountType":"CFD"}],"clientId":"101290216","timezoneOffset":1,"hasActiveDemoAccounts":true,"hasActiveLiveAccounts":true,"trailingStopsEnabled":false,"reroutingEnvironment":null,"dealingEnabled":true}"#;
-
-    let result: crate::model::auth::SessionResponse = serde_json::from_str(json)?;
-    println!("Success: is_v2={}", result.is_v2());
-
-    let response: crate::model::auth::V2Response = serde_json::from_str(json)?;
-    assert_eq!(response.account_type, "CFD");
-    Ok(())
-}
-
-#[test]
-fn test_v2_response_deserialization_prod() -> Result<(), serde_json::Error> {
-    let json = r#"{"accountType":"CFD","accountInfo":{"balance":18791.56,"deposit":3300.18,"profitLoss":187.42,"available":14952.68},"currencyIsoCode":"EUR","currencySymbol":"E","currentAccountId":"BS0Y3","lightstreamerEndpoint":"https://apd.marketdatasystems.com","accounts":[{"accountId":"BS0Y3","accountName":"Opciones Prod","preferred":true,"accountType":"CFD"},{"accountId":"BSI1I","accountName":"Barreras y Opciones","preferred":false,"accountType":"CFD"},{"accountId":"BSU96","accountName":"Turbos","preferred":false,"accountType":"PHYSICAL"},{"accountId":"BTCKN","accountName":"CFD","preferred":false,"accountType":"CFD"},{"accountId":"BXNIZ","accountName":"Principal","preferred":false,"accountType":"CFD"}],"clientId":"102828353","timezoneOffset":1,"hasActiveDemoAccounts":true,"hasActiveLiveAccounts":true,"trailingStopsEnabled":false,"reroutingEnvironment":null,"dealingEnabled":true}"#;
-
-    let result: crate::model::auth::SessionResponse = serde_json::from_str(json)?;
-    println!("Success: is_v2={}", result.is_v2());
-
-    let response: crate::model::auth::V2Response = serde_json::from_str(json)?;
-    assert_eq!(response.account_type, "CFD");
-    assert_eq!(response.current_account_id, "BS0Y3");
-    Ok(())
-}
-
 #[cfg(test)]
 mod session_lifecycle_tests {
     use super::*;

@@ -4,281 +4,79 @@ use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 static INIT: Once = Once::new();
+
+/// Maps a `LOGLEVEL`-style string to a [`tracing::Level`].
+///
+/// Matching is case-insensitive. Any value that is not one of `TRACE`, `DEBUG`,
+/// `WARN`, or `ERROR` (including empty or unknown strings) falls back to the
+/// default level, [`Level::INFO`].
+#[must_use]
+#[inline]
+pub(crate) fn level_from_str(s: &str) -> Level {
+    match s.trim().to_uppercase().as_str() {
+        "TRACE" => Level::TRACE,
+        "DEBUG" => Level::DEBUG,
+        "WARN" => Level::WARN,
+        "ERROR" => Level::ERROR,
+        // Unknown / empty / "INFO" all resolve to the default.
+        _ => Level::INFO,
+    }
+}
+
 /// Sets up the logger for the application.
 ///
-/// The logger level is determined by the `LOGLEVEL` environment variable.
-/// If the variable is not set, it defaults to `INFO`.
+/// The logger level is determined by the `LOGLEVEL` environment variable
+/// (case-insensitive). If the variable is not set or holds an unrecognized
+/// value, it defaults to `INFO`.
+///
+/// This installs a global subscriber and is intended for binaries, examples,
+/// and tests only — library code must not install a global subscriber.
 pub fn setup_logger() {
     INIT.call_once(|| {
-        let log_level = env::var("LOGLEVEL")
-            .unwrap_or_else(|_| "INFO".to_string())
-            .to_uppercase();
-
-        let level = match log_level.as_str() {
-            "DEBUG" => Level::DEBUG,
-            "ERROR" => Level::ERROR,
-            "WARN" => Level::WARN,
-            "TRACE" => Level::TRACE,
-            _ => Level::INFO,
-        };
+        let level = level_from_str(&env::var("LOGLEVEL").unwrap_or_default());
 
         let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
 
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Error setting default subscriber");
+        // Ignore the error: a subscriber may already be installed by the host
+        // process (another binary, a test harness). `INIT` guards against this
+        // crate double-installing, and we never want setup to panic.
+        let _ = tracing::subscriber::set_global_default(subscriber);
 
-        tracing::debug!("Log level set to: {}", level);
+        tracing::debug!(%level, "log level configured");
     });
 }
 
 #[cfg(test)]
-mod tests_setup_logger {
-    use super::setup_logger;
-    use std::env;
-    use tracing::subscriber::set_global_default;
-    use tracing_subscriber::FmtSubscriber;
+mod tests {
+    use super::level_from_str;
+    use tracing::Level;
 
     #[test]
-    fn test_logger_initialization_info() {
-        unsafe {
-            env::set_var("LOGLEVEL", "INFO");
-        }
-        setup_logger();
-
-        // After setting up the logger, you would typically assert that the logger is working
-        // However, due to the nature of logging, it's difficult to directly assert on log output.
-        // You can, however, check that set_global_default has been called successfully without panic.
-        assert!(
-            set_global_default(FmtSubscriber::builder().finish()).is_err(),
-            "Logger should already be set"
-        );
+    fn test_level_from_str_known_uppercase_variants() {
+        assert_eq!(level_from_str("TRACE"), Level::TRACE);
+        assert_eq!(level_from_str("DEBUG"), Level::DEBUG);
+        assert_eq!(level_from_str("INFO"), Level::INFO);
+        assert_eq!(level_from_str("WARN"), Level::WARN);
+        assert_eq!(level_from_str("ERROR"), Level::ERROR);
     }
 
     #[test]
-    fn test_logger_initialization_debug() {
-        unsafe {
-            env::set_var("LOGLEVEL", "DEBUG");
-        }
-        setup_logger();
-
-        // Similar to the previous test, check that the global logger has been set
-        assert!(
-            set_global_default(FmtSubscriber::builder().finish()).is_err(),
-            "Logger should already be set"
-        );
+    fn test_level_from_str_is_case_insensitive() {
+        assert_eq!(level_from_str("debug"), Level::DEBUG);
+        assert_eq!(level_from_str("info"), Level::INFO);
+        assert_eq!(level_from_str("Warn"), Level::WARN);
+        assert_eq!(level_from_str("eRrOr"), Level::ERROR);
     }
 
     #[test]
-    fn test_logger_initialization_default() {
-        unsafe {
-            env::remove_var("LOGLEVEL");
-        }
-        setup_logger();
-
-        // Check that the global logger has been set
-        assert!(
-            set_global_default(FmtSubscriber::builder().finish()).is_err(),
-            "Logger should already be set"
-        );
+    fn test_level_from_str_trims_surrounding_whitespace() {
+        assert_eq!(level_from_str("  debug  "), Level::DEBUG);
     }
 
     #[test]
-    fn test_logger_called_once() {
-        unsafe {
-            env::set_var("LOGLEVEL", "INFO");
-        }
-
-        setup_logger(); // First call should set up the logger
-        setup_logger(); // Second call should not re-initialize
-
-        // Check that the global logger has been set only once
-        assert!(
-            set_global_default(FmtSubscriber::builder().finish()).is_err(),
-            "Logger should already be set and should not be reset"
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests_setup_logger_bis {
-    use super::*;
-    use std::sync::Mutex;
-    use tracing::info;
-    use tracing::subscriber::with_default;
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    static TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-    #[derive(Clone)]
-    struct TestLayer {
-        level: std::sync::Arc<Mutex<Option<Level>>>,
-    }
-
-    impl<S> Layer<S> for TestLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if let Ok(mut level) = self.level.lock() {
-                *level = Some(*event.metadata().level());
-            }
-        }
-    }
-
-    fn create_test_layer() -> (TestLayer, std::sync::Arc<Mutex<Option<Level>>>) {
-        let level = std::sync::Arc::new(Mutex::new(None));
-        (
-            TestLayer {
-                level: level.clone(),
-            },
-            level,
-        )
-    }
-
-    #[test]
-    fn test_default_log_level() {
-        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
-        unsafe {
-            env::remove_var("LOGLEVEL");
-        }
-
-        let (layer, level) = create_test_layer();
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        with_default(subscriber, || {
-            setup_logger();
-            info!("Test log");
-        });
-
-        assert_eq!(
-            *level.lock().expect("Level mutex poisoned"),
-            Some(Level::INFO)
-        );
-    }
-
-    #[test]
-    fn test_debug_log_level() {
-        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
-        unsafe {
-            env::set_var("LOGLEVEL", "DEBUG");
-        }
-
-        let (layer, level) = create_test_layer();
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        with_default(subscriber, || {
-            setup_logger();
-            tracing::debug!("Test log");
-        });
-
-        assert_eq!(
-            *level.lock().expect("Level mutex poisoned"),
-            Some(Level::DEBUG)
-        );
-
-        unsafe {
-            env::remove_var("LOGLEVEL");
-        }
-    }
-
-    #[test]
-    fn test_error_log_level() {
-        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
-        unsafe {
-            env::set_var("LOGLEVEL", "ERROR");
-        }
-
-        let (layer, level) = create_test_layer();
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        with_default(subscriber, || {
-            setup_logger();
-            tracing::error!("Test log");
-        });
-
-        assert_eq!(
-            *level.lock().expect("Level mutex poisoned"),
-            Some(Level::ERROR)
-        );
-        unsafe {
-            env::remove_var("LOGLEVEL");
-        }
-    }
-
-    #[test]
-    fn test_warn_log_level() {
-        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
-        unsafe {
-            env::set_var("LOGLEVEL", "WARN");
-        }
-
-        let (layer, level) = create_test_layer();
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        with_default(subscriber, || {
-            setup_logger();
-            tracing::warn!("Test log");
-        });
-
-        assert_eq!(
-            *level.lock().expect("Level mutex poisoned"),
-            Some(Level::WARN)
-        );
-        unsafe {
-            env::remove_var("LOGLEVEL");
-        }
-    }
-
-    #[test]
-    fn test_trace_log_level() {
-        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
-        unsafe {
-            env::set_var("LOGLEVEL", "TRACE");
-        }
-
-        let (layer, level) = create_test_layer();
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        with_default(subscriber, || {
-            setup_logger();
-            tracing::trace!("Test log");
-        });
-
-        assert_eq!(
-            *level.lock().expect("Level mutex poisoned"),
-            Some(Level::TRACE)
-        );
-        unsafe {
-            env::remove_var("LOGLEVEL");
-        }
-    }
-
-    #[test]
-    fn test_invalid_log_level() {
-        let _lock = TEST_MUTEX.lock().expect("Test mutex poisoned");
-        unsafe {
-            env::set_var("LOGLEVEL", "INVALID");
-        }
-
-        let (layer, level) = create_test_layer();
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        with_default(subscriber, || {
-            setup_logger();
-            info!("Test log");
-        });
-
-        assert_eq!(
-            *level.lock().expect("Level mutex poisoned"),
-            Some(Level::INFO)
-        );
-        unsafe {
-            env::remove_var("LOGLEVEL");
-        }
+    fn test_level_from_str_unknown_defaults_to_info() {
+        assert_eq!(level_from_str("INVALID"), Level::INFO);
+        assert_eq!(level_from_str(""), Level::INFO);
+        assert_eq!(level_from_str("warning"), Level::INFO);
     }
 }

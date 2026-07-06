@@ -66,6 +66,27 @@ mod tests {
     }
 
     #[test]
+    fn test_string_as_float_opt_deserialize_numeric_variants() {
+        // Negative, zero, and scientific-notation string values must all parse.
+        let json = r#"{"value": "-456.78"}"#;
+        let deserialized: FloatTest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            deserialized,
+            FloatTest {
+                value: Some(-456.78)
+            }
+        );
+
+        let json = r#"{"value": "0.0"}"#;
+        let deserialized: FloatTest = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized, FloatTest { value: Some(0.0) });
+
+        let json = r#"{"value": "1.23e2"}"#;
+        let deserialized: FloatTest = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized, FloatTest { value: Some(123.0) });
+    }
+
+    #[test]
     fn test_string_as_float_opt_deserialize_errors() {
         // Test deserializing from invalid string
         let json = r#"{"value": "not-a-number"}"#;

@@ -334,6 +334,12 @@ fn test_auth_error_unexpected() {
 }
 
 #[test]
+fn test_app_error_oauth_token_expired() {
+    let app_error = AppError::OAuthTokenExpired;
+    assert_display_contains(&app_error, "oauth token expired");
+}
+
+#[test]
 fn test_app_error_historical_data_allowance_exceeded() {
     let error = AppError::HistoricalDataAllowanceExceeded {
         allowance_expiry: 604800,

@@ -964,4 +964,148 @@ mod tests {
         let cloned = field.clone();
         assert_eq!(field, cloned);
     }
+
+    // Exhaustive wire-name pinning for every enum variant. Each variant's
+    // JSON serialization, `Debug`, and `Display` must all agree on the exact
+    // IG Lightstreamer field name, so any future rename fails loudly. This is
+    // the coverage previously carried by `tests/unit/model/test_streaming.rs`.
+    fn assert_wire_name<T>(field: &T, expected: &str)
+    where
+        T: Serialize + Debug + Display,
+    {
+        let serialized = serde_json::to_string(field).expect("serialize failed");
+        assert_eq!(serialized, format!("\"{expected}\""));
+        assert_eq!(format!("{field:?}"), expected);
+        assert_eq!(format!("{field}"), expected);
+    }
+
+    #[test]
+    fn test_streaming_market_field_all_variants_wire_names() {
+        for (field, expected) in [
+            (StreamingMarketField::MidOpen, "MID_OPEN"),
+            (StreamingMarketField::High, "HIGH"),
+            (StreamingMarketField::Low, "LOW"),
+            (StreamingMarketField::Change, "CHANGE"),
+            (StreamingMarketField::ChangePct, "CHANGE_PCT"),
+            (StreamingMarketField::UpdateTime, "UPDATE_TIME"),
+            (StreamingMarketField::MarketDelay, "MARKET_DELAY"),
+            (StreamingMarketField::MarketState, "MARKET_STATE"),
+            (StreamingMarketField::Bid, "BID"),
+            (StreamingMarketField::Offer, "OFFER"),
+        ] {
+            assert_wire_name(&field, expected);
+        }
+    }
+
+    #[test]
+    fn test_streaming_account_field_all_variants_wire_names() {
+        for (field, expected) in [
+            (StreamingAccountDataField::Pnl, "PNL"),
+            (StreamingAccountDataField::Deposit, "DEPOSIT"),
+            (StreamingAccountDataField::AvailableCash, "AVAILABLE_CASH"),
+            (StreamingAccountDataField::PnlLr, "PNL_LR"),
+            (StreamingAccountDataField::PnlNlr, "PNL_NLR"),
+            (StreamingAccountDataField::Funds, "FUNDS"),
+            (StreamingAccountDataField::Margin, "MARGIN"),
+            (StreamingAccountDataField::MarginLr, "MARGIN_LR"),
+            (StreamingAccountDataField::MarginNlr, "MARGIN_NLR"),
+            (
+                StreamingAccountDataField::AvailableToDeal,
+                "AVAILABLE_TO_DEAL",
+            ),
+            (StreamingAccountDataField::Equity, "EQUITY"),
+            (StreamingAccountDataField::EquityUsed, "EQUITY_USED"),
+        ] {
+            assert_wire_name(&field, expected);
+        }
+    }
+
+    #[test]
+    fn test_streaming_price_field_special_variants_wire_names() {
+        // Pins the variants whose wire names are non-obvious: explicit renames
+        // (MID_OPEN, DLG_FLAG) and the UPPERCASE-run collapses (BIDQUOTEID,
+        // BIDPRICE1, C1BIDSIZE1, ...).
+        for (field, expected) in [
+            (StreamingPriceField::MidOpen, "MID_OPEN"),
+            (StreamingPriceField::High, "HIGH"),
+            (StreamingPriceField::Low, "LOW"),
+            (StreamingPriceField::BidQuoteId, "BIDQUOTEID"),
+            (StreamingPriceField::AskQuoteId, "ASKQUOTEID"),
+            (StreamingPriceField::BidPrice1, "BIDPRICE1"),
+            (StreamingPriceField::AskPrice5, "ASKPRICE5"),
+            (StreamingPriceField::Currency0, "CURRENCY0"),
+            (StreamingPriceField::C1BidSize1, "C1BIDSIZE1"),
+            (StreamingPriceField::C5AskSize5, "C5ASKSIZE5"),
+            (StreamingPriceField::Timestamp, "TIMESTAMP"),
+            (StreamingPriceField::DlgFlag, "DLG_FLAG"),
+        ] {
+            assert_wire_name(&field, expected);
+        }
+    }
+
+    #[test]
+    fn test_streaming_chart_field_all_variants_wire_names() {
+        for (field, expected) in [
+            (StreamingChartField::Ltv, "LTV"),
+            (StreamingChartField::Ttv, "TTV"),
+            (StreamingChartField::Utm, "UTM"),
+            (StreamingChartField::DayOpenMid, "DAY_OPEN_MID"),
+            (StreamingChartField::DayNetChgMid, "DAY_NET_CHG_MID"),
+            (StreamingChartField::DayPercChgMid, "DAY_PERC_CHG_MID"),
+            (StreamingChartField::DayHigh, "DAY_HIGH"),
+            (StreamingChartField::DayLow, "DAY_LOW"),
+            (StreamingChartField::Bid, "BID"),
+            (StreamingChartField::Ofr, "OFR"),
+            (StreamingChartField::Ltp, "LTP"),
+            (StreamingChartField::OfrOpen, "OFR_OPEN"),
+            (StreamingChartField::OfrHigh, "OFR_HIGH"),
+            (StreamingChartField::OfrLow, "OFR_LOW"),
+            (StreamingChartField::OfrClose, "OFR_CLOSE"),
+            (StreamingChartField::BidOpen, "BID_OPEN"),
+            (StreamingChartField::BidHigh, "BID_HIGH"),
+            (StreamingChartField::BidLow, "BID_LOW"),
+            (StreamingChartField::BidClose, "BID_CLOSE"),
+            (StreamingChartField::LtpOpen, "LTP_OPEN"),
+            (StreamingChartField::LtpHigh, "LTP_HIGH"),
+            (StreamingChartField::LtpLow, "LTP_LOW"),
+            (StreamingChartField::LtpClose, "LTP_CLOSE"),
+            (StreamingChartField::ConsEnd, "CONS_END"),
+            (StreamingChartField::ConsTickCount, "CONS_TICK_COUNT"),
+        ] {
+            assert_wire_name(&field, expected);
+        }
+    }
+
+    #[test]
+    fn test_streaming_price_field_in_hashset() {
+        let mut set = HashSet::new();
+        set.insert(StreamingPriceField::MidOpen);
+        set.insert(StreamingPriceField::High);
+        set.insert(StreamingPriceField::MidOpen); // duplicate
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&StreamingPriceField::MidOpen));
+        assert!(!set.contains(&StreamingPriceField::Low));
+    }
+
+    #[test]
+    fn test_streaming_chart_field_in_hashset() {
+        let mut set = HashSet::new();
+        set.insert(StreamingChartField::Bid);
+        set.insert(StreamingChartField::Ofr);
+        set.insert(StreamingChartField::Bid); // duplicate
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&StreamingChartField::Bid));
+        assert!(!set.contains(&StreamingChartField::Ltp));
+    }
+
+    #[test]
+    fn test_streaming_account_field_in_hashset() {
+        let mut set = HashSet::new();
+        set.insert(StreamingAccountDataField::Pnl);
+        set.insert(StreamingAccountDataField::Deposit);
+        set.insert(StreamingAccountDataField::Pnl); // duplicate
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&StreamingAccountDataField::Pnl));
+        assert!(!set.contains(&StreamingAccountDataField::AvailableCash));
+    }
 }

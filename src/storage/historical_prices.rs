@@ -433,6 +433,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_snapshot_time_rejects_out_of_range_and_wrong_shapes() {
+        // Out-of-range components and unsupported separators/orderings must all
+        // fail rather than silently coerce.
+        for bad in [
+            "2025/13/01 00:00:00",  // invalid month
+            "2025-10-32 00:00:00",  // invalid day
+            "2025-10-20T19:22:33Z", // ISO 8601 separator/timezone (unsupported)
+            "20-10-2025 00:00:00",  // day-month-year order (unsupported)
+        ] {
+            assert!(
+                parse_snapshot_time(bad).is_err(),
+                "should fail for input: {bad}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_snapshot_time_empty_string() {
         let result = parse_snapshot_time("");
         assert!(result.is_err());
