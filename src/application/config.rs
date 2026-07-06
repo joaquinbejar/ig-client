@@ -43,7 +43,7 @@ impl std::fmt::Display for DatabaseConfig {
     }
 }
 
-#[derive(DebugPretty, DisplaySimple, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 /// Authentication credentials for the IG Markets API
 pub struct Credentials {
     /// Username for the IG Markets account
@@ -60,8 +60,56 @@ pub struct Credentials {
     pub account_token: Option<String>,
 }
 
-#[derive(DebugPretty, DisplaySimple, Serialize, Deserialize, Clone)]
-/// Main configuration for the IG Markets API client
+// `password`, `api_key` and the tokens are secrets, so `Debug`/`Display` must
+// never print them — they show `<redacted>` and leave only `username` /
+// `account_id` (non-sensitive identifiers) visible.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .field("api_key", &"<redacted>")
+            .field(
+                "client_token",
+                &self.client_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "account_token",
+                &self.account_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Credentials {{ username: {}, account_id: {}, password: <redacted>, \
+             api_key: <redacted>, client_token: {}, account_token: {} }}",
+            self.username,
+            self.account_id,
+            if self.client_token.is_some() {
+                "<redacted>"
+            } else {
+                "None"
+            },
+            if self.account_token.is_some() {
+                "<redacted>"
+            } else {
+                "None"
+            },
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+/// Main configuration for the IG Markets API client.
+///
+/// `Debug` is derived and delegates to each field's `Debug`, so the redacting
+/// `Credentials` and `DatabaseConfig` impls keep secrets out of the output;
+/// `Display` is manual for the same reason.
 pub struct Config {
     /// Authentication credentials
     pub credentials: Credentials,
@@ -81,6 +129,30 @@ pub struct Config {
     pub days_to_look_back: i64,
     /// API version to use for authentication (2 or 3). If None, auto-detect based on available tokens
     pub api_version: Option<u8>,
+}
+
+// Manual `Display` (replacing the derived, serde-based `DisplaySimple`, which
+// would serialize the whole tree including credential secrets). It delegates to
+// the nested configs' own `Display` impls — `Credentials` and `DatabaseConfig`
+// redact their secrets — and shows only non-sensitive scalars directly.
+impl std::fmt::Display for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Config {{ credentials: {}, rest_api: {}, websocket: {}, database: {}, \
+             rate_limiter: {}, sleep_hours: {}, page_size: {}, days_to_look_back: {}, \
+             api_version: {:?} }}",
+            self.credentials,
+            self.rest_api,
+            self.websocket,
+            self.database,
+            self.rate_limiter,
+            self.sleep_hours,
+            self.page_size,
+            self.days_to_look_back,
+            self.api_version,
+        )
+    }
 }
 
 #[derive(DebugPretty, DisplaySimple, Serialize, Deserialize, Clone)]
@@ -201,6 +273,65 @@ impl Config {
                 .and_then(|v| v.parse::<u8>().ok())
                 .filter(|&v| v == 2 || v == 3)
                 .or(Some(3)), // Default to API v3 (OAuth) if not specified
+        }
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    fn secret_credentials() -> Credentials {
+        Credentials {
+            username: "user@example.com".to_string(),
+            password: "SUPER-SECRET-PASSWORD".to_string(),
+            account_id: "ACC123".to_string(),
+            api_key: "SECRET-API-KEY".to_string(),
+            client_token: Some("SECRET-CST".to_string()),
+            account_token: Some("SECRET-XST".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_credentials_debug_and_display_redact_secrets() {
+        let creds = secret_credentials();
+        for rendered in [format!("{creds:?}"), format!("{creds}")] {
+            for secret in [
+                "SUPER-SECRET-PASSWORD",
+                "SECRET-API-KEY",
+                "SECRET-CST",
+                "SECRET-XST",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "credentials rendering leaked {secret}: {rendered}"
+                );
+            }
+            assert!(rendered.contains("<redacted>"));
+            // Non-sensitive identifiers stay visible.
+            assert!(rendered.contains("user@example.com"));
+            assert!(rendered.contains("ACC123"));
+        }
+    }
+
+    #[test]
+    fn test_config_debug_and_display_redact_credential_and_db_secrets() {
+        let config = Config {
+            credentials: secret_credentials(),
+            database: DatabaseConfig {
+                url: "postgres://dbuser:DB-SECRET-PW@host/db".to_string(),
+                max_connections: 5,
+            },
+            ..Config::default()
+        };
+        for rendered in [format!("{config:?}"), format!("{config}")] {
+            for secret in ["SUPER-SECRET-PASSWORD", "SECRET-API-KEY", "DB-SECRET-PW"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "config rendering leaked {secret}: {rendered}"
+                );
+            }
+            assert!(rendered.contains("<redacted>"));
         }
     }
 }
