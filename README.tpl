@@ -12,31 +12,44 @@
 
 {{readme}}
 
-## What's New in 0.11.1
+## What's New in 0.12.0
 
-This release adds comprehensive API coverage with the following new services:
+A large correctness, safety, and API-consistency release. Highlights:
 
-### New Services
-- **WatchlistService** - Full CRUD operations for watchlists
-  - `get_watchlists()`, `create_watchlist()`, `get_watchlist()`, `delete_watchlist()`
-  - `add_to_watchlist()`, `remove_from_watchlist()`
-- **SentimentService** - Client sentiment data
-  - `get_client_sentiment()`, `get_client_sentiment_by_market()`, `get_related_sentiment()`
-- **CostsService** - Indicative costs and charges
-  - `get_indicative_costs_open()`, `get_indicative_costs_close()`, `get_indicative_costs_edit()`
-  - `get_costs_history()`, `get_durable_medium()`
-- **OperationsService** - API application management
-  - `get_client_apps()`, `disable_client_app()`
+### Security & reliability
+- Credentials, session tokens (CST / X-SECURITY-TOKEN / OAuth) and the DB
+  connection URL are redacted from `Debug`/`Display` and never logged.
+- Retries are finite by default with exponential backoff + jitter; HTTP 429
+  is retried; unbounded retry loops are gone.
+- The rate limiter honours the configured `max_requests` and separates the
+  trading, non-trading and historical budgets.
+- Token expiry/refresh is consistent (single refresh-and-replay on 401); the
+  streaming connection no longer holds a lock across its lifetime and every
+  spawned task has a shutdown path.
 
-### Extended Services
-- **AccountService** - Added `get_preferences()`, `update_preferences()`, `get_activity_by_period()`
-- **OrderService** - Added `get_position()`, `update_working_order()`
+### Correctness
+- Order size rounds to the nearest tick (no more `0.29 → 0.28`); P&L math is
+  unified and correct when a market price is missing; position netting takes
+  the larger side's direction.
+- Storage: the unique-constraint migration actually runs, empty-epic stats no
+  longer panic, `instrument_type` is stored unquoted, and historical prices
+  persist in UTC (`snapshotTimeUTC`).
+- DTOs capture previously-dropped IG fields (`affectedDeals`/`profit` on
+  confirms, `EXECUTE_AND_ELIMINATE`, OPU stop/limit/trailing fields); IG
+  numeric fields are `i64`/unsigned, not `i32`.
 
-### New Examples
-- `examples/watchlist/` - Watchlist management examples
-- `examples/sentiment/` - Client sentiment examples
-- `examples/costs/` - Indicative costs examples
-- Additional examples in `positions/`, `orders/`, and `other/`
+### API & structure (breaking — 0.12.0)
+- Constructors are fallible and panic-free: use `Client::try_new()`,
+  `Auth::try_new()`, `HttpClient::new_lazy()` (`new()`/`Default` removed).
+- Module boundaries restored: `model`/`presentation` are pure DTO layers;
+  `HttpClient` and the streaming adapters live in `application`.
+- Typed errors are wired up (`AuthError`, deserialization context with the
+  auth-response body redacted). The prelude now exports the streaming API and
+  all service traits.
+
+### Testing
+- Offline test coverage for the auth flow, HTTP retry/status mapping,
+  streaming lifecycle, and serde round-trips (via a `wiremock` dev-dependency).
 
 ## Contribution 
 
