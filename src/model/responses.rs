@@ -437,8 +437,9 @@ pub struct CreateWorkingOrderResponse {
 /// Outcome of a deal as reported by the order confirmation endpoint.
 ///
 /// Returned by `GET /confirms/{dealReference}` in the top-level `dealStatus`
-/// field and in each [`AffectedDeal`]. IG documents `ACCEPTED` and `REJECTED`
-/// for this field.
+/// field, for which IG documents `ACCEPTED` and `REJECTED`. This is distinct
+/// from [`AffectedDeal::status`], which reports a per-deal lifecycle status
+/// (e.g. `FULLY_CLOSED`, `PARTIALLY_CLOSED`, `OPENED`).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, DisplaySimple, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -458,7 +459,10 @@ pub struct AffectedDeal {
     /// Identifier of the affected deal.
     #[serde(rename = "dealId")]
     pub deal_id: String,
-    /// Status of the affected deal (for example `ACCEPTED`).
+    /// Per-deal lifecycle status — a different domain from the top-level
+    /// [`DealStatus`]; IG returns values such as `FULLY_CLOSED`,
+    /// `PARTIALLY_CLOSED` or `OPENED`. Kept as a `String` because the set is
+    /// broader and less stable than the accept/reject outcome.
     #[serde(rename = "status")]
     pub status: String,
 }
