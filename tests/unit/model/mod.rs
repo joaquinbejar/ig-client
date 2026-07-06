@@ -7,4 +7,3 @@ mod test_auth;
 mod test_config;
 mod test_requests;
 mod test_responses;
-mod test_streaming;

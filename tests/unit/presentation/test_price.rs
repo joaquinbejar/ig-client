@@ -148,10 +148,19 @@ fn test_price_data_from_item_update_invalid_float() {
     };
 
     let result = PriceData::from_item_update(&item_update);
-    // The implementation returns an error for invalid floats
-    // If it doesn't error, it means the implementation handles it gracefully
-    // Let's just verify it completes without panicking
-    let _ = result;
+    // An unparseable float in a numeric field is a hard error: `parse_float`
+    // fails and the error propagates out of `from_item_update`. The message
+    // names the offending field and value.
+    assert!(result.is_err());
+    let err = result.expect_err("invalid float must yield an error");
+    assert!(
+        err.contains("BID"),
+        "error should name the offending field, got: {err}"
+    );
+    assert!(
+        err.contains("invalid"),
+        "error should include the offending value, got: {err}"
+    );
 }
 
 #[test]
