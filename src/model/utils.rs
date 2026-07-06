@@ -127,19 +127,39 @@ pub fn build_market_hierarchy<'a>(
     })
 }
 
-/// Recursively extract all markets from the hierarchy into a flat list
-pub fn extract_markets_from_hierarchy(nodes: &[MarketNode]) -> Vec<MarketData> {
-    let mut all_markets = Vec::new();
+/// Recursively extract all markets from the hierarchy into a flat list of
+/// borrowed references.
+///
+/// The hierarchy owns the [`MarketData`]; callers only need read access, so
+/// this returns `&MarketData` and performs no clones (previously every market
+/// was deep-cloned at each recursion level). Markets are collected depth-first:
+/// a node's own markets precede its descendants', preserving the previous
+/// ordering. The returned references borrow `nodes`.
+#[must_use]
+pub fn extract_markets_from_hierarchy(nodes: &[MarketNode]) -> Vec<&MarketData> {
+    // Pre-size once with the exact market count to avoid intermediate per-level
+    // Vec allocations and reallocations.
+    let mut all_markets = Vec::with_capacity(count_markets(nodes));
+    collect_markets(nodes, &mut all_markets);
+    all_markets
+}
 
+/// Counts every market in the hierarchy (including descendants) so the flat
+/// output vector can be pre-allocated exactly once.
+fn count_markets(nodes: &[MarketNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| node.markets.len() + count_markets(&node.children))
+        .sum()
+}
+
+/// Appends borrowed market references into `out` depth-first, reusing a single
+/// accumulator instead of allocating a Vec per recursion level.
+fn collect_markets<'a>(nodes: &'a [MarketNode], out: &mut Vec<&'a MarketData>) {
     for node in nodes {
-        // Add markets from this node
-        all_markets.extend(node.markets.clone());
-
-        // Recursively add markets from child nodes
+        out.extend(node.markets.iter());
         if !node.children.is_empty() {
-            all_markets.extend(extract_markets_from_hierarchy(&node.children));
+            collect_markets(&node.children, out);
         }
     }
-
-    all_markets
 }

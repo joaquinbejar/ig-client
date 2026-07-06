@@ -11,11 +11,13 @@
 //!
 //! Each test skips silently when `DATABASE_URL` is unset.
 
-use ig_client::presentation::market::{HistoricalPrice, PricePoint};
+use ig_client::presentation::instrument::InstrumentType;
+use ig_client::presentation::market::{HistoricalPrice, MarketData, MarketNode, PricePoint};
 use ig_client::presentation::transaction::StoreTransaction;
 use ig_client::storage::historical_prices::{
     get_table_statistics, initialize_historical_prices_table, store_historical_prices,
 };
+use ig_client::storage::market_database::MarketDatabaseService;
 use ig_client::storage::utils::{initialize_ig_options_table, store_transactions};
 use sqlx::{PgPool, Row};
 
@@ -166,6 +168,113 @@ async fn test_get_table_statistics_empty_epic_returns_zeroed_stats() {
     assert!((stats.avg_close_price - 0.0).abs() < f64::EPSILON);
     assert!((stats.min_price - 0.0).abs() < f64::EPSILON);
     assert!((stats.max_price - 0.0).abs() < f64::EPSILON);
+}
+
+fn market(epic: &str, name: &str) -> MarketData {
+    MarketData {
+        epic: epic.to_string(),
+        instrument_name: name.to_string(),
+        instrument_type: InstrumentType::Shares,
+        expiry: "DFB".to_string(),
+        high_limit_price: Some(100.0),
+        low_limit_price: Some(50.0),
+        market_status: "TRADEABLE".to_string(),
+        net_change: Some(1.0),
+        percentage_change: Some(0.5),
+        update_time: Some("2024-01-01T00:00:00Z".to_string()),
+        update_time_utc: Some("2024-01-01T00:00:00Z".to_string()),
+        bid: Some(75.0),
+        offer: Some(76.0),
+    }
+}
+
+/// Verifies the batched (`UNNEST`) `store_market_hierarchy` stores the right
+/// rows: it flattens a nested hierarchy, dedupes a duplicate epic to a single
+/// instrument, and a re-run (full refresh) is idempotent (no duplicates).
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL via DATABASE_URL"]
+async fn test_store_market_hierarchy_batched_dedupe_and_refresh() {
+    let Some(pool) = test_pool().await else {
+        return;
+    };
+    let exchange = "TEST_ISSUE46";
+    let service = MarketDatabaseService::new(pool.clone(), exchange.to_string());
+
+    service
+        .initialize_database()
+        .await
+        .expect("schema initialization should succeed");
+
+    // n1 (E1) -> n1c (E2); n2 (E1 duplicate epic, node_id last-wins = n2).
+    let child = MarketNode {
+        id: "TEST_ISSUE46_n1c".to_string(),
+        name: "Child".to_string(),
+        children: vec![],
+        markets: vec![market("TEST.ISSUE46.E2", "E2")],
+    };
+    let n1 = MarketNode {
+        id: "TEST_ISSUE46_n1".to_string(),
+        name: "Node 1".to_string(),
+        children: vec![child],
+        markets: vec![market("TEST.ISSUE46.E1", "E1")],
+    };
+    let n2 = MarketNode {
+        id: "TEST_ISSUE46_n2".to_string(),
+        name: "Node 2".to_string(),
+        children: vec![],
+        markets: vec![market("TEST.ISSUE46.E1", "E1 updated")],
+    };
+    let hierarchy = vec![n1, n2];
+
+    service
+        .store_market_hierarchy(&hierarchy)
+        .await
+        .expect("first store should succeed");
+
+    let stats = service
+        .get_statistics()
+        .await
+        .expect("statistics should succeed");
+    assert_eq!(stats.node_count, 3, "n1 + n1c + n2");
+    assert_eq!(stats.instrument_count, 2, "E1 deduped + E2");
+
+    // Duplicate epic collapsed to one row, last occurrence's data wins.
+    let row = sqlx::query(
+        "SELECT node_id, instrument_name FROM market_instruments \
+         WHERE epic = $1 AND exchange = $2",
+    )
+    .bind("TEST.ISSUE46.E1")
+    .bind(exchange)
+    .fetch_one(&pool)
+    .await
+    .expect("the deduped instrument row should exist exactly once");
+    assert_eq!(row.get::<String, _>("node_id"), "TEST_ISSUE46_n2");
+    assert_eq!(row.get::<String, _>("instrument_name"), "E1 updated");
+
+    // Re-run: full refresh must not accumulate duplicates.
+    service
+        .store_market_hierarchy(&hierarchy)
+        .await
+        .expect("second store (refresh) should succeed");
+    let stats2 = service
+        .get_statistics()
+        .await
+        .expect("statistics should succeed");
+    assert_eq!(stats2.node_count, 3, "refresh must not duplicate nodes");
+    assert_eq!(
+        stats2.instrument_count, 2,
+        "refresh must not duplicate instruments"
+    );
+
+    // Clean up (instruments first for the node_id FK).
+    let _ = sqlx::query("DELETE FROM market_instruments WHERE exchange = $1")
+        .bind(exchange)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM market_hierarchy_nodes WHERE exchange = $1")
+        .bind(exchange)
+        .execute(&pool)
+        .await;
 }
 
 #[tokio::test]

@@ -37,7 +37,8 @@ fn test_extract_markets_from_single_node_with_market() {
         markets: vec![market.clone()],
     };
 
-    let markets = extract_markets_from_hierarchy(&[node]);
+    let nodes = [node];
+    let markets = extract_markets_from_hierarchy(&nodes);
     assert_eq!(markets.len(), 1);
     assert_eq!(markets[0].epic, "TEST.EPIC");
 }
@@ -61,7 +62,8 @@ fn test_extract_markets_from_multiple_nodes() {
         markets: vec![market2.clone()],
     };
 
-    let markets = extract_markets_from_hierarchy(&[node1, node2]);
+    let nodes = [node1, node2];
+    let markets = extract_markets_from_hierarchy(&nodes);
     assert_eq!(markets.len(), 2);
     assert_eq!(markets[0].epic, "EPIC1");
     assert_eq!(markets[1].epic, "EPIC2");
@@ -94,7 +96,8 @@ fn test_extract_markets_from_nested_hierarchy() {
         markets: vec![market3.clone()],
     };
 
-    let markets = extract_markets_from_hierarchy(&[parent_node, sibling_node]);
+    let nodes = [parent_node, sibling_node];
+    let markets = extract_markets_from_hierarchy(&nodes);
     assert_eq!(markets.len(), 3);
     assert_eq!(markets[0].epic, "EPIC1");
     assert_eq!(markets[1].epic, "EPIC2");
@@ -110,7 +113,8 @@ fn test_extract_markets_from_node_without_markets() {
         markets: vec![],
     };
 
-    let markets = extract_markets_from_hierarchy(&[node]);
+    let nodes = [node];
+    let markets = extract_markets_from_hierarchy(&nodes);
     assert!(markets.is_empty());
 }
 
@@ -141,7 +145,8 @@ fn test_extract_markets_from_deeply_nested_hierarchy() {
         markets: vec![market1.clone()],
     };
 
-    let markets = extract_markets_from_hierarchy(&[level1]);
+    let nodes = [level1];
+    let markets = extract_markets_from_hierarchy(&nodes);
     assert_eq!(markets.len(), 3);
     assert_eq!(markets[0].epic, "EPIC1");
     assert_eq!(markets[1].epic, "EPIC2");
@@ -173,7 +178,8 @@ fn test_extract_markets_preserves_market_data() {
         markets: vec![market.clone()],
     };
 
-    let markets = extract_markets_from_hierarchy(&[node]);
+    let nodes = [node];
+    let markets = extract_markets_from_hierarchy(&nodes);
     assert_eq!(markets.len(), 1);
 
     let extracted = &markets[0];
