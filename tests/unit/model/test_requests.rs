@@ -9,6 +9,34 @@ fn json_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
 }
 
 #[test]
+fn time_in_force_execute_and_eliminate_serde_round_trips() {
+    // The variant maps to IG's exact wire name.
+    let tif = TimeInForce::ExecuteAndEliminate;
+    let raw = serde_json::to_string(&tif).unwrap();
+    assert_eq!(raw, "\"EXECUTE_AND_ELIMINATE\"");
+
+    let back: TimeInForce = serde_json::from_str("\"EXECUTE_AND_ELIMINATE\"").unwrap();
+    assert_eq!(back, TimeInForce::ExecuteAndEliminate);
+
+    // A request DTO carrying the variant serialises it on the wire and round-trips.
+    let mut order = CreateOrderRequest::market(
+        "CS.D.EURUSD.TODAY.IP".to_string(),
+        Direction::Buy,
+        1.0,
+        Some("EUR".to_string()),
+        Some("REF_EAE".to_string()),
+    );
+    order.time_in_force = TimeInForce::ExecuteAndEliminate;
+
+    let json = json_value(&order);
+    assert_eq!(json.get("timeInForce").unwrap(), "EXECUTE_AND_ELIMINATE");
+
+    let raw = serde_json::to_string(&order).unwrap();
+    let re: CreateOrderRequest = serde_json::from_str(&raw).unwrap();
+    assert_eq!(re.time_in_force, TimeInForce::ExecuteAndEliminate);
+}
+
+#[test]
 fn recent_prices_request_builders() {
     let req = RecentPricesRequest::new("CS.D.EURUSD.TODAY.IP")
         .with_resolution("MINUTE")

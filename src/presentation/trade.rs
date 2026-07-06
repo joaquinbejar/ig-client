@@ -91,6 +91,30 @@ pub struct OpenPositionUpdate {
     #[serde(with = "option_string_empty_as_none")]
     #[serde(default)]
     pub deal_id_origin: Option<String>,
+    /// Price level of the stop loss, if set (points).
+    #[serde(rename = "stopLevel")]
+    #[serde(with = "string_as_float_opt")]
+    #[serde(default)]
+    pub stop_level: Option<f64>,
+    /// Price level of the limit (take profit), if set (points).
+    #[serde(rename = "limitLevel")]
+    #[serde(with = "string_as_float_opt")]
+    #[serde(default)]
+    pub limit_level: Option<f64>,
+    /// Whether the stop is a guaranteed stop.
+    #[serde(rename = "guaranteedStop")]
+    #[serde(default)]
+    pub guaranteed_stop: Option<bool>,
+    /// Trailing stop step increment, if a trailing stop is set (points).
+    #[serde(rename = "trailingStep")]
+    #[serde(with = "string_as_float_opt")]
+    #[serde(default)]
+    pub trailing_step: Option<f64>,
+    /// Trailing stop distance from the current level, if set (points).
+    #[serde(rename = "trailingStopDistance")]
+    #[serde(with = "string_as_float_opt")]
+    #[serde(default)]
+    pub trailing_stop_distance: Option<f64>,
 }
 
 /// Structure representing details of a working order update.
@@ -296,6 +320,63 @@ mod tests {
         let opu = fields.opu.expect("OPU should be populated");
         assert_eq!(opu.deal_id.as_deref(), Some("DIAAAAF00SYNTH01"));
         assert_eq!(opu.level, Some(18000.5));
+    }
+
+    #[test]
+    fn test_open_position_update_captures_stop_limit_and_trailing_fields() {
+        // Realistic OPU payload for a position carrying a stop, a limit and a
+        // trailing stop. Deal ids are synthetic; the numeric fields arrive as
+        // strings in the OPU JSON and are parsed via `string_as_float_opt`.
+        let json = r#"{
+            "dealReference": "REF_SYNTHETIC_0002",
+            "dealId": "DIAAAAF00SYNTH02",
+            "dealIdOrigin": "DIAAAAF00SYNTH02",
+            "direction": "SELL",
+            "epic": "IX.D.DAX.DAILY.IP",
+            "status": "OPEN",
+            "dealStatus": "ACCEPTED",
+            "level": "18010.0",
+            "size": "2.0",
+            "currency": "EUR",
+            "timestamp": "2024-01-15T10:31:00.000",
+            "channel": "PublicRestOTC",
+            "expiry": "DFB",
+            "stopLevel": "18100.0",
+            "limitLevel": "17900.0",
+            "guaranteedStop": true,
+            "trailingStep": "5.0",
+            "trailingStopDistance": "50.0"
+        }"#;
+
+        let opu: OpenPositionUpdate = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(opu.stop_level, Some(18100.0));
+        assert_eq!(opu.limit_level, Some(17900.0));
+        assert_eq!(opu.guaranteed_stop, Some(true));
+        assert_eq!(opu.trailing_step, Some(5.0));
+        assert_eq!(opu.trailing_stop_distance, Some(50.0));
+
+        // Round-trip leg: compare structs, not JSON text.
+        let out = serde_json::to_string(&opu).expect("serialize failed");
+        let reparsed: OpenPositionUpdate =
+            serde_json::from_str(&out).expect("re-deserialize failed");
+        assert_eq!(reparsed.stop_level, Some(18100.0));
+        assert_eq!(reparsed.limit_level, Some(17900.0));
+        assert_eq!(reparsed.guaranteed_stop, Some(true));
+        assert_eq!(reparsed.trailing_step, Some(5.0));
+        assert_eq!(reparsed.trailing_stop_distance, Some(50.0));
+    }
+
+    #[test]
+    fn test_open_position_update_new_fields_absent_default_to_none() {
+        // The original OPU shape (no stop/limit/trailing keys) must still parse,
+        // with the added fields defaulting to `None`.
+        let opu: OpenPositionUpdate =
+            serde_json::from_str(SANITIZED_OPU_JSON).expect("deserialize failed");
+        assert!(opu.stop_level.is_none());
+        assert!(opu.limit_level.is_none());
+        assert!(opu.guaranteed_stop.is_none());
+        assert!(opu.trailing_step.is_none());
+        assert!(opu.trailing_stop_distance.is_none());
     }
 
     #[test]

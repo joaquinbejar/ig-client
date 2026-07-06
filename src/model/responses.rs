@@ -434,6 +434,39 @@ pub struct CreateWorkingOrderResponse {
     pub deal_reference: String,
 }
 
+/// Outcome of a deal as reported by the order confirmation endpoint.
+///
+/// Returned by `GET /confirms/{dealReference}` in the top-level `dealStatus`
+/// field, for which IG documents `ACCEPTED` and `REJECTED`. This is distinct
+/// from [`AffectedDeal::status`], which reports a per-deal lifecycle status
+/// (e.g. `FULLY_CLOSED`, `PARTIALLY_CLOSED`, `OPENED`).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, DisplaySimple, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DealStatus {
+    /// The deal was accepted by IG.
+    Accepted,
+    /// The deal was rejected by IG.
+    Rejected,
+}
+
+/// A deal affected by an order confirmation.
+///
+/// IG returns one entry per deal touched by the confirmed order — for example
+/// the individual deals partially closed to fill a closing order.
+#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct AffectedDeal {
+    /// Identifier of the affected deal.
+    #[serde(rename = "dealId")]
+    pub deal_id: String,
+    /// Per-deal lifecycle status — a different domain from the top-level
+    /// [`DealStatus`]; IG returns values such as `FULLY_CLOSED`,
+    /// `PARTIALLY_CLOSED` or `OPENED`. Kept as a `String` because the set is
+    /// broader and less stable than the accept/reject outcome.
+    #[serde(rename = "status")]
+    pub status: String,
+}
+
 /// Details of a confirmed order
 #[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize)]
 pub struct OrderConfirmationResponse {
@@ -451,9 +484,10 @@ pub struct OrderConfirmationResponse {
     /// Client-generated reference for the deal
     #[serde(rename = "dealReference")]
     pub deal_reference: String,
-    /// Status of the deal
+    /// Status of the deal (accepted or rejected)
     #[serde(rename = "dealStatus")]
-    pub deal_status: Option<String>,
+    #[serde(default)]
+    pub deal_status: Option<DealStatus>,
     /// Instrument EPIC identifier
     pub epic: Option<String>,
     /// Expiry date for the order
@@ -484,6 +518,18 @@ pub struct OrderConfirmationResponse {
     pub trailing_stop: Option<bool>,
     /// Direction of the order (buy or sell)
     pub direction: Option<Direction>,
+    /// Deals affected by this confirmation (empty when IG omits the field)
+    #[serde(rename = "affectedDeals")]
+    #[serde(default)]
+    pub affected_deals: Vec<AffectedDeal>,
+    /// Realised profit or loss for the confirmed deal, in `profit_currency`
+    #[serde(rename = "profit")]
+    #[serde(default)]
+    pub profit: Option<f64>,
+    /// Currency in which `profit` is denominated (ISO code, for example `GBP`)
+    #[serde(rename = "profitCurrency")]
+    #[serde(default)]
+    pub profit_currency: Option<String>,
 }
 
 impl std::fmt::Display for MultipleMarketDetailsResponse {

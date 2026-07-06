@@ -93,8 +93,20 @@ pub enum TimeInForce {
     GoodTillCancelled,
     /// Order remains valid until a specified date
     GoodTillDate,
-    /// Order is executed immediately (partially or completely) or cancelled
+    /// Order is executed immediately (partially or completely) or cancelled.
+    ///
+    /// Note: `IMMEDIATE_OR_CANCEL` is not a documented value for IG's OTC
+    /// `timeInForce`; it is retained for backward compatibility. Prefer
+    /// [`TimeInForce::ExecuteAndEliminate`] for partial-fill-then-cancel
+    /// semantics on OTC create/close position endpoints.
     ImmediateOrCancel,
-    /// Order must be filled completely immediately or cancelled
+    /// Order must be filled completely immediately or cancelled.
+    ///
+    /// Serializes to `FILL_OR_KILL`.
     FillOrKill,
+    /// Order fills as much as possible immediately, then cancels the remainder.
+    ///
+    /// Serializes to `EXECUTE_AND_ELIMINATE`. Accepted alongside
+    /// [`TimeInForce::FillOrKill`] by IG's OTC create/close position endpoints.
+    ExecuteAndEliminate,
 }

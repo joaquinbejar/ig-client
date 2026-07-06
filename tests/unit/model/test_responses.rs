@@ -417,6 +417,79 @@ fn order_confirmation_response_deserialize_status_and_fields() {
 }
 
 #[test]
+fn order_confirmation_response_captures_affected_deals_profit_and_deal_status() {
+    // Realistic DealConfirmation payload from GET /confirms/{dealReference} for a
+    // closing order that partially matched two open deals. Deal ids are fake.
+    let json = r#"{
+        "date": "2025-10-19T10:15:30.123",
+        "status": "CLOSED",
+        "reason": "SUCCESS",
+        "dealId": "DIAAAABBBBCCCC1",
+        "dealReference": "TEST_REF_0001",
+        "dealStatus": "ACCEPTED",
+        "epic": "CS.D.EURUSD.CFD.IP",
+        "expiry": "-",
+        "guaranteedStop": false,
+        "level": 1.10256,
+        "limitDistance": null,
+        "limitLevel": null,
+        "size": 2.0,
+        "stopDistance": null,
+        "stopLevel": null,
+        "trailingStop": false,
+        "direction": "SELL",
+        "affectedDeals": [
+            { "dealId": "DIAAAABBBBCCCC2", "status": "FULLY_CLOSED" },
+            { "dealId": "DIAAAABBBBCCCC3", "status": "PARTIALLY_CLOSED" }
+        ],
+        "profit": 12.5,
+        "profitCurrency": "GBP"
+    }"#;
+
+    let conf: OrderConfirmationResponse = serde_json::from_str(json).expect("deserialize failed");
+    assert_eq!(conf.deal_status, Some(DealStatus::Accepted));
+    assert_eq!(conf.profit, Some(12.5));
+    assert_eq!(conf.profit_currency.as_deref(), Some("GBP"));
+    assert_eq!(conf.affected_deals.len(), 2);
+    assert_eq!(conf.affected_deals[0].deal_id, "DIAAAABBBBCCCC2");
+    assert_eq!(conf.affected_deals[0].status, "FULLY_CLOSED");
+    assert_eq!(conf.affected_deals[1].deal_id, "DIAAAABBBBCCCC3");
+    assert_eq!(conf.affected_deals[1].status, "PARTIALLY_CLOSED");
+
+    // Round-trip leg: compare structs, not JSON text.
+    let out = serde_json::to_string(&conf).expect("serialize failed");
+    let reparsed: OrderConfirmationResponse =
+        serde_json::from_str(&out).expect("re-deserialize failed");
+    assert_eq!(reparsed.deal_status, Some(DealStatus::Accepted));
+    assert_eq!(reparsed.profit, Some(12.5));
+    assert_eq!(reparsed.profit_currency.as_deref(), Some("GBP"));
+    assert_eq!(reparsed.affected_deals.len(), 2);
+    assert_eq!(reparsed.affected_deals, conf.affected_deals);
+}
+
+#[test]
+fn order_confirmation_response_rejected_deal_status_and_absent_new_fields() {
+    // Minimal rejected confirmation: no affectedDeals / profit / profitCurrency.
+    let json = r#"{
+        "date": "2025-10-19T10:16:00",
+        "status": "REJECTED",
+        "reason": "INSUFFICIENT_FUNDS",
+        "dealId": "DIAAAABBBBCCCC9",
+        "dealReference": "TEST_REF_0002",
+        "dealStatus": "REJECTED",
+        "epic": "CS.D.EURUSD.CFD.IP",
+        "direction": "BUY"
+    }"#;
+
+    let conf: OrderConfirmationResponse = serde_json::from_str(json).expect("deserialize failed");
+    assert_eq!(conf.deal_status, Some(DealStatus::Rejected));
+    assert_eq!(conf.status, Status::Rejected);
+    assert!(conf.affected_deals.is_empty());
+    assert!(conf.profit.is_none());
+    assert!(conf.profit_currency.is_none());
+}
+
+#[test]
 fn simple_deal_reference_responses_serde_field_names() {
     let c = CreateOrderResponse {
         deal_reference: "ABC".into(),
