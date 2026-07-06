@@ -254,9 +254,18 @@ impl MarketData {
 /// Historical price data point
 #[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize)]
 pub struct HistoricalPrice {
-    /// Timestamp of the price data point
+    /// Timestamp of the price data point, in the account's timezone
+    /// (e.g. `"2024/01/15 14:30:00"`). Prefer [`snapshot_time_utc`] for storage.
+    ///
+    /// [`snapshot_time_utc`]: HistoricalPrice::snapshot_time_utc
     #[serde(rename = "snapshotTime")]
     pub snapshot_time: String,
+    /// UTC timestamp of the price data point (`"2024-01-15T14:30:00"`), as IG
+    /// returns it in `snapshotTimeUTC`. Authoritative for persistence — the
+    /// account-timezone `snapshot_time` shifts stored values by the account's
+    /// offset. `None` on older payloads that omit the field.
+    #[serde(rename = "snapshotTimeUTC", default)]
+    pub snapshot_time_utc: Option<String>,
     /// Opening price for the period
     #[serde(rename = "openPrice")]
     pub open_price: PricePoint,
@@ -683,6 +692,43 @@ pub struct MarketFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_historical_price_captures_snapshot_time_utc() {
+        // IG returns both snapshotTime (account tz) and snapshotTimeUTC.
+        let json = r#"{
+            "snapshotTime": "2024/01/15 15:30:00",
+            "snapshotTimeUTC": "2024-01-15T14:30:00",
+            "openPrice": { "bid": 1.1, "ask": 1.2, "lastTraded": null },
+            "highPrice": { "bid": 1.3, "ask": 1.4, "lastTraded": null },
+            "lowPrice": { "bid": 1.0, "ask": 1.05, "lastTraded": null },
+            "closePrice": { "bid": 1.25, "ask": 1.26, "lastTraded": null },
+            "lastTradedVolume": 42
+        }"#;
+        let hp: HistoricalPrice = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(hp.snapshot_time, "2024/01/15 15:30:00");
+        assert_eq!(hp.snapshot_time_utc.as_deref(), Some("2024-01-15T14:30:00"));
+
+        // Round-trips through serialize -> deserialize.
+        let round: HistoricalPrice =
+            serde_json::from_str(&serde_json::to_string(&hp).expect("ser")).expect("de");
+        assert_eq!(
+            round.snapshot_time_utc.as_deref(),
+            Some("2024-01-15T14:30:00")
+        );
+
+        // Older payloads without the field default to None.
+        let legacy = r#"{
+            "snapshotTime": "2024/01/15 15:30:00",
+            "openPrice": { "bid": 1.1, "ask": 1.2, "lastTraded": null },
+            "highPrice": { "bid": 1.3, "ask": 1.4, "lastTraded": null },
+            "lowPrice": { "bid": 1.0, "ask": 1.05, "lastTraded": null },
+            "closePrice": { "bid": 1.25, "ask": 1.26, "lastTraded": null },
+            "lastTradedVolume": null
+        }"#;
+        let hp2: HistoricalPrice = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert!(hp2.snapshot_time_utc.is_none());
+    }
 
     #[test]
     fn test_market_data_is_call_returns_true_for_call_option() {

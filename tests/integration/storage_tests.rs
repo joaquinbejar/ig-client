@@ -40,6 +40,7 @@ async fn test_pool() -> Option<PgPool> {
 fn sample_price(snapshot: &str) -> HistoricalPrice {
     HistoricalPrice {
         snapshot_time: snapshot.to_string(),
+        snapshot_time_utc: None,
         open_price: PricePoint {
             bid: Some(1.0),
             ask: Some(1.1),

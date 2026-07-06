@@ -179,14 +179,20 @@ pub async fn store_historical_prices(
     for (i, price) in prices.iter().enumerate() {
         stats.total_processed += 1;
 
-        // Parse snapshot time
-        let snapshot_time = match parse_snapshot_time(&price.snapshot_time) {
+        // Parse snapshot time. Prefer the UTC value IG provides in
+        // `snapshotTimeUTC`; the plain `snapshotTime` is in the account's
+        // timezone, so storing it would shift every row by the account offset.
+        let raw_snapshot_time = price
+            .snapshot_time_utc
+            .as_deref()
+            .unwrap_or(&price.snapshot_time);
+        let snapshot_time = match parse_snapshot_time(raw_snapshot_time) {
             Ok(time) => time,
             Err(e) => {
                 warn!(
                     "⚠️  Skipping record {}: Invalid timestamp '{}': {}",
                     i + 1,
-                    price.snapshot_time,
+                    raw_snapshot_time,
                     e
                 );
                 stats.skipped += 1;
@@ -274,12 +280,16 @@ pub async fn store_historical_prices(
 ///
 /// Returns `AppError::Generic` if the timestamp cannot be parsed with any supported format.
 pub fn parse_snapshot_time(snapshot_time: &str) -> Result<DateTime<Utc>, AppError> {
-    // IG format: "yyyy/MM/dd hh:mm:ss" or "yyyy-MM-dd hh:mm:ss"
+    // IG formats: "yyyy/MM/dd hh:mm:ss" / "yyyy-MM-dd hh:mm:ss" (snapshotTime),
+    // and the ISO-8601 "yyyy-MM-ddTHH:mm:ss" that snapshotTimeUTC uses.
     let formats = [
         "%Y/%m/%d %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
         "%Y/%m/%d %H:%M",
         "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
     ];
 
     for format in &formats {
@@ -411,6 +421,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_snapshot_time_iso_utc_format() {
+        // snapshotTimeUTC uses the ISO-8601 `T` separator, with or without `Z`.
+        for input in ["2024-01-15T14:30:00", "2024-01-15T14:30:00Z"] {
+            let dt =
+                parse_snapshot_time(input).unwrap_or_else(|e| panic!("should parse {input}: {e}"));
+            assert_eq!(
+                dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                "2024-01-15 14:30:00"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_snapshot_time_without_seconds_slash() {
         let result = parse_snapshot_time("2024/01/15 14:30");
         assert!(result.is_ok());
@@ -437,10 +460,10 @@ mod tests {
         // Out-of-range components and unsupported separators/orderings must all
         // fail rather than silently coerce.
         for bad in [
-            "2025/13/01 00:00:00",  // invalid month
-            "2025-10-32 00:00:00",  // invalid day
-            "2025-10-20T19:22:33Z", // ISO 8601 separator/timezone (unsupported)
-            "20-10-2025 00:00:00",  // day-month-year order (unsupported)
+            "2025/13/01 00:00:00",       // invalid month
+            "2025-10-32 00:00:00",       // invalid day
+            "20-10-2025 00:00:00",       // day-month-year order (unsupported)
+            "2025-10-20 19:22:33+02:00", // numeric offset (unsupported)
         ] {
             assert!(
                 parse_snapshot_time(bad).is_err(),
