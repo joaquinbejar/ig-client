@@ -13,8 +13,8 @@ const DEAL_REF_LENGTH: usize = 30;
 
 /// Generates a unique deal reference as a `String`.
 ///
-/// This function creates a [`DEAL_REF_LENGTH`]-character unique identifier drawn
-/// from [`DEAL_REF_ALPHABET`] (nanoid's URL-safe alphabet) using the `nanoid`
+/// This function creates a `DEAL_REF_LENGTH`-character unique identifier drawn
+/// from `DEAL_REF_ALPHABET` (nanoid's URL-safe alphabet) using the `nanoid`
 /// library. The generated identifier is securely random and designed to be
 /// collision-resistant, and stays within IG's permitted deal-reference charset.
 ///
