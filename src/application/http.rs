@@ -310,9 +310,42 @@ impl HttpClient {
         .await
     }
 
-    /// Parses response
+    /// Deserializes a successful HTTP response body into the target DTO,
+    /// attaching request context when parsing fails.
+    ///
+    /// On a deserialization failure the returned [`AppError::Deserialization`]
+    /// names the endpoint URL, the HTTP status, and the serde error, so DTO
+    /// drift is diagnosable instead of surfacing as a bare serde message.
+    ///
+    /// For non-`/session` endpoints a truncated body snippet is appended to the
+    /// message. The `/session` endpoints are auth-adjacent — their bodies can
+    /// carry credentials / CST / X-SECURITY-TOKEN / OAuth tokens — so their body
+    /// is deliberately never echoed into the error (status + URL + serde error
+    /// only).
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the body cannot be read, and
+    /// [`AppError::Deserialization`] if the body cannot be parsed into `T`.
     async fn parse_response<T: DeserializeOwned>(&self, response: Response) -> Result<T, AppError> {
-        Ok(response.json().await?)
+        let status = response.status();
+        let url = response.url().clone();
+        // Buffer the body once so a parse failure can be reported with context;
+        // `json()` would consume the body and leave nothing to snippet.
+        let text = response.text().await?;
+
+        serde_json::from_str(&text).map_err(|e| {
+            // `/session` bodies are auth-adjacent and may carry tokens: never
+            // echo them. Every other endpoint gets a truncated snippet to help
+            // diagnose DTO drift against the real IG payload.
+            if is_auth_endpoint(url.path()) {
+                AppError::Deserialization(format!("failed to deserialize {url} ({status}): {e}"))
+            } else {
+                let snippet = truncate_body_snippet(&text);
+                AppError::Deserialization(format!(
+                    "failed to deserialize {url} ({status}): {e}; body: {snippet}"
+                ))
+            }
+        })
     }
 
     /// Switches to a different trading account
@@ -551,6 +584,38 @@ pub async fn make_http_request<B: Serialize>(
     Err(AppError::RateLimitExceeded)
 }
 
+/// Maximum number of characters of a response body echoed into a
+/// deserialization error message.
+///
+/// Long enough to spot the offending field against the real IG payload, short
+/// enough to keep error messages and logs bounded.
+const BODY_SNIPPET_MAX_CHARS: usize = 500;
+
+/// Returns whether `path` targets the auth-adjacent `/session` endpoint, whose
+/// response body can carry credentials / session tokens and must never be
+/// echoed into an error message.
+#[must_use]
+#[inline]
+fn is_auth_endpoint(path: &str) -> bool {
+    path.contains("/session")
+}
+
+/// Truncates a response body to at most [`BODY_SNIPPET_MAX_CHARS`] characters
+/// for inclusion in an error message.
+///
+/// Truncation is on `char` boundaries so it never splits a UTF-8 code point;
+/// a truncation marker is appended when the body was longer than the limit.
+#[must_use]
+#[inline]
+fn truncate_body_snippet(body: &str) -> String {
+    match body.char_indices().nth(BODY_SNIPPET_MAX_CHARS) {
+        // `idx` is the byte offset of the (limit+1)-th char, so `..idx` keeps
+        // exactly `BODY_SNIPPET_MAX_CHARS` chars on a valid boundary.
+        Some((idx, _)) => format!("{}... (truncated)", &body[..idx]),
+        None => body.to_string(),
+    }
+}
+
 /// Classification of an HTTP status code for retry decisions.
 ///
 /// Body-dependent statuses (401, 403) are handled separately in
@@ -705,6 +770,145 @@ mod tests {
         assert_eq!(
             classify_status(StatusCode::CONFLICT),
             StatusClass::Permanent
+        );
+    }
+
+    #[test]
+    fn test_truncate_body_snippet_short_body_is_unchanged() {
+        let body = r#"{"errorCode":"validation.null-not-allowed.request.epic"}"#;
+        assert_eq!(super::truncate_body_snippet(body), body);
+    }
+
+    #[test]
+    fn test_truncate_body_snippet_long_body_is_truncated_on_char_boundary() {
+        // A multi-byte char repeated past the limit must not be split.
+        let body = "é".repeat(super::BODY_SNIPPET_MAX_CHARS + 50);
+        let snippet = super::truncate_body_snippet(&body);
+        assert!(snippet.ends_with("... (truncated)"));
+        // The kept prefix is exactly the char limit (each `é` is 2 bytes).
+        let kept = snippet.trim_end_matches("... (truncated)");
+        assert_eq!(kept.chars().count(), super::BODY_SNIPPET_MAX_CHARS);
+    }
+
+    #[test]
+    fn test_is_auth_endpoint_matches_session_paths_only() {
+        assert!(super::is_auth_endpoint("/gateway/deal/session"));
+        assert!(super::is_auth_endpoint("/session"));
+        assert!(!super::is_auth_endpoint(
+            "/gateway/deal/markets/CS.D.EURUSD.MINI.IP"
+        ));
+    }
+
+    /// A DTO with a required field, used to force a deserialization failure
+    /// against an unexpected IG payload shape.
+    #[derive(Debug, serde::Deserialize)]
+    struct RequiredFieldDto {
+        #[allow(dead_code)]
+        instrument_type: String,
+    }
+
+    #[tokio::test]
+    async fn test_parse_response_malformed_body_includes_status_and_snippet() {
+        use super::HttpClient;
+        use crate::error::AppError;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A 200 whose body does not match the target DTO (DTO drift).
+        Mock::given(method("GET"))
+            .and(path("/markets/CS.D.EURUSD.MINI.IP"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"unexpectedField":"surprise","another":"drifted"}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/markets/CS.D.EURUSD.MINI.IP", server.uri());
+        let response = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("request should reach the mock server");
+
+        let client = HttpClient::default();
+        let result: Result<RequiredFieldDto, AppError> = client.parse_response(response).await;
+
+        let msg = match result {
+            Err(AppError::Deserialization(msg)) => msg,
+            other => panic!("expected AppError::Deserialization, got {other:?}"),
+        };
+        // Status, endpoint, and a body snippet all present.
+        assert!(
+            msg.contains("200"),
+            "error should carry the HTTP status: {msg}"
+        );
+        assert!(
+            msg.contains("/markets/"),
+            "error should carry the endpoint URL: {msg}"
+        );
+        assert!(
+            msg.contains("body:"),
+            "error should carry a body snippet: {msg}"
+        );
+        assert!(
+            msg.contains("unexpectedField"),
+            "error should include the malformed body snippet: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_response_session_endpoint_omits_body_snippet() {
+        use super::HttpClient;
+        use crate::error::AppError;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A /session body that fails to deserialize into the target DTO but
+        // carries a token-shaped secret. The error must NOT echo the body.
+        const SECRET: &str = "SUPER-SECRET-OAUTH-TOKEN-VALUE";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(r#"{{"oauthToken":{{"access_token":"{SECRET}"}}}}"#),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/session", server.uri());
+        let response = reqwest::Client::new()
+            .post(&url)
+            .send()
+            .await
+            .expect("request should reach the mock server");
+
+        let client = HttpClient::default();
+        let result: Result<RequiredFieldDto, AppError> = client.parse_response(response).await;
+
+        let msg = match result {
+            Err(AppError::Deserialization(msg)) => msg,
+            other => panic!("expected AppError::Deserialization, got {other:?}"),
+        };
+        // Status and endpoint are present for diagnosis...
+        assert!(
+            msg.contains("200"),
+            "error should carry the HTTP status: {msg}"
+        );
+        assert!(
+            msg.contains("/session"),
+            "error should carry the endpoint URL: {msg}"
+        );
+        // ...but the auth-adjacent body (and any token in it) is NOT echoed.
+        assert!(
+            !msg.contains("body:"),
+            "session errors must not include a body snippet: {msg}"
+        );
+        assert!(
+            !msg.contains(SECRET),
+            "session errors must never leak token material: {msg}"
         );
     }
 }

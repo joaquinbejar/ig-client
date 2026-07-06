@@ -1,4 +1,4 @@
-use ig_client::error::{AppError, AuthError, FetchError};
+use ig_client::error::{AppError, AuthError};
 use reqwest::StatusCode;
 use serde_json::Error as JsonError;
 use sqlx::Error as SqlxError;
@@ -79,29 +79,61 @@ fn test_app_error_from_sqlx_error() {
 
 #[test]
 fn test_app_error_from_auth_error() {
-    // Create an AuthError
+    // An AuthError is wrapped (not flattened) into AppError::Auth, preserving
+    // both the specific auth variant and its contextual message.
     let auth_error = AuthError::BadCredentials;
-
     let app_error = AppError::from(auth_error);
 
     match app_error {
-        AppError::Unauthorized => {
+        AppError::Auth(AuthError::BadCredentials) => {
             // Test passed
         }
-        _ => panic!("Expected AppError::Unauthorized, got {app_error:?}"),
+        _ => panic!("Expected AppError::Auth(BadCredentials), got {app_error:?}"),
     }
 
-    assert_display_contains(&app_error, "unauthorized");
+    // The wrapped auth message is carried through the AppError Display.
+    assert_display_contains(&app_error, "auth error");
+    assert_display_contains(&app_error, "bad credentials");
 
     // Test another variant
     let auth_error = AuthError::Unexpected(StatusCode::INTERNAL_SERVER_ERROR);
     let app_error = AppError::from(auth_error);
 
     match app_error {
-        AppError::Unexpected(_) => {
+        AppError::Auth(AuthError::Unexpected(_)) => {
             // Test passed
         }
-        _ => panic!("Expected AppError::Unexpected, got {app_error:?}"),
+        _ => panic!("Expected AppError::Auth(Unexpected), got {app_error:?}"),
+    }
+}
+
+#[test]
+fn test_app_error_from_missing_session_token_names_header() {
+    // The concrete wiring that makes AuthError non-dead: a missing session
+    // header maps to a typed auth error whose message names the header, and
+    // survives conversion into AppError.
+    let auth_error = AuthError::MissingSessionToken("cst".to_string());
+    assert_display_contains(&auth_error, "missing cst header in login response");
+
+    let app_error = AppError::from(auth_error);
+    match &app_error {
+        AppError::Auth(AuthError::MissingSessionToken(header)) => assert_eq!(header, "cst"),
+        _ => panic!("Expected AppError::Auth(MissingSessionToken), got {app_error:?}"),
+    }
+    assert_display_contains(&app_error, "missing cst header in login response");
+}
+
+#[test]
+fn test_auth_error_from_app_error_auth_round_trips() {
+    // AppError::Auth unwraps back to the inner AuthError rather than being
+    // re-stringified into AuthError::Other.
+    let app_error = AppError::Auth(AuthError::MissingSessionToken(
+        "x-security-token".to_string(),
+    ));
+    let auth_error = AuthError::from(app_error);
+    match auth_error {
+        AuthError::MissingSessionToken(header) => assert_eq!(header, "x-security-token"),
+        _ => panic!("Expected AuthError::MissingSessionToken, got {auth_error:?}"),
     }
 }
 
@@ -192,15 +224,18 @@ fn test_app_error_from_box_dyn_error() {
     // Create a Box<dyn Error> containing a different error type
     let boxed_error: Box<dyn Error> = Box::new(TestError("test error".to_string()));
 
-    // Convert to AppError - should default to Unexpected
+    // Convert to AppError - the fallback now PRESERVES the original message via
+    // Generic instead of fabricating a fake "unexpected http status: 500".
     let app_error = AppError::from(boxed_error);
 
-    match app_error {
-        AppError::Unexpected(_) => {
+    match &app_error {
+        AppError::Generic(_) => {
             // Test passed
         }
-        _ => panic!("Expected AppError::Unexpected, got {app_error:?}"),
+        _ => panic!("Expected AppError::Generic, got {app_error:?}"),
     }
+    // The original error text is not discarded.
+    assert_display_contains(&app_error, "test error");
 }
 
 #[test]
@@ -311,7 +346,10 @@ fn test_auth_error_from_box_dyn_error_send_sync() {
 }
 
 #[test]
+#[allow(deprecated)] // FetchError is deprecated; this pins its Display until removal.
 fn test_fetch_error_display() {
+    use ig_client::error::FetchError;
+
     let fetch_error = FetchError::Parser("parsing failed".to_string());
     assert_display_contains(&fetch_error, "parser error");
     assert_display_contains(&fetch_error, "parsing failed");

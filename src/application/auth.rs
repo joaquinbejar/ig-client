@@ -16,7 +16,7 @@ use crate::application::config::Config;
 use crate::application::http::make_http_request;
 use crate::application::rate_limiter::RateLimiter;
 use crate::constants::USER_AGENT;
-use crate::error::AppError;
+use crate::error::{AppError, AuthError};
 pub(crate) use crate::model::auth::{SecurityHeaders, SessionResponse};
 use crate::model::retry::RetryConfig;
 use reqwest::{Client, Method};
@@ -334,8 +334,10 @@ impl Auth {
         {
             Some(token) => token,
             None => {
-                error!("CST header not found in response");
-                return Err(AppError::InvalidInput("CST missing".to_string()));
+                // A rejected / malformed auth response, not bad caller input:
+                // surface a typed auth error naming the missing header.
+                error!("missing cst header in login response");
+                return Err(AuthError::MissingSessionToken("cst".to_string()).into());
             }
         };
         let x_security_token: String = match response
@@ -346,10 +348,10 @@ impl Auth {
         {
             Some(token) => token,
             None => {
-                error!("X-SECURITY-TOKEN header not found in response");
-                return Err(AppError::InvalidInput(
-                    "X-SECURITY-TOKEN missing".to_string(),
-                ));
+                // A rejected / malformed auth response, not bad caller input:
+                // surface a typed auth error naming the missing header.
+                error!("missing x-security-token header in login response");
+                return Err(AuthError::MissingSessionToken("x-security-token".to_string()).into());
             }
         };
 

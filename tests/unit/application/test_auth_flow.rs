@@ -7,7 +7,7 @@ use ig_client::application::config::{
     Config, Credentials, RateLimiterConfig, RestApiConfig, WebSocketConfig,
 };
 use ig_client::application::http::HttpClient;
-use ig_client::error::AppError;
+use ig_client::error::{AppError, AuthError};
 use ig_client::storage::config::DatabaseConfig;
 use std::sync::Arc;
 use wiremock::matchers::{method, path};
@@ -122,7 +122,7 @@ async fn test_login_v2_returns_session_with_cst_and_security_token() {
 }
 
 #[tokio::test]
-async fn test_login_v2_missing_cst_header_yields_invalid_input() {
+async fn test_login_v2_missing_cst_header_yields_missing_session_token() {
     let server = MockServer::start().await;
     // Body present, but the CST response header is missing.
     Mock::given(method("POST"))
@@ -132,17 +132,17 @@ async fn test_login_v2_missing_cst_header_yields_invalid_input() {
         .await;
 
     let auth = Auth::new(Arc::new(test_config(&server.uri(), 2)));
+    // A rejected / malformed auth response maps to a typed auth error naming
+    // the missing header — NOT AppError::InvalidInput (which means bad caller
+    // input).
     match auth.login().await {
-        Err(AppError::InvalidInput(msg)) => assert!(
-            msg.contains("CST"),
-            "error should name the missing CST header, got: {msg}"
-        ),
-        other => panic!("expected InvalidInput for missing CST, got {other:?}"),
+        Err(AppError::Auth(AuthError::MissingSessionToken(header))) => assert_eq!(header, "cst"),
+        other => panic!("expected MissingSessionToken for missing CST, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn test_login_v2_missing_security_token_header_yields_invalid_input() {
+async fn test_login_v2_missing_security_token_header_yields_missing_session_token() {
     let server = MockServer::start().await;
     // CST present, X-SECURITY-TOKEN missing.
     Mock::given(method("POST"))
@@ -153,11 +153,10 @@ async fn test_login_v2_missing_security_token_header_yields_invalid_input() {
 
     let auth = Auth::new(Arc::new(test_config(&server.uri(), 2)));
     match auth.login().await {
-        Err(AppError::InvalidInput(msg)) => assert!(
-            msg.contains("X-SECURITY-TOKEN"),
-            "error should name the missing security token header, got: {msg}"
-        ),
-        other => panic!("expected InvalidInput for missing X-SECURITY-TOKEN, got {other:?}"),
+        Err(AppError::Auth(AuthError::MissingSessionToken(header))) => {
+            assert_eq!(header, "x-security-token");
+        }
+        other => panic!("expected MissingSessionToken for missing X-SECURITY-TOKEN, got {other:?}"),
     }
 }
 
