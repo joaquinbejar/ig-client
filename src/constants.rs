@@ -34,8 +34,12 @@ pub const BASE_DELAY_MS: u64 = 1000;
 /// Additional safety buffer in milliseconds added to wait times
 /// This provides extra margin to ensure rate limits are not exceeded
 pub const SAFETY_BUFFER_MS: u64 = 1000;
-/// User agent string used in HTTP requests to identify this client to the IG Markets API
-pub const USER_AGENT: &str = "Rust-IG-Client/0.1.9";
+/// User agent string used in HTTP requests to identify this client to the IG
+/// Markets API.
+///
+/// The version is derived from `CARGO_PKG_VERSION` at compile time so it can
+/// never drift from the crate version and mislead server-side diagnostics.
+pub const USER_AGENT: &str = concat!("ig-client/", env!("CARGO_PKG_VERSION"));
 /// Conservative per-app trading request budget, in requests per second,
 /// enforced by the rate limiter for order / position mutations
 /// (`positions/otc`, `workingorders/otc`).

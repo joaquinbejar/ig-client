@@ -10,19 +10,17 @@ use ig_client::error::AppError;
 use ig_client::model::http::make_http_request;
 use ig_client::model::retry::RetryConfig;
 use reqwest::{Client, Method, StatusCode};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A permissive rate limiter so pacing never slows the tests. The mock endpoint
 /// path is non-trading, so it is governed by this configured budget.
-fn permissive_rate_limiter() -> Arc<RwLock<RateLimiter>> {
-    Arc::new(RwLock::new(RateLimiter::new(&RateLimiterConfig {
+fn permissive_rate_limiter() -> RateLimiter {
+    RateLimiter::new(&RateLimiterConfig {
         max_requests: 1000,
         period_seconds: 1,
         burst_size: 100,
-    })))
+    })
 }
 
 /// A finite retry config with zero base delay: `max_retries = 2` means up to
@@ -47,7 +45,7 @@ async fn get_test_endpoint(
     let url = format!("{}/test-endpoint", server.uri());
     make_http_request(
         &client,
-        permissive_rate_limiter(),
+        &permissive_rate_limiter(),
         Method::GET,
         &url,
         vec![("X-IG-API-KEY", "FAKE-API-KEY")],

@@ -14,6 +14,7 @@
 
 use crate::application::config::Config;
 use crate::application::rate_limiter::RateLimiter;
+use crate::constants::USER_AGENT;
 use crate::error::AppError;
 pub(crate) use crate::model::auth::{OAuthToken, SecurityHeaders, SessionResponse};
 use crate::model::http::make_http_request;
@@ -25,8 +26,6 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-
-const USER_AGENT: &str = "ig-client/0.6.0";
 
 /// WebSocket connection information for Lightstreamer
 ///
@@ -331,7 +330,10 @@ pub struct Auth {
     config: Arc<Config>,
     client: Client,
     session: Arc<RwLock<Option<Session>>>,
-    rate_limiter: Arc<RwLock<RateLimiter>>,
+    // `RateLimiter` is `Clone` and already wraps each governor bucket in an
+    // `Arc`, so it is shared directly without an outer `RwLock`: the limiter is
+    // configured once at construction and never write-swapped.
+    rate_limiter: RateLimiter,
 }
 
 impl Auth {
@@ -367,7 +369,7 @@ impl Auth {
     pub fn try_new(config: Arc<Config>) -> Result<Self, AppError> {
         let client = Client::builder().user_agent(USER_AGENT).build()?;
 
-        let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(&config.rate_limiter)));
+        let rate_limiter = RateLimiter::new(&config.rate_limiter);
 
         Ok(Self {
             config,
@@ -510,7 +512,7 @@ impl Auth {
 
         let response = make_http_request(
             &self.client,
-            self.rate_limiter.clone(),
+            &self.rate_limiter,
             Method::POST,
             &url,
             headers,
@@ -601,7 +603,7 @@ impl Auth {
 
         let response = make_http_request(
             &self.client,
-            self.rate_limiter.clone(),
+            &self.rate_limiter,
             Method::POST,
             &url,
             headers,
@@ -760,7 +762,7 @@ impl Auth {
 
         let response = make_http_request(
             &self.client,
-            self.rate_limiter.clone(),
+            &self.rate_limiter,
             Method::PUT,
             &url,
             headers,
@@ -904,7 +906,7 @@ impl Auth {
 
         match make_http_request(
             &self.client,
-            self.rate_limiter.clone(),
+            &self.rate_limiter,
             Method::DELETE,
             &url,
             headers,

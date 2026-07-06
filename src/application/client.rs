@@ -54,11 +54,10 @@ use lightstreamer_rs::subscription::{
 };
 use lightstreamer_rs::utils::{LightstreamerError, setup_signal_hook};
 use reqwest::StatusCode;
-use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -259,8 +258,10 @@ impl MarketService for Client {
     async fn get_market_details(&self, epic: &str) -> Result<MarketDetails, AppError> {
         let path = format!("markets/{epic}");
         info!("Getting market details: {}", epic);
-        let market_value: Value = self.http_client.get(&path, Some(3)).await?;
-        let market_details: MarketDetails = serde_json::from_value(market_value)?;
+        // Deserialize straight into the typed DTO: the previous
+        // `serde_json::Value` -> `from_value` hop allocated the whole JSON tree
+        // twice and dropped the epic from any deserialization error.
+        let market_details: MarketDetails = self.http_client.get(&path, Some(3)).await?;
         debug!("Market details obtained for: {}", epic);
         Ok(market_details)
     }
@@ -1277,18 +1278,39 @@ pub struct StreamerClient {
 }
 
 impl StreamerClient {
-    /// Creates a new streaming client instance.
+    /// Creates a new streaming client instance with its own REST session.
     ///
-    /// This initializes both streaming clients (market and price) but does not
-    /// establish connections yet. Connections are established when `connect()` is called.
+    /// This builds a fresh [`Client`], logs in to obtain the Lightstreamer
+    /// connection details, and initializes both streaming clients (market and
+    /// price). No connection is established yet — that happens on `connect()`.
     ///
-    /// # Returns
+    /// When the caller already holds a [`Client`] with an active REST session,
+    /// prefer [`with_client`](Self::with_client) to reuse that session instead
+    /// of performing a second login.
     ///
-    /// Returns a new `StreamerClient` instance or an error if initialization fails.
+    /// # Errors
+    ///
+    /// Returns [`AppError`] if the login / session lookup or Lightstreamer
+    /// client initialization fails.
     pub async fn new() -> Result<Self, AppError> {
-        let http_client_raw = Arc::new(RwLock::new(Client::new()));
-        let http_client = http_client_raw.read().await;
-        let ws_info = http_client.ws_info().await?;
+        Self::with_client(&Client::new()).await
+    }
+
+    /// Creates a new streaming client that reuses the caller's existing REST
+    /// session.
+    ///
+    /// Unlike [`new`](Self::new), this does not build a second HTTP client or
+    /// perform a second login: it reuses `client`'s cached session (via
+    /// [`Client::ws_info`]) to obtain the Lightstreamer endpoint and
+    /// credentials. Both streaming clients (market and price) are initialized
+    /// but no connection is established until `connect()` is called.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError`] if the session lookup or Lightstreamer client
+    /// initialization fails.
+    pub async fn with_client(client: &Client) -> Result<Self, AppError> {
+        let ws_info = client.ws_info().await?;
         let password = ws_info.get_ws_password();
 
         // Market data client (no adapter specified - uses default)
@@ -1309,18 +1331,18 @@ impl StreamerClient {
         // Force WebSocket streaming transport on both clients to satisfy IG requirements
         // and configure logging to use tracing levels for proper log propagation
         {
-            let mut client = market_streamer_client.lock().await;
-            client
+            let mut streamer = market_streamer_client.lock().await;
+            streamer
                 .connection_options
                 .set_forced_transport(Some(Transport::WsStreaming));
-            client.set_logging_type(LogType::TracingLogs);
+            streamer.set_logging_type(LogType::TracingLogs);
         }
         {
-            let mut client = price_streamer_client.lock().await;
-            client
+            let mut streamer = price_streamer_client.lock().await;
+            streamer
                 .connection_options
                 .set_forced_transport(Some(Transport::WsStreaming));
-            client.set_logging_type(LogType::TracingLogs);
+            streamer.set_logging_type(LogType::TracingLogs);
         }
 
         Ok(Self {
@@ -1331,11 +1353,6 @@ impl StreamerClient {
             has_price_stream_subs: false,
             converter_tasks: Vec::new(),
         })
-    }
-
-    /// Creates a default streaming client instance.
-    pub async fn default() -> Result<Self, AppError> {
-        Self::new().await
     }
 
     /// Subscribes to market data updates for the specified instruments.

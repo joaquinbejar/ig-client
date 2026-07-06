@@ -7,6 +7,7 @@
 use crate::application::auth::{Auth, Session, WebsocketInfo};
 use crate::application::config::Config;
 use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
+use crate::constants::USER_AGENT;
 use crate::error::AppError;
 use crate::model::retry::RetryConfig;
 use reqwest::Client as HttpInternalClient;
@@ -14,10 +15,7 @@ use reqwest::{Client, Method, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
-
-const USER_AGENT: &str = "ig-client/0.6.0";
 
 /// Simplified client for IG Markets API with automatic authentication
 ///
@@ -31,7 +29,11 @@ pub struct HttpClient {
     auth: Arc<Auth>,
     http_client: HttpInternalClient,
     config: Arc<Config>,
-    rate_limiter: Arc<RwLock<RateLimiter>>,
+    // `RateLimiter` is `Clone` and already wraps each governor bucket in an
+    // `Arc`, so it is stored directly: the limiter is configured once and never
+    // write-swapped, so an outer `RwLock` would only add an allocation and an
+    // await point (a read guard held across the pacing sleep) for no benefit.
+    rate_limiter: RateLimiter,
 }
 
 impl HttpClient {
@@ -50,7 +52,7 @@ impl HttpClient {
         let http_client = HttpInternalClient::builder()
             .user_agent(USER_AGENT)
             .build()?;
-        let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(&config.rate_limiter)));
+        let rate_limiter = RateLimiter::new(&config.rate_limiter);
 
         // Create Auth instance
         let auth = Arc::new(Auth::new(config.clone()));
@@ -77,7 +79,7 @@ impl HttpClient {
         let http_client = HttpInternalClient::builder()
             .user_agent(USER_AGENT)
             .build()?;
-        let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(&config.rate_limiter)));
+        let rate_limiter = RateLimiter::new(&config.rate_limiter);
 
         // Create Auth instance via the fallible constructor so the whole
         // `new_lazy` path (and `Client::try_new` built on it) never panics.
@@ -176,24 +178,18 @@ impl HttpClient {
         body: B,
         version: Option<u8>,
     ) -> Result<T, AppError> {
-        match self
-            .request_internal_with_delete_method(path, &body, version)
-            .await
-        {
-            Ok(response) => self.parse_response(response).await,
-            Err(AppError::OAuthTokenExpired) => {
-                warn!("OAuth token expired, forcing refresh and retrying once");
-                // Force a fresh login: the server has invalidated the token even
-                // though the local clock may still consider it valid, so a
-                // proactive refresh could resend the same stale token.
-                self.auth.force_refresh().await?;
-                let response = self
-                    .request_internal_with_delete_method(path, &body, version)
-                    .await?;
-                self.parse_response(response).await
-            }
-            Err(e) => Err(e),
-        }
+        // IG requires POST + `_method: DELETE` for position closes; it rejects a
+        // DELETE with a body. Everything else — URL construction, auth headers,
+        // and the 401 refresh-and-replay contract — is identical to a normal
+        // request, so it routes through the same wrapper with one extra header.
+        self.request_with_refresh(
+            Method::POST,
+            path,
+            Some(body),
+            version,
+            &[("_method", "DELETE")],
+        )
+        .await
     }
 
     /// Makes a request with custom API version
@@ -204,8 +200,29 @@ impl HttpClient {
         body: Option<B>,
         version: Option<u8>,
     ) -> Result<T, AppError> {
+        self.request_with_refresh(method, path, body, version, &[])
+            .await
+    }
+
+    /// Sends a request through the shared builder and applies the token
+    /// refresh-and-replay contract exactly once.
+    ///
+    /// This is the single place the 401 / OAuth-token-expiry handling lives:
+    /// both [`request`](Self::request) and
+    /// [`post_with_delete_method`](Self::post_with_delete_method) route through
+    /// here. On [`AppError::OAuthTokenExpired`] it forces a fresh login and
+    /// replays the request one time. The match arm is not a loop: the replay
+    /// happens exactly once, after which any further failure is returned.
+    async fn request_with_refresh<B: Serialize, T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<B>,
+        version: Option<u8>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<T, AppError> {
         match self
-            .request_internal(method.clone(), path, &body, version)
+            .request_internal(method.clone(), path, &body, version, extra_headers)
             .await
         {
             Ok(response) => self.parse_response(response).await,
@@ -215,20 +232,31 @@ impl HttpClient {
                 // the same server-invalidated token. This match arm is not a
                 // loop: the replay happens exactly once.
                 self.auth.force_refresh().await?;
-                let response = self.request_internal(method, path, &body, version).await?;
+                let response = self
+                    .request_internal(method, path, &body, version, extra_headers)
+                    .await?;
                 self.parse_response(response).await
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Internal method to make HTTP requests
+    /// Builds and sends a single HTTP request against the IG API.
+    ///
+    /// Constructs the URL, assembles the common headers (API key, content type,
+    /// version) plus the session auth headers (OAuth `Bearer` or v2
+    /// `CST` / `X-SECURITY-TOKEN`), appends any `extra_headers` (e.g. IG's
+    /// `_method: DELETE` for position closes), and dispatches through
+    /// [`make_http_request`] with the finite default retry policy. It performs
+    /// no token refresh — that is the caller's job via
+    /// [`request_with_refresh`](Self::request_with_refresh).
     async fn request_internal<B: Serialize>(
         &self,
         method: Method,
         path: &str,
         body: &Option<B>,
         version: Option<u8>,
+        extra_headers: &[(&str, &str)],
     ) -> Result<Response, AppError> {
         let session = self.auth.get_session().await?;
 
@@ -239,96 +267,36 @@ impl HttpClient {
             format!("{}/{}", self.config.rest_api.base_url, path)
         };
 
-        let api_key = self.config.credentials.api_key.clone();
         let version_owned = version.unwrap_or(1).to_string();
         let auth_header_value;
-        let account_id;
-        let cst;
-        let x_security_token;
 
+        // Borrow directly from `self.config` and the owned `session`, both of
+        // which outlive this function, so no api_key / cst / token clone is
+        // needed to build the header tuples.
         let mut headers = vec![
-            ("X-IG-API-KEY", api_key.as_str()),
+            ("X-IG-API-KEY", self.config.credentials.api_key.as_str()),
             ("Content-Type", "application/json; charset=UTF-8"),
             ("Accept", "application/json; charset=UTF-8"),
             ("Version", version_owned.as_str()),
         ];
+        headers.extend_from_slice(extra_headers);
 
         if let Some(oauth) = &session.oauth_token {
             auth_header_value = format!("Bearer {}", oauth.access_token);
-            account_id = session.account_id.clone();
             headers.push(("Authorization", auth_header_value.as_str()));
-            headers.push(("IG-ACCOUNT-ID", account_id.as_str()));
+            headers.push(("IG-ACCOUNT-ID", session.account_id.as_str()));
         } else if let (Some(cst_val), Some(token_val)) = (&session.cst, &session.x_security_token) {
-            cst = cst_val.clone();
-            x_security_token = token_val.clone();
-            headers.push(("CST", cst.as_str()));
-            headers.push(("X-SECURITY-TOKEN", x_security_token.as_str()));
+            headers.push(("CST", cst_val.as_str()));
+            headers.push(("X-SECURITY-TOKEN", token_val.as_str()));
         }
 
         make_http_request(
             &self.http_client,
-            self.rate_limiter.clone(),
+            &self.rate_limiter,
             method,
             &url,
             headers,
             body,
-            RetryConfig::default(),
-        )
-        .await
-    }
-
-    /// Internal method to make POST requests with _method: DELETE header
-    ///
-    /// This is required by IG API for closing positions
-    async fn request_internal_with_delete_method<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-        version: Option<u8>,
-    ) -> Result<Response, AppError> {
-        let session = self.auth.get_session().await?;
-
-        let url = if path.starts_with("http") {
-            path.to_string()
-        } else {
-            let path = path.trim_start_matches('/');
-            format!("{}/{}", self.config.rest_api.base_url, path)
-        };
-
-        let api_key = self.config.credentials.api_key.clone();
-        let version_owned = version.unwrap_or(1).to_string();
-        let auth_header_value;
-        let account_id;
-        let cst;
-        let x_security_token;
-
-        let mut headers = vec![
-            ("X-IG-API-KEY", api_key.as_str()),
-            ("Content-Type", "application/json; charset=UTF-8"),
-            ("Accept", "application/json; charset=UTF-8"),
-            ("Version", version_owned.as_str()),
-            ("_method", "DELETE"), // Special header for IG API
-        ];
-
-        if let Some(oauth) = &session.oauth_token {
-            auth_header_value = format!("Bearer {}", oauth.access_token);
-            account_id = session.account_id.clone();
-            headers.push(("Authorization", auth_header_value.as_str()));
-            headers.push(("IG-ACCOUNT-ID", account_id.as_str()));
-        } else if let (Some(cst_val), Some(token_val)) = (&session.cst, &session.x_security_token) {
-            cst = cst_val.clone();
-            x_security_token = token_val.clone();
-            headers.push(("CST", cst.as_str()));
-            headers.push(("X-SECURITY-TOKEN", x_security_token.as_str()));
-        }
-
-        make_http_request(
-            &self.http_client,
-            self.rate_limiter.clone(),
-            Method::POST, // Always POST for this method
-            &url,
-            headers,
-            &Some(body),
             RetryConfig::default(),
         )
         .await
@@ -394,7 +362,7 @@ impl Default for HttpClient {
 /// # Arguments
 ///
 /// * `client` - The HTTP client to use for the request
-/// * `rate_limiter` - Shared rate limiter to control request rate
+/// * `rate_limiter` - Shared rate limiter (borrowed) to pace the request
 /// * `method` - HTTP method (GET, POST, PUT, DELETE, etc.)
 /// * `url` - Full URL to request
 /// * `headers` - Vector of (header_name, header_value) tuples
@@ -417,11 +385,9 @@ impl Default for HttpClient {
 /// use ig_client::model::http::make_http_request;
 /// use ig_client::model::retry::RetryConfig;
 /// use reqwest::{Client, Method};
-/// use std::sync::Arc;
-/// use tokio::sync::RwLock;
 ///
 /// let client = Client::new();
-/// let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(&config)));
+/// let rate_limiter = RateLimiter::new(&config);
 /// let headers = vec![
 ///     ("X-IG-API-KEY", "your-api-key"),
 ///     ("Content-Type", "application/json"),
@@ -430,7 +396,7 @@ impl Default for HttpClient {
 /// // Finite defaults (DEFAULT_MAX_RETRIES retries, exponential backoff)
 /// let response = make_http_request(
 ///     &client,
-///     rate_limiter.clone(),
+///     &rate_limiter,
 ///     Method::GET,
 ///     "https://demo-api.ig.com/gateway/deal/markets/EPIC",
 ///     headers.clone(),
@@ -441,7 +407,7 @@ impl Default for HttpClient {
 /// // Maximum 3 retries with a 5 second base delay
 /// let response = make_http_request(
 ///     &client,
-///     rate_limiter,
+///     &rate_limiter,
 ///     Method::GET,
 ///     "https://demo-api.ig.com/gateway/deal/markets/EPIC",
 ///     headers,
@@ -451,7 +417,7 @@ impl Default for HttpClient {
 /// ```
 pub async fn make_http_request<B: Serialize>(
     client: &Client,
-    rate_limiter: Arc<RwLock<RateLimiter>>,
+    rate_limiter: &RateLimiter,
     method: Method,
     url: &str,
     headers: Vec<(&str, &str)>,
@@ -468,12 +434,11 @@ pub async fn make_http_request<B: Serialize>(
     // Bounded loop: `attempt` ranges over [0, max_retries]. Attempt 0 is the
     // first try; each further attempt is a retry. This can never loop forever.
     for attempt in 0..=max_retries {
-        // Wait for rate limiter before making request. Clone the limiter (cheap
-        // `Arc` copy) out of the read guard and drop the guard before awaiting,
-        // so a pending config swap on the write side is never blocked behind an
-        // in-flight rate-limit wait.
-        let limiter = rate_limiter.read().await.clone();
-        limiter.wait_for(class).await;
+        // Pace this request against its class bucket before sending. The limiter
+        // is shared by reference; each governor bucket is internally `Arc`-backed
+        // and parks the future until a slot is free, so there is no lock guard
+        // held across this await.
+        rate_limiter.wait_for(class).await;
 
         debug!(%method, %url, class = ?class, "http request");
 
