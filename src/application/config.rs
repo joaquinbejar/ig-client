@@ -231,10 +231,16 @@ impl Config {
         if api_key == "default_api_key" {
             error!("IG_API_KEY not found in environment variables or .env file");
         }
-        if database_url == crate::constants::DEFAULT_DATABASE_URL {
-            // Credential-less placeholder: persistence will not connect until
-            // DATABASE_URL is set. We never fall back to a credentialed default.
-            error!("DATABASE_URL not found in environment variables or .env file");
+        // Check the variable directly rather than comparing the resolved value
+        // to the placeholder: a user may intentionally set a credential-less URL
+        // equal to the placeholder, which is not the "unset" case we warn about.
+        if env::var("DATABASE_URL").is_err() {
+            // Falls back to the credential-less placeholder; persistence will not
+            // connect until DATABASE_URL is set. We never use a credentialed default.
+            error!(
+                "DATABASE_URL not found in environment variables or .env file; \
+                 using a credential-less placeholder and persistence will not connect"
+            );
         }
 
         Config {
