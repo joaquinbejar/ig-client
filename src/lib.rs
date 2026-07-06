@@ -45,11 +45,13 @@
 //! [dependencies]
 //! ig-client = "0.12.0"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
-//! dotenv = "0.15"                                  # Optional: load a local .env
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
 //! sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "postgres"] }
 //! ```
+//!
+//! You do not need to add `dotenv` yourself — `Config::new()` loads a local
+//! `.env` file internally.
 //!
 //! ### Requirements
 //!
