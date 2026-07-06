@@ -16,6 +16,7 @@
 //! on failure, preserving the previous streaming behaviour) are provided per
 //! type.
 
+use crate::error::AppError;
 use crate::presentation::account::AccountData;
 use crate::presentation::chart::ChartData;
 use crate::presentation::market::{MarketFields, PresentationMarketData};
@@ -38,10 +39,11 @@ fn changed_fields_as_options(changed: &HashMap<String, String>) -> HashMap<Strin
 /// Converts a Lightstreamer `ItemUpdate` into a [`PriceData`].
 ///
 /// # Errors
-/// Returns an error string when a field fails to parse (e.g. a non-numeric
-/// price or an unknown dealing flag).
+/// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. a
+/// non-numeric price or an unknown dealing flag). The message names the
+/// offending field and value.
 #[must_use = "the parse result must be handled"]
-pub fn price_data_from_item_update(item_update: &ItemUpdate) -> Result<PriceData, String> {
+pub fn price_data_from_item_update(item_update: &ItemUpdate) -> Result<PriceData, AppError> {
     let changed_fields = changed_fields_as_options(&item_update.changed_fields);
     PriceData::from_fields(
         item_update.item_name.as_deref(),
@@ -50,6 +52,7 @@ pub fn price_data_from_item_update(item_update: &ItemUpdate) -> Result<PriceData
         &item_update.fields,
         &changed_fields,
     )
+    .map_err(AppError::Deserialization)
 }
 
 impl From<&ItemUpdate> for PriceData {
@@ -64,12 +67,12 @@ impl From<&ItemUpdate> for PriceData {
 /// Converts a Lightstreamer `ItemUpdate` into a [`PresentationMarketData`].
 ///
 /// # Errors
-/// Returns an error string when a field fails to parse (e.g. an unknown market
-/// state or an invalid `MARKET_DELAY` value).
+/// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. an
+/// unknown market state or an invalid `MARKET_DELAY` value).
 #[must_use = "the parse result must be handled"]
 pub fn market_data_from_item_update(
     item_update: &ItemUpdate,
-) -> Result<PresentationMarketData, String> {
+) -> Result<PresentationMarketData, AppError> {
     let changed_fields = changed_fields_as_options(&item_update.changed_fields);
     PresentationMarketData::from_fields(
         item_update.item_name.as_deref(),
@@ -78,6 +81,7 @@ pub fn market_data_from_item_update(
         &item_update.fields,
         &changed_fields,
     )
+    .map_err(AppError::Deserialization)
 }
 
 impl From<&ItemUpdate> for PresentationMarketData {
@@ -95,10 +99,10 @@ impl From<&ItemUpdate> for PresentationMarketData {
 /// Converts a Lightstreamer `ItemUpdate` into a [`ChartData`].
 ///
 /// # Errors
-/// Returns an error string when a field fails to parse (e.g. a non-numeric
-/// candle value).
+/// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. a
+/// non-numeric candle value).
 #[must_use = "the parse result must be handled"]
-pub fn chart_data_from_item_update(item_update: &ItemUpdate) -> Result<ChartData, String> {
+pub fn chart_data_from_item_update(item_update: &ItemUpdate) -> Result<ChartData, AppError> {
     let changed_fields = changed_fields_as_options(&item_update.changed_fields);
     ChartData::from_fields(
         item_update.item_name.as_deref(),
@@ -107,6 +111,7 @@ pub fn chart_data_from_item_update(item_update: &ItemUpdate) -> Result<ChartData
         &item_update.fields,
         &changed_fields,
     )
+    .map_err(AppError::Deserialization)
 }
 
 impl From<&ItemUpdate> for ChartData {
@@ -118,10 +123,10 @@ impl From<&ItemUpdate> for ChartData {
 /// Converts a Lightstreamer `ItemUpdate` into a [`TradeData`].
 ///
 /// # Errors
-/// Returns an error string when the embedded OPU / WOU JSON payload fails to
-/// parse.
+/// Returns [`AppError::Deserialization`] when the embedded OPU / WOU JSON
+/// payload fails to parse.
 #[must_use = "the parse result must be handled"]
-pub fn trade_data_from_item_update(item_update: &ItemUpdate) -> Result<TradeData, String> {
+pub fn trade_data_from_item_update(item_update: &ItemUpdate) -> Result<TradeData, AppError> {
     let changed_fields = changed_fields_as_options(&item_update.changed_fields);
     TradeData::from_fields(
         item_update.item_name.as_deref(),
@@ -130,6 +135,7 @@ pub fn trade_data_from_item_update(item_update: &ItemUpdate) -> Result<TradeData
         &item_update.fields,
         &changed_fields,
     )
+    .map_err(AppError::Deserialization)
 }
 
 impl From<&ItemUpdate> for TradeData {
@@ -141,10 +147,10 @@ impl From<&ItemUpdate> for TradeData {
 /// Converts a Lightstreamer `ItemUpdate` into an [`AccountData`].
 ///
 /// # Errors
-/// Returns an error string when a field fails to parse (e.g. a non-numeric P&L
-/// or margin value).
+/// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. a
+/// non-numeric P&L or margin value).
 #[must_use = "the parse result must be handled"]
-pub fn account_data_from_item_update(item_update: &ItemUpdate) -> Result<AccountData, String> {
+pub fn account_data_from_item_update(item_update: &ItemUpdate) -> Result<AccountData, AppError> {
     let changed_fields = changed_fields_as_options(&item_update.changed_fields);
     AccountData::from_fields(
         item_update.item_name.as_deref(),
@@ -153,6 +159,7 @@ pub fn account_data_from_item_update(item_update: &ItemUpdate) -> Result<Account
         &item_update.fields,
         &changed_fields,
     )
+    .map_err(AppError::Deserialization)
 }
 
 impl From<&ItemUpdate> for AccountData {

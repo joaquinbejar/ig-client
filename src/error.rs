@@ -6,7 +6,18 @@
 use reqwest::StatusCode;
 use std::io;
 
-/// Error type for fetch operations
+/// Error type for fetch operations.
+///
+/// # Deprecated
+/// This enum is dead: no library code constructs or returns it. Every fetch,
+/// network, database, and parse failure surfaces through [`AppError`] instead
+/// ([`AppError::Network`], [`AppError::Db`], [`AppError::Deserialization`]).
+/// It is kept only for backward compatibility and will be removed in a future
+/// release — migrate to [`AppError`].
+#[deprecated(
+    since = "0.12.0",
+    note = "unused dead enum; use AppError (Network / Db / Deserialization) instead"
+)]
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     /// Network error from reqwest
@@ -44,6 +55,14 @@ pub enum AuthError {
     /// Rate limit exceeded error
     #[error("rate limit exceeded")]
     RateLimitExceeded,
+    /// A login / account-switch response was accepted by IG but omitted a
+    /// required session-token header (CST or X-SECURITY-TOKEN), so no usable
+    /// session could be derived. The payload holds the lowercase header name.
+    ///
+    /// This is a rejected / malformed authentication *response*, not bad caller
+    /// input — it must not be reported as [`AppError::InvalidInput`].
+    #[error("missing {0} header in login response")]
+    MissingSessionToken(String),
 }
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for AuthError {
@@ -86,6 +105,8 @@ impl From<AppError> for AuthError {
             AppError::Io(e) => AuthError::Io(e),
             AppError::Json(e) => AuthError::Json(e),
             AppError::Unexpected(s) => AuthError::Unexpected(s),
+            // Unwrap an already-typed auth error rather than re-stringifying it.
+            AppError::Auth(a) => a,
             _ => AuthError::Other(e.to_string()),
         }
     }
@@ -142,23 +163,17 @@ pub enum AppError {
     /// Invalid input error with a description of the constraint violated
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Authentication failure carrying a typed [`AuthError`].
+    ///
+    /// Login / refresh / account-switch paths surface their typed
+    /// [`AuthError`] through this variant (e.g. a login response missing a
+    /// required session-token header). Wrapping — rather than flattening —
+    /// preserves both the specific auth variant and its contextual message.
+    #[error("auth error: {0}")]
+    Auth(#[from] AuthError),
     /// Generic error for cases that don't fit other categories
     #[error("generic error: {0}")]
     Generic(String),
-}
-
-impl From<AuthError> for AppError {
-    #[cold]
-    fn from(e: AuthError) -> Self {
-        match e {
-            AuthError::Network(e) => AppError::Network(e),
-            AuthError::Io(e) => AppError::Io(e),
-            AuthError::Json(e) => AppError::Json(e),
-            AuthError::BadCredentials => AppError::Unauthorized,
-            AuthError::Unexpected(s) => AppError::Unexpected(s),
-            _ => AppError::Unexpected(StatusCode::INTERNAL_SERVER_ERROR),
-        }
-    }
 }
 
 impl From<Box<dyn std::error::Error>> for AppError {
@@ -170,7 +185,9 @@ impl From<Box<dyn std::error::Error>> for AppError {
                 Ok(js) => AppError::Json(*js),
                 Err(e) => match e.downcast::<std::io::Error>() {
                     Ok(ioe) => AppError::Io(*ioe),
-                    Err(_) => AppError::Unexpected(StatusCode::INTERNAL_SERVER_ERROR),
+                    // Preserve the original error text instead of fabricating a
+                    // fake "unexpected http status: 500" for arbitrary errors.
+                    Err(other) => AppError::Generic(other.to_string()),
                 },
             },
         }

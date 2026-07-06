@@ -150,10 +150,13 @@ fn test_price_data_from_item_update_invalid_float() {
 
     let result = price_data_from_item_update(&item_update);
     // An unparseable float in a numeric field is a hard error: `parse_float`
-    // fails and the error propagates out of `from_item_update`. The message
-    // names the offending field and value.
+    // fails and the error propagates out of `from_item_update` as a typed
+    // `AppError::Deserialization`. The message names the offending field and
+    // value.
     assert!(result.is_err());
-    let err = result.expect_err("invalid float must yield an error");
+    let err = result
+        .expect_err("invalid float must yield an error")
+        .to_string();
     assert!(
         err.contains("BID"),
         "error should name the offending field, got: {err}"
