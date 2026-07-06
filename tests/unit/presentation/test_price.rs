@@ -335,6 +335,101 @@ fn test_price_data_from_trait_does_not_panic_on_error() {
 }
 
 #[test]
+fn test_price_fields_round_trip_with_none_fields() {
+    // Regression guard for the skip-without-default asymmetry: `PriceFields`
+    // omits `None` fields on serialize (`skip_serializing_if`), so without a
+    // matching `#[serde(default)]` it could not deserialize its own output.
+    // Build a realistic, sparse update (only a few populated fields) and prove
+    // it round-trips.
+    let fields = PriceFields {
+        bid: Some(18000.5),
+        offer: Some(18001.5),
+        market_delay: Some(false),
+        market_state: Some("TRADEABLE".to_string()),
+        update_time: Some("12:34:56".to_string()),
+        timestamp: Some(1_700_000_000_000),
+        ..Default::default()
+    };
+
+    let json = serde_json::to_string(&fields).expect("serialize should succeed");
+    // The absent fields must not appear in the serialized output.
+    assert!(!json.contains("MID_OPEN"), "None fields must be skipped");
+
+    let restored: PriceFields =
+        serde_json::from_str(&json).expect("PriceFields must deserialize its own output");
+    assert_eq!(restored.bid, Some(18000.5));
+    assert_eq!(restored.offer, Some(18001.5));
+    assert_eq!(restored.market_delay, Some(false));
+    assert_eq!(restored.market_state.as_deref(), Some("TRADEABLE"));
+    assert_eq!(restored.update_time.as_deref(), Some("12:34:56"));
+    assert_eq!(restored.timestamp, Some(1_700_000_000_000));
+    // Absent fields round-trip back to None.
+    assert!(restored.mid_open.is_none());
+    assert!(restored.high.is_none());
+}
+
+#[test]
+fn test_price_data_from_item_update_market_delay_flag() {
+    // MARKET_DELAY is a 0/1 delayed-data flag, parsed as a bool (not seconds).
+    let mut fields = HashMap::new();
+    fields.insert("MARKET_DELAY".to_string(), Some("1".to_string()));
+
+    let item_update = ItemUpdate {
+        item_name: Some("MARKET:TEST".to_string()),
+        item_pos: 1,
+        is_snapshot: true,
+        fields,
+        changed_fields: HashMap::new(),
+    };
+
+    let result = price_data_from_item_update(&item_update);
+    assert!(result.is_ok());
+    let price_data = result.expect("market delay flag should parse");
+    assert_eq!(price_data.fields.market_delay, Some(true));
+}
+
+#[test]
+fn test_price_data_from_item_update_market_delay_invalid_is_error() {
+    let mut fields = HashMap::new();
+    fields.insert("MARKET_DELAY".to_string(), Some("7".to_string()));
+
+    let item_update = ItemUpdate {
+        item_name: Some("MARKET:TEST".to_string()),
+        item_pos: 1,
+        is_snapshot: true,
+        fields,
+        changed_fields: HashMap::new(),
+    };
+
+    let result = price_data_from_item_update(&item_update);
+    assert!(
+        result.is_err(),
+        "a non-0/1 MARKET_DELAY value must surface an error"
+    );
+}
+
+#[test]
+fn test_price_data_from_item_update_timestamp_is_epoch_millis_i64() {
+    // TIMESTAMP is epoch milliseconds (UTC), parsed as i64 to avoid float
+    // rounding on large integer values.
+    let mut fields = HashMap::new();
+    fields.insert("TIMESTAMP".to_string(), Some("1700000000123".to_string()));
+
+    let item_update = ItemUpdate {
+        item_name: Some("MARKET:TEST".to_string()),
+        item_pos: 1,
+        is_snapshot: true,
+        fields,
+        changed_fields: HashMap::new(),
+    };
+
+    let result = price_data_from_item_update(&item_update);
+    assert!(result.is_ok());
+    let price_data = result.expect("timestamp should parse");
+    assert_eq!(price_data.fields.timestamp, Some(1_700_000_000_123));
+}
+
+#[test]
 fn test_price_data_from_item_update_dlg_flag_with_trailing_spaces() {
     let mut fields = HashMap::new();
     // Server sends DLG_FLAG with trailing whitespace padding

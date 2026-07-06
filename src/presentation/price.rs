@@ -1,4 +1,6 @@
-use crate::presentation::serialization::string_as_float_opt;
+use crate::presentation::serialization::{
+    string_as_bool_opt, string_as_float_opt, string_as_int_opt,
+};
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -46,7 +48,14 @@ pub struct PriceData {
 }
 
 /// Price field data containing bid, offer, and market status information
+///
+/// Every field carries `skip_serializing_if = "Option::is_none"`, so absent
+/// values are omitted from the serialized output. The struct-level
+/// `#[serde(default)]` makes the reverse direction symmetric: a missing field
+/// deserializes back to `None` instead of failing, so the DTO round-trips its
+/// own output.
 #[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct PriceFields {
     /// The opening price at the middle of the bid-ask spread
     #[serde(rename = "MID_OPEN")]
@@ -90,11 +99,15 @@ pub struct PriceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_pct: Option<f64>,
 
-    /// Market data delay in seconds
+    /// Delayed-data flag (1 = delayed).
+    ///
+    /// This is IG's `MARKET_DELAY` wire field: a 0/1 flag, not a duration.
+    /// Kept in sync with [`crate::presentation::market::MarketFields::market_delay`],
+    /// which parses the same field the same way.
     #[serde(rename = "MARKET_DELAY")]
-    #[serde(with = "string_as_float_opt")]
+    #[serde(with = "string_as_bool_opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub market_delay: Option<f64>,
+    pub market_delay: Option<bool>,
 
     /// Current market state (e.g., "OPEN", "CLOSED", "SUSPENDED")
     #[serde(rename = "MARKET_STATE")]
@@ -571,11 +584,14 @@ pub struct PriceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub c5_ask_size_5: Option<f64>,
 
-    /// The timestamp of the price update in UTC milliseconds since epoch
+    /// The timestamp of the price update, in epoch milliseconds (UTC).
+    ///
+    /// Typed as `i64` to preserve integer epoch-millis exactly (float parsing
+    /// would risk silent rounding on large values).
     #[serde(rename = "TIMESTAMP")]
-    #[serde(with = "string_as_float_opt")]
+    #[serde(with = "string_as_int_opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<f64>,
+    pub timestamp: Option<i64>,
 
     /// Dealing status flag indicating trading availability/state of the market
     #[serde(rename = "DLG_FLAG")]
@@ -655,6 +671,26 @@ impl PriceData {
             }
         };
 
+        // Helper function to parse integer values (e.g. epoch-millis timestamps).
+        let parse_int = |key: &str| -> Result<Option<i64>, String> {
+            match get_field(key) {
+                Some(val) if !val.is_empty() => val
+                    .parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| format!("Failed to parse {key} as integer: {val}")),
+                _ => Ok(None),
+            }
+        };
+
+        // Parse the MARKET_DELAY flag: IG sends "0" / "1" (delayed-data flag),
+        // not a duration. An empty string is treated as None.
+        let market_delay = match get_field("MARKET_DELAY").as_deref() {
+            Some("0") => Some(false),
+            Some("1") => Some(true),
+            Some("") | None => None,
+            Some(val) => return Err(format!("Invalid MARKET_DELAY value: {val}")),
+        };
+
         // Parse dealing flag (case-insensitive to handle potential lowercase conversion).
         // An empty string (produced when the server sends '#' for null) is treated as None.
         let dealing_flag = match get_field("DLG_FLAG")
@@ -685,7 +721,7 @@ impl PriceData {
             offer: parse_float("OFFER")?,
             change: parse_float("CHANGE")?,
             change_pct: parse_float("CHANGE_PCT")?,
-            market_delay: parse_float("MARKET_DELAY")?,
+            market_delay,
             market_state: get_field("MARKET_STATE"),
             update_time: get_field("UPDATE_TIME"),
 
@@ -790,7 +826,7 @@ impl PriceData {
             c5_ask_size_4: parse_float("C5ASKSIZE4")?,
             c5_ask_size_5: parse_float("C5ASKSIZE5")?,
 
-            timestamp: parse_float("TIMESTAMP")?,
+            timestamp: parse_int("TIMESTAMP")?,
             dealing_flag,
             net_chg: parse_float("NET_CHG")?,
             net_chg_pct: parse_float("NET_CHG_PCT")?,

@@ -1,4 +1,6 @@
-use crate::presentation::serialization::string_as_float_opt;
+use crate::presentation::serialization::{
+    string_as_bool_opt, string_as_float_opt, string_as_int_opt,
+};
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt};
@@ -81,10 +83,13 @@ pub struct ChartFields {
     pub incremental_trading_volume: Option<f64>,
 
     #[serde(rename = "UTM")]
-    #[serde(with = "string_as_float_opt")]
+    #[serde(with = "string_as_int_opt")]
     #[serde(default)]
-    /// Update time timestamp for the data point
-    pub update_time: Option<f64>,
+    /// Update time for the data point, in epoch milliseconds (UTC).
+    ///
+    /// Typed as `i64` to preserve integer epoch-millis exactly (float parsing
+    /// would risk silent rounding on large values).
+    pub update_time: Option<i64>,
 
     #[serde(rename = "DAY_OPEN_MID")]
     #[serde(with = "string_as_float_opt")]
@@ -209,10 +214,12 @@ pub struct ChartFields {
     pub ltp_close: Option<f64>,
 
     #[serde(rename = "CONS_END")]
-    #[serde(with = "string_as_float_opt")]
+    #[serde(with = "string_as_bool_opt")]
     #[serde(default)]
-    /// Candle end timestamp
-    pub candle_end: Option<f64>,
+    /// Candle-completed flag: 1 when the candle has ended, 0 while it is still
+    /// forming. This is IG's `CONS_END` wire field, a 0/1 boolean rather than a
+    /// timestamp.
+    pub candle_end: Option<bool>,
 
     #[serde(rename = "CONS_TICK_COUNT")]
     #[serde(with = "string_as_float_opt")]
@@ -302,11 +309,32 @@ impl ChartData {
             }
         };
 
+        // Helper function to parse integer values (e.g. epoch-millis timestamps).
+        let parse_int = |key: &str| -> Result<Option<i64>, String> {
+            match get_field(key) {
+                Some(val) if !val.is_empty() => val
+                    .parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| format!("Failed to parse {key} as integer: {val}")),
+                _ => Ok(None),
+            }
+        };
+
+        // Parse the CONS_END candle-completed flag: IG sends "0" / "1"
+        // (1 = candle ended, 0 = still forming). An empty string is treated as
+        // None.
+        let candle_end = match get_field("CONS_END").as_deref() {
+            Some("0") => Some(false),
+            Some("1") => Some(true),
+            Some("") | None => None,
+            Some(val) => return Err(format!("Invalid CONS_END value: {val}")),
+        };
+
         Ok(ChartFields {
             // Common fields
             last_traded_volume: parse_float("LTV")?,
             incremental_trading_volume: parse_float("TTV")?,
-            update_time: parse_float("UTM")?,
+            update_time: parse_int("UTM")?,
             day_open_mid: parse_float("DAY_OPEN_MID")?,
             day_net_change_mid: parse_float("DAY_NET_CHG_MID")?,
             day_percentage_change_mid: parse_float("DAY_PERC_CHG_MID")?,
@@ -331,7 +359,7 @@ impl ChartData {
             ltp_high: parse_float("LTP_HIGH")?,
             ltp_low: parse_float("LTP_LOW")?,
             ltp_close: parse_float("LTP_CLOSE")?,
-            candle_end: parse_float("CONS_END")?,
+            candle_end,
             candle_tick_count: parse_float("CONS_TICK_COUNT")?,
         })
     }

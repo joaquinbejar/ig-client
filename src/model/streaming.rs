@@ -380,138 +380,13 @@ impl Display for StreamingPriceField {
 ///
 /// # Returns
 ///
-/// A `Vec<String>` where each `String` is a serialized representation of a `StreamingPriceField` from the input set.
-///
-/// # Panics
-///
-/// This function will panic if the serialization of any `StreamingPriceField` fails.
-///
+/// A `Vec<String>` where each `String` is the exact IG Lightstreamer wire name
+/// of a `StreamingPriceField` from the input set.
 pub(crate) fn get_streaming_price_fields(fields: &HashSet<StreamingPriceField>) -> Vec<String> {
-    // Map each enum variant to the exact IG Lightstreamer field identifier.
-    let map_field = |f: &StreamingPriceField| -> &'static str {
-        match f {
-            // Core prices
-            StreamingPriceField::MidOpen => "MID_OPEN",
-            StreamingPriceField::High => "HIGH",
-            StreamingPriceField::Low => "LOW",
-            StreamingPriceField::BidQuoteId => "BIDQUOTEID",
-            StreamingPriceField::AskQuoteId => "ASKQUOTEID",
-
-            // Bid ladder prices
-            StreamingPriceField::BidPrice1 => "BIDPRICE1",
-            StreamingPriceField::BidPrice2 => "BIDPRICE2",
-            StreamingPriceField::BidPrice3 => "BIDPRICE3",
-            StreamingPriceField::BidPrice4 => "BIDPRICE4",
-            StreamingPriceField::BidPrice5 => "BIDPRICE5",
-
-            // Ask ladder prices
-            StreamingPriceField::AskPrice1 => "ASKPRICE1",
-            StreamingPriceField::AskPrice2 => "ASKPRICE2",
-            StreamingPriceField::AskPrice3 => "ASKPRICE3",
-            StreamingPriceField::AskPrice4 => "ASKPRICE4",
-            StreamingPriceField::AskPrice5 => "ASKPRICE5",
-
-            // Bid sizes
-            StreamingPriceField::BidSize1 => "BIDSIZE1",
-            StreamingPriceField::BidSize2 => "BIDSIZE2",
-            StreamingPriceField::BidSize3 => "BIDSIZE3",
-            StreamingPriceField::BidSize4 => "BIDSIZE4",
-            StreamingPriceField::BidSize5 => "BIDSIZE5",
-
-            // Ask sizes
-            StreamingPriceField::AskSize1 => "ASKSIZE1",
-            StreamingPriceField::AskSize2 => "ASKSIZE2",
-            StreamingPriceField::AskSize3 => "ASKSIZE3",
-            StreamingPriceField::AskSize4 => "ASKSIZE4",
-            StreamingPriceField::AskSize5 => "ASKSIZE5",
-
-            // Currencies
-            StreamingPriceField::Currency0 => "CURRENCY0",
-            StreamingPriceField::Currency1 => "CURRENCY1",
-            StreamingPriceField::Currency2 => "CURRENCY2",
-            StreamingPriceField::Currency3 => "CURRENCY3",
-            StreamingPriceField::Currency4 => "CURRENCY4",
-            StreamingPriceField::Currency5 => "CURRENCY5",
-
-            // Currency 1 bid sizes
-            StreamingPriceField::C1BidSize1 => "C1BIDSIZE1",
-            StreamingPriceField::C1BidSize2 => "C1BIDSIZE2",
-            StreamingPriceField::C1BidSize3 => "C1BIDSIZE3",
-            StreamingPriceField::C1BidSize4 => "C1BIDSIZE4",
-            StreamingPriceField::C1BidSize5 => "C1BIDSIZE5",
-            // Currency 1 ask sizes
-            StreamingPriceField::C1AskSize1 => "C1ASKSIZE1",
-            StreamingPriceField::C1AskSize2 => "C1ASKSIZE2",
-            StreamingPriceField::C1AskSize3 => "C1ASKSIZE3",
-            StreamingPriceField::C1AskSize4 => "C1ASKSIZE4",
-            StreamingPriceField::C1AskSize5 => "C1ASKSIZE5",
-
-            // Currency 2 bid sizes
-            StreamingPriceField::C2BidSize1 => "C2BIDSIZE1",
-            StreamingPriceField::C2BidSize2 => "C2BIDSIZE2",
-            StreamingPriceField::C2BidSize3 => "C2BIDSIZE3",
-            StreamingPriceField::C2BidSize4 => "C2BIDSIZE4",
-            StreamingPriceField::C2BidSize5 => "C2BIDSIZE5",
-            // Currency 2 ask sizes
-            StreamingPriceField::C2AskSize1 => "C2ASKSIZE1",
-            StreamingPriceField::C2AskSize2 => "C2ASKSIZE2",
-            StreamingPriceField::C2AskSize3 => "C2ASKSIZE3",
-            StreamingPriceField::C2AskSize4 => "C2ASKSIZE4",
-            StreamingPriceField::C2AskSize5 => "C2ASKSIZE5",
-
-            // Currency 3 bid sizes
-            StreamingPriceField::C3BidSize1 => "C3BIDSIZE1",
-            StreamingPriceField::C3BidSize2 => "C3BIDSIZE2",
-            StreamingPriceField::C3BidSize3 => "C3BIDSIZE3",
-            StreamingPriceField::C3BidSize4 => "C3BIDSIZE4",
-            StreamingPriceField::C3BidSize5 => "C3BIDSIZE5",
-            // Currency 3 ask sizes
-            StreamingPriceField::C3AskSize1 => "C3ASKSIZE1",
-            StreamingPriceField::C3AskSize2 => "C3ASKSIZE2",
-            StreamingPriceField::C3AskSize3 => "C3ASKSIZE3",
-            StreamingPriceField::C3AskSize4 => "C3ASKSIZE4",
-            StreamingPriceField::C3AskSize5 => "C3ASKSIZE5",
-
-            // Currency 4 bid sizes
-            StreamingPriceField::C4BidSize1 => "C4BIDSIZE1",
-            StreamingPriceField::C4BidSize2 => "C4BIDSIZE2",
-            StreamingPriceField::C4BidSize3 => "C4BIDSIZE3",
-            StreamingPriceField::C4BidSize4 => "C4BIDSIZE4",
-            StreamingPriceField::C4BidSize5 => "C4BIDSIZE5",
-            // Currency 4 ask sizes
-            StreamingPriceField::C4AskSize1 => "C4ASKSIZE1",
-            StreamingPriceField::C4AskSize2 => "C4ASKSIZE2",
-            StreamingPriceField::C4AskSize3 => "C4ASKSIZE3",
-            StreamingPriceField::C4AskSize4 => "C4ASKSIZE4",
-            StreamingPriceField::C4AskSize5 => "C4ASKSIZE5",
-
-            // Currency 5 bid sizes
-            StreamingPriceField::C5BidSize1 => "C5BIDSIZE1",
-            StreamingPriceField::C5BidSize2 => "C5BIDSIZE2",
-            StreamingPriceField::C5BidSize3 => "C5BIDSIZE3",
-            StreamingPriceField::C5BidSize4 => "C5BIDSIZE4",
-            StreamingPriceField::C5BidSize5 => "C5BIDSIZE5",
-            // Currency 5 ask sizes
-            StreamingPriceField::C5AskSize1 => "C5ASKSIZE1",
-            StreamingPriceField::C5AskSize2 => "C5ASKSIZE2",
-            StreamingPriceField::C5AskSize3 => "C5ASKSIZE3",
-            StreamingPriceField::C5AskSize4 => "C5ASKSIZE4",
-            StreamingPriceField::C5AskSize5 => "C5ASKSIZE5",
-
-            // Misc
-            StreamingPriceField::Timestamp => "TIMESTAMP",
-            StreamingPriceField::DlgFlag => "DLG_FLAG",
-            StreamingPriceField::NetChg => "NET_CHG",
-            StreamingPriceField::NetChgPct => "NET_CHG_PCT",
-            StreamingPriceField::Delay => "DELAY",
-        }
-    };
-
-    let mut fields_vec = Vec::with_capacity(fields.len());
-    for field in fields {
-        fields_vec.push(map_field(field).to_string());
-    }
-    fields_vec
+    // `Display` (via the `Debug` impl above) is the single source of truth for
+    // the exact IG Lightstreamer wire field name of every variant, so no
+    // separate mapping table or fallible serialization is needed.
+    fields.iter().map(|field| field.to_string()).collect()
 }
 
 /// Streaming account data fields available for account subscriptions.
@@ -1074,6 +949,204 @@ mod tests {
         ] {
             assert_wire_name(&field, expected);
         }
+    }
+
+    /// Every variant of every streaming field enum, so drift between the serde
+    /// renames and the `Display`/`Debug` wire mapping can be checked
+    /// exhaustively (see [`test_all_streaming_fields_serde_matches_display`]).
+    const ALL_MARKET_FIELDS: &[StreamingMarketField] = &[
+        StreamingMarketField::MidOpen,
+        StreamingMarketField::High,
+        StreamingMarketField::Low,
+        StreamingMarketField::Change,
+        StreamingMarketField::ChangePct,
+        StreamingMarketField::UpdateTime,
+        StreamingMarketField::MarketDelay,
+        StreamingMarketField::MarketState,
+        StreamingMarketField::Bid,
+        StreamingMarketField::Offer,
+    ];
+
+    const ALL_ACCOUNT_FIELDS: &[StreamingAccountDataField] = &[
+        StreamingAccountDataField::Pnl,
+        StreamingAccountDataField::Deposit,
+        StreamingAccountDataField::AvailableCash,
+        StreamingAccountDataField::PnlLr,
+        StreamingAccountDataField::PnlNlr,
+        StreamingAccountDataField::Funds,
+        StreamingAccountDataField::Margin,
+        StreamingAccountDataField::MarginLr,
+        StreamingAccountDataField::MarginNlr,
+        StreamingAccountDataField::AvailableToDeal,
+        StreamingAccountDataField::Equity,
+        StreamingAccountDataField::EquityUsed,
+    ];
+
+    const ALL_CHART_FIELDS: &[StreamingChartField] = &[
+        StreamingChartField::Ltv,
+        StreamingChartField::Ttv,
+        StreamingChartField::Utm,
+        StreamingChartField::DayOpenMid,
+        StreamingChartField::DayNetChgMid,
+        StreamingChartField::DayPercChgMid,
+        StreamingChartField::DayHigh,
+        StreamingChartField::DayLow,
+        StreamingChartField::Bid,
+        StreamingChartField::Ofr,
+        StreamingChartField::Ltp,
+        StreamingChartField::OfrOpen,
+        StreamingChartField::OfrHigh,
+        StreamingChartField::OfrLow,
+        StreamingChartField::OfrClose,
+        StreamingChartField::BidOpen,
+        StreamingChartField::BidHigh,
+        StreamingChartField::BidLow,
+        StreamingChartField::BidClose,
+        StreamingChartField::LtpOpen,
+        StreamingChartField::LtpHigh,
+        StreamingChartField::LtpLow,
+        StreamingChartField::LtpClose,
+        StreamingChartField::ConsEnd,
+        StreamingChartField::ConsTickCount,
+    ];
+
+    const ALL_PRICE_FIELDS: &[StreamingPriceField] = &[
+        StreamingPriceField::MidOpen,
+        StreamingPriceField::High,
+        StreamingPriceField::Low,
+        StreamingPriceField::BidQuoteId,
+        StreamingPriceField::AskQuoteId,
+        StreamingPriceField::BidPrice1,
+        StreamingPriceField::BidPrice2,
+        StreamingPriceField::BidPrice3,
+        StreamingPriceField::BidPrice4,
+        StreamingPriceField::BidPrice5,
+        StreamingPriceField::AskPrice1,
+        StreamingPriceField::AskPrice2,
+        StreamingPriceField::AskPrice3,
+        StreamingPriceField::AskPrice4,
+        StreamingPriceField::AskPrice5,
+        StreamingPriceField::BidSize1,
+        StreamingPriceField::BidSize2,
+        StreamingPriceField::BidSize3,
+        StreamingPriceField::BidSize4,
+        StreamingPriceField::BidSize5,
+        StreamingPriceField::AskSize1,
+        StreamingPriceField::AskSize2,
+        StreamingPriceField::AskSize3,
+        StreamingPriceField::AskSize4,
+        StreamingPriceField::AskSize5,
+        StreamingPriceField::Currency0,
+        StreamingPriceField::Currency1,
+        StreamingPriceField::C1BidSize1,
+        StreamingPriceField::C1BidSize2,
+        StreamingPriceField::C1BidSize3,
+        StreamingPriceField::C1BidSize4,
+        StreamingPriceField::C1BidSize5,
+        StreamingPriceField::C1AskSize1,
+        StreamingPriceField::C1AskSize2,
+        StreamingPriceField::C1AskSize3,
+        StreamingPriceField::C1AskSize4,
+        StreamingPriceField::C1AskSize5,
+        StreamingPriceField::Currency2,
+        StreamingPriceField::C2BidSize1,
+        StreamingPriceField::C2BidSize2,
+        StreamingPriceField::C2BidSize3,
+        StreamingPriceField::C2BidSize4,
+        StreamingPriceField::C2BidSize5,
+        StreamingPriceField::C2AskSize1,
+        StreamingPriceField::C2AskSize2,
+        StreamingPriceField::C2AskSize3,
+        StreamingPriceField::C2AskSize4,
+        StreamingPriceField::C2AskSize5,
+        StreamingPriceField::Currency3,
+        StreamingPriceField::C3BidSize1,
+        StreamingPriceField::C3BidSize2,
+        StreamingPriceField::C3BidSize3,
+        StreamingPriceField::C3BidSize4,
+        StreamingPriceField::C3BidSize5,
+        StreamingPriceField::C3AskSize1,
+        StreamingPriceField::C3AskSize2,
+        StreamingPriceField::C3AskSize3,
+        StreamingPriceField::C3AskSize4,
+        StreamingPriceField::C3AskSize5,
+        StreamingPriceField::Currency4,
+        StreamingPriceField::C4BidSize1,
+        StreamingPriceField::C4BidSize2,
+        StreamingPriceField::C4BidSize3,
+        StreamingPriceField::C4BidSize4,
+        StreamingPriceField::C4BidSize5,
+        StreamingPriceField::C4AskSize1,
+        StreamingPriceField::C4AskSize2,
+        StreamingPriceField::C4AskSize3,
+        StreamingPriceField::C4AskSize4,
+        StreamingPriceField::C4AskSize5,
+        StreamingPriceField::Currency5,
+        StreamingPriceField::C5BidSize1,
+        StreamingPriceField::C5BidSize2,
+        StreamingPriceField::C5BidSize3,
+        StreamingPriceField::C5BidSize4,
+        StreamingPriceField::C5BidSize5,
+        StreamingPriceField::C5AskSize1,
+        StreamingPriceField::C5AskSize2,
+        StreamingPriceField::C5AskSize3,
+        StreamingPriceField::C5AskSize4,
+        StreamingPriceField::C5AskSize5,
+        StreamingPriceField::Timestamp,
+        StreamingPriceField::DlgFlag,
+        StreamingPriceField::NetChg,
+        StreamingPriceField::NetChgPct,
+        StreamingPriceField::Delay,
+    ];
+
+    /// Asserts that the serde wire name (the JSON string a variant serializes
+    /// to) matches the variant's `Display` output. This is the single guard
+    /// that keeps the serde renames and the `Display`/`Debug` mapping — the two
+    /// independent sources for the IG Lightstreamer wire name — from drifting.
+    fn assert_serde_matches_display<T>(field: &T)
+    where
+        T: Serialize + Display,
+    {
+        let value = serde_json::to_value(field).expect("serialize to value failed");
+        let wire = value
+            .as_str()
+            .expect("a streaming field enum variant must serialize to a JSON string");
+        assert_eq!(
+            wire,
+            field.to_string(),
+            "serde wire name and Display disagree for a streaming field variant"
+        );
+    }
+
+    #[test]
+    fn test_all_streaming_fields_serde_matches_display() {
+        for field in ALL_MARKET_FIELDS {
+            assert_serde_matches_display(field);
+        }
+        for field in ALL_ACCOUNT_FIELDS {
+            assert_serde_matches_display(field);
+        }
+        for field in ALL_CHART_FIELDS {
+            assert_serde_matches_display(field);
+        }
+        for field in ALL_PRICE_FIELDS {
+            assert_serde_matches_display(field);
+        }
+    }
+
+    #[test]
+    fn test_get_streaming_price_fields_uses_display_wire_names() {
+        // The price getter now derives wire names from `Display`; pin a couple of
+        // non-obvious ones so a regression to a divergent mapping fails loudly.
+        let mut fields = HashSet::new();
+        fields.insert(StreamingPriceField::MidOpen);
+        fields.insert(StreamingPriceField::C1BidSize1);
+        fields.insert(StreamingPriceField::DlgFlag);
+        let result = get_streaming_price_fields(&fields);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&"MID_OPEN".to_string()));
+        assert!(result.contains(&"C1BIDSIZE1".to_string()));
+        assert!(result.contains(&"DLG_FLAG".to_string()));
     }
 
     #[test]

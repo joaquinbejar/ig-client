@@ -62,3 +62,85 @@ fn test_chart_data_serialization() {
     let json = serde_json::to_string(&chart).unwrap();
     let _deserialized: ChartData = serde_json::from_str(&json).unwrap();
 }
+
+#[test]
+fn test_chart_data_from_item_update_cons_end_is_flag() {
+    // CONS_END is a 0/1 candle-completed flag (1 = ended, 0 = forming), not a
+    // timestamp.
+    let mut fields = HashMap::new();
+    fields.insert("CONS_END".to_string(), Some("1".to_string()));
+    fields.insert("UTM".to_string(), Some("1700000000123".to_string()));
+
+    let item_update = ItemUpdate {
+        item_name: Some("CHART:CS.D.EURUSD.MINI.IP:1MINUTE".to_string()),
+        item_pos: 1,
+        is_snapshot: true,
+        fields,
+        changed_fields: HashMap::new(),
+    };
+
+    let data = chart_data_from_item_update(&item_update).expect("chart update should parse");
+    assert_eq!(data.fields.candle_end, Some(true));
+    // UTM is epoch milliseconds (UTC), parsed as i64.
+    assert_eq!(data.fields.update_time, Some(1_700_000_000_123));
+}
+
+#[test]
+fn test_chart_data_from_item_update_cons_end_zero_is_false() {
+    let mut fields = HashMap::new();
+    fields.insert("CONS_END".to_string(), Some("0".to_string()));
+
+    let item_update = ItemUpdate {
+        item_name: Some("CHART:CS.D.EURUSD.MINI.IP:1MINUTE".to_string()),
+        item_pos: 1,
+        is_snapshot: true,
+        fields,
+        changed_fields: HashMap::new(),
+    };
+
+    let data = chart_data_from_item_update(&item_update).expect("chart update should parse");
+    assert_eq!(data.fields.candle_end, Some(false));
+}
+
+#[test]
+fn test_chart_data_from_item_update_cons_end_invalid_is_error() {
+    let mut fields = HashMap::new();
+    fields.insert("CONS_END".to_string(), Some("2".to_string()));
+
+    let item_update = ItemUpdate {
+        item_name: Some("CHART:CS.D.EURUSD.MINI.IP:1MINUTE".to_string()),
+        item_pos: 1,
+        is_snapshot: true,
+        fields,
+        changed_fields: HashMap::new(),
+    };
+
+    assert!(
+        chart_data_from_item_update(&item_update).is_err(),
+        "a non-0/1 CONS_END value must surface an error"
+    );
+}
+
+#[test]
+fn test_chart_fields_round_trip_with_new_types() {
+    // Round-trips a sparse candle update through serde, pinning that the
+    // retyped fields (`candle_end: bool`, `update_time: i64`) survive.
+    let fields = ChartFields {
+        bid: Some(1.1000),
+        offer: Some(1.1002),
+        update_time: Some(1_700_000_000_123),
+        candle_end: Some(true),
+        candle_tick_count: Some(42.0),
+        ..Default::default()
+    };
+
+    let json = serde_json::to_string(&fields).expect("serialize should succeed");
+    let restored: ChartFields =
+        serde_json::from_str(&json).expect("ChartFields must deserialize its own output");
+    assert_eq!(restored.bid, Some(1.1000));
+    assert_eq!(restored.offer, Some(1.1002));
+    assert_eq!(restored.update_time, Some(1_700_000_000_123));
+    assert_eq!(restored.candle_end, Some(true));
+    assert_eq!(restored.candle_tick_count, Some(42.0));
+    assert!(restored.day_high.is_none());
+}

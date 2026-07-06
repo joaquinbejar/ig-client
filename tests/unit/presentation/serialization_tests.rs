@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use ig_client::presentation::serialization::{
-        option_string_empty_as_none, string_as_bool_opt, string_as_float_opt,
+        option_string_empty_as_none, string_as_bool_opt, string_as_float_opt, string_as_int_opt,
     };
     use serde::{Deserialize, Serialize};
 
@@ -12,6 +12,13 @@ mod tests {
     struct FloatTest {
         #[serde(with = "string_as_float_opt")]
         value: Option<f64>,
+    }
+
+    // Test structs for string_as_int_opt
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct IntTest {
+        #[serde(with = "string_as_int_opt")]
+        value: Option<i64>,
     }
 
     // Test structs for string_as_bool_opt
@@ -106,6 +113,89 @@ mod tests {
         // Test deserializing from object
         let json = r#"{"value": {"a": 1}}"#;
         let result: Result<FloatTest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // Tests for string_as_int_opt
+    #[test]
+    fn test_string_as_int_opt_serialize() {
+        // Some(i64) serializes to a JSON number.
+        let test = IntTest {
+            value: Some(1_700_000_000_123),
+        };
+        let serialized = serde_json::to_string(&test).unwrap();
+        assert_eq!(serialized, r#"{"value":1700000000123}"#);
+
+        // None serializes to null.
+        let test = IntTest { value: None };
+        let serialized = serde_json::to_string(&test).unwrap();
+        assert_eq!(serialized, r#"{"value":null}"#);
+    }
+
+    #[test]
+    fn test_string_as_int_opt_deserialize() {
+        // From a JSON number.
+        let json = r#"{"value": 1700000000123}"#;
+        let deserialized: IntTest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            deserialized,
+            IntTest {
+                value: Some(1_700_000_000_123)
+            }
+        );
+
+        // From a string holding an integer (the IG wire shape).
+        let json = r#"{"value": "1700000000123"}"#;
+        let deserialized: IntTest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            deserialized,
+            IntTest {
+                value: Some(1_700_000_000_123)
+            }
+        );
+
+        // Negative integers round-trip.
+        let json = r#"{"value": "-42"}"#;
+        let deserialized: IntTest = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized, IntTest { value: Some(-42) });
+
+        // Null and empty string both map to None.
+        let json = r#"{"value": null}"#;
+        let deserialized: IntTest = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized, IntTest { value: None });
+
+        let json = r#"{"value": ""}"#;
+        let deserialized: IntTest = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized, IntTest { value: None });
+    }
+
+    #[test]
+    fn test_string_as_int_opt_preserves_large_epoch_millis() {
+        // A 13-digit epoch-millis value must survive exactly, with no float
+        // rounding.
+        let original = IntTest {
+            value: Some(1_763_000_000_999),
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let restored: IntTest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_string_as_int_opt_deserialize_errors() {
+        // A non-integer string is an error.
+        let json = r#"{"value": "not-a-number"}"#;
+        let result: Result<IntTest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+
+        // A fractional value is not a valid integer.
+        let json = r#"{"value": "42.5"}"#;
+        let result: Result<IntTest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+
+        // A boolean is not accepted.
+        let json = r#"{"value": true}"#;
+        let result: Result<IntTest, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
