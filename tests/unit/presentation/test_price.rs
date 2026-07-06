@@ -1,3 +1,4 @@
+use ig_client::application::streaming_convert::price_data_from_item_update;
 use ig_client::presentation::price::{DealingFlag, PriceData, PriceFields};
 use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
@@ -82,7 +83,7 @@ fn test_price_data_from_item_update_empty() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 
@@ -100,7 +101,7 @@ fn test_price_data_from_item_update_with_bid_offer() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
 
     let price_data = result.unwrap();
@@ -130,7 +131,7 @@ fn test_price_data_from_item_update_with_all_fields() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 
@@ -147,7 +148,7 @@ fn test_price_data_from_item_update_invalid_float() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     // An unparseable float in a numeric field is a hard error: `parse_float`
     // fails and the error propagates out of `from_item_update`. The message
     // names the offending field and value.
@@ -177,7 +178,7 @@ fn test_price_data_from_item_update_empty_strings() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 
@@ -197,7 +198,7 @@ fn test_price_data_from_item_update_with_changed_fields() {
         changed_fields,
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 
@@ -231,7 +232,7 @@ fn test_price_data_from_item_update_empty_dlg_flag_is_none() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok(), "empty DLG_FLAG should not cause an error");
     let price_data = result.unwrap();
     assert!(
@@ -253,7 +254,7 @@ fn test_price_data_from_item_update_closingsonly_flag() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
     let price_data = result.unwrap();
     assert_eq!(
@@ -276,7 +277,7 @@ fn test_price_data_from_item_update_closingonly_backward_compat() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
     let price_data = result.unwrap();
     assert_eq!(
@@ -301,7 +302,7 @@ fn test_price_data_from_item_update_with_net_chg_fields() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(result.is_ok());
 
     let price_data = result.unwrap();
@@ -344,7 +345,7 @@ fn test_price_data_from_item_update_dlg_flag_with_trailing_spaces() {
         changed_fields: HashMap::new(),
     };
 
-    let result = PriceData::from_item_update(&item_update);
+    let result = price_data_from_item_update(&item_update);
     assert!(
         result.is_ok(),
         "DLG_FLAG with trailing spaces should not error"

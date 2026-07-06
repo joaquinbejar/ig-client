@@ -1,4 +1,4 @@
-use ig_client::model::utils::build_market_hierarchy;
+use ig_client::application::market_hierarchy::build_market_hierarchy;
 use ig_client::prelude::*;
 use tracing::{error, info};
 

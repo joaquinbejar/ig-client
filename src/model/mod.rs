@@ -5,8 +5,6 @@
 ******************************************************************************/
 /// Authentication models and session management
 pub mod auth;
-/// HTTP request utilities with rate limiting and retry
-pub mod http;
 /// Request models for API calls
 pub mod requests;
 /// Response models from API calls
@@ -15,5 +13,3 @@ pub mod responses;
 pub mod retry;
 /// Streaming data field definitions for real-time subscriptions
 pub mod streaming;
-/// Utility functions for models
-pub mod utils;

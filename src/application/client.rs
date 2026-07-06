@@ -5,6 +5,7 @@
 ******************************************************************************/
 use crate::application::auth::WebsocketInfo;
 use crate::application::config::Config;
+use crate::application::http::HttpClient;
 use crate::application::interfaces::account::AccountService;
 use crate::application::interfaces::costs::CostsService;
 use crate::application::interfaces::market::MarketService;
@@ -13,7 +14,6 @@ use crate::application::interfaces::order::OrderService;
 use crate::application::interfaces::sentiment::SentimentService;
 use crate::application::interfaces::watchlist::WatchlistService;
 use crate::error::AppError;
-use crate::model::http::HttpClient;
 use crate::model::requests::RecentPricesRequest;
 use crate::model::requests::{
     AddToWatchlistRequest, CloseCostsRequest, CreateWatchlistRequest, EditCostsRequest,
@@ -21,6 +21,10 @@ use crate::model::requests::{
 };
 use crate::model::requests::{
     ClosePositionRequest, CreateOrderRequest, CreateWorkingOrderRequest, UpdatePositionRequest,
+};
+use crate::model::responses::{
+    AccountActivityResponse, AccountsResponse, OrderConfirmationResponse, PositionsResponse,
+    TransactionHistoryResponse, WorkingOrdersResponse,
 };
 use crate::model::responses::{
     AccountPreferencesResponse, ApplicationDetailsResponse, CategoriesResponse,
@@ -39,13 +43,11 @@ use crate::model::streaming::{
     get_streaming_account_data_fields, get_streaming_chart_fields, get_streaming_market_fields,
     get_streaming_price_fields,
 };
-use crate::prelude::{
-    AccountActivityResponse, AccountFields, AccountsResponse, ChartData, ChartScale,
-    OrderConfirmationResponse, PositionsResponse, TradeFields, TransactionHistoryResponse,
-    WorkingOrdersResponse,
-};
+use crate::presentation::account::AccountFields;
+use crate::presentation::chart::{ChartData, ChartScale};
 use crate::presentation::market::{MarketData, MarketDetails};
 use crate::presentation::price::PriceData;
+use crate::presentation::trade::TradeFields;
 use async_trait::async_trait;
 use futures::StreamExt;
 use lightstreamer_rs::client::{LightstreamerClient, LogType, Transport};

@@ -1,13 +1,26 @@
 use crate::constants::{DAYS_TO_BACK_LOOK, DEFAULT_PAGE_SIZE, DEFAULT_SLEEP_TIME};
-use crate::storage::config::DatabaseConfig;
 use crate::utils::config::get_env_or_default;
 use dotenv::dotenv;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use std::env;
 use tracing::error;
 use tracing::log::debug;
+
+/// Configuration for database connections
+///
+/// This is a pure configuration DTO with no I/O. It lives in the application
+/// config module (alongside the other `*Config` types) so the application layer
+/// can embed it in [`Config`] without depending on the storage layer. The
+/// storage layer re-exports it (see `storage::config`) and owns the actual pool
+/// construction (`storage::utils::create_connection_pool`).
+#[derive(Debug, DisplaySimple, Serialize, Deserialize, Clone)]
+pub struct DatabaseConfig {
+    /// Database connection URL
+    pub url: String,
+    /// Maximum number of connections in the connection pool
+    pub max_connections: u32,
+}
 
 #[derive(DebugPretty, DisplaySimple, Serialize, Deserialize, Clone)]
 /// Authentication credentials for the IG Markets API
@@ -168,17 +181,5 @@ impl Config {
                 .filter(|&v| v == 2 || v == 3)
                 .or(Some(3)), // Default to API v3 (OAuth) if not specified
         }
-    }
-
-    /// Creates a PostgreSQL connection pool using the database configuration
-    ///
-    /// # Returns
-    ///
-    /// A Result containing either a PostgreSQL connection pool or an error
-    pub async fn pg_pool(&self) -> Result<sqlx::Pool<sqlx::Postgres>, sqlx::Error> {
-        PgPoolOptions::new()
-            .max_connections(self.database.max_connections)
-            .connect(&self.database.url)
-            .await
     }
 }

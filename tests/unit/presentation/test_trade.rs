@@ -1,3 +1,4 @@
+use ig_client::application::streaming_convert::trade_data_from_item_update;
 use ig_client::presentation::trade::{TradeData, TradeFields};
 use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ fn test_trade_data_from_item_update_empty() {
         changed_fields: HashMap::new(),
     };
 
-    let result = TradeData::from_item_update(&item_update);
+    let result = trade_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 
@@ -53,7 +54,7 @@ fn test_trade_data_from_item_update_with_confirms() {
         changed_fields: HashMap::new(),
     };
 
-    let result = TradeData::from_item_update(&item_update);
+    let result = trade_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 

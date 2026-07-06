@@ -12,7 +12,7 @@
 //! - Price data (detailed bid/ask levels)
 //! - Account data (P&L, margin, equity)
 
-use crate::prelude::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 

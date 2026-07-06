@@ -1,3 +1,4 @@
+use ig_client::application::streaming_convert::chart_data_from_item_update;
 use ig_client::presentation::chart::{ChartData, ChartFields};
 use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
@@ -24,7 +25,7 @@ fn test_chart_data_from_item_update_empty() {
         changed_fields: HashMap::new(),
     };
 
-    let result = ChartData::from_item_update(&item_update);
+    let result = chart_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 
@@ -45,7 +46,7 @@ fn test_chart_data_from_item_update_with_fields() {
         changed_fields: HashMap::new(),
     };
 
-    let result = ChartData::from_item_update(&item_update);
+    let result = chart_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 

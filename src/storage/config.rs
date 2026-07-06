@@ -1,11 +1,10 @@
-use pretty_simple_display::DisplaySimple;
-use serde::{Deserialize, Serialize};
+//! Database configuration for the storage layer.
+//!
+//! The `DatabaseConfig` data type is defined in `crate::application::config`
+//! (alongside the other `*Config` types, so [`crate::application::config::Config`]
+//! can embed it without an application → storage dependency). It is re-exported
+//! here to preserve the historical `crate::storage::config::DatabaseConfig`
+//! public path and to keep the storage-layer's pool construction co-located with
+//! the config it consumes.
 
-/// Configuration for database connections
-#[derive(Debug, DisplaySimple, Serialize, Deserialize, Clone)]
-pub struct DatabaseConfig {
-    /// Database connection URL
-    pub url: String,
-    /// Maximum number of connections in the connection pool
-    pub max_connections: u32,
-}
+pub use crate::application::config::DatabaseConfig;

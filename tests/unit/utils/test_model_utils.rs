@@ -1,4 +1,4 @@
-use ig_client::model::utils::extract_markets_from_hierarchy;
+use ig_client::application::market_hierarchy::extract_markets_from_hierarchy;
 use ig_client::prelude::{MarketData, MarketNode};
 use ig_client::presentation::instrument::InstrumentType;
 

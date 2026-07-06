@@ -44,7 +44,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
         }
     }
     // Store the transactions in database if configured
-    if let Ok(pool) = config.pg_pool().await {
+    if let Ok(pool) = create_connection_pool(&config.database).await {
         let tx_list = TransactionList::from(&transactions.transactions);
         let inserted = store_transactions(&pool, tx_list.as_ref()).await?;
         info!("Inserted {} rows into database", inserted);

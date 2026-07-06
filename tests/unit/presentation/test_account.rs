@@ -1,3 +1,4 @@
+use ig_client::application::streaming_convert::account_data_from_item_update;
 use ig_client::presentation::account::{AccountData, AccountFields};
 use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
@@ -24,7 +25,7 @@ fn test_account_data_from_item_update_empty() {
         changed_fields: HashMap::new(),
     };
 
-    let result = AccountData::from_item_update(&item_update);
+    let result = account_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 
@@ -44,7 +45,7 @@ fn test_account_data_from_item_update_with_fields() {
         changed_fields: HashMap::new(),
     };
 
-    let result = AccountData::from_item_update(&item_update);
+    let result = account_data_from_item_update(&item_update);
     assert!(result.is_ok());
 }
 

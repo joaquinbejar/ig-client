@@ -4,10 +4,11 @@
    Date: 19/10/25
 ******************************************************************************/
 use crate::constants::{DEFAULT_ORDER_BUY_LEVEL, DEFAULT_ORDER_SELL_LEVEL};
-use crate::prelude::{Deserialize, Serialize, WorkingOrder};
+use crate::presentation::account::WorkingOrder;
 use crate::presentation::order::{Direction, OrderType, TimeInForce};
 use chrono::{Duration, Utc};
 use pretty_simple_display::{DebugPretty, DisplaySimple};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::{Debug, Display};
 

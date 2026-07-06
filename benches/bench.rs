@@ -20,7 +20,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group};
 
-use ig_client::model::utils::extract_markets_from_hierarchy;
+use ig_client::application::market_hierarchy::extract_markets_from_hierarchy;
 use ig_client::prelude::DBEntryResponse;
 use ig_client::presentation::instrument::InstrumentType;
 use ig_client::presentation::market::{MarketData, MarketNode};

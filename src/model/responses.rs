@@ -3,14 +3,14 @@
    Email: jb@taunais.com
    Date: 19/10/25
 ******************************************************************************/
-use crate::prelude::{Account, Activity, MarketDetails};
 use crate::presentation::account::{
-    AccountTransaction, ActivityMetadata, Position, TransactionMetadata, WorkingOrder,
+    Account, AccountTransaction, Activity, ActivityMetadata, Position, TransactionMetadata,
+    WorkingOrder,
 };
 use crate::presentation::instrument::InstrumentType;
 use crate::presentation::market::{
     Category, CategoryInstrument, CategoryInstrumentsMetadata, HistoricalPrice, MarketData,
-    MarketNavigationNode, MarketNode, PriceAllowance,
+    MarketDetails, MarketNavigationNode, MarketNode, PriceAllowance,
 };
 use crate::presentation::order::{Direction, Status};
 use crate::utils::parsing::{deserialize_null_as_empty_vec, deserialize_nullable_status};
