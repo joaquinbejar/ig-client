@@ -18,7 +18,7 @@ use crate::model::responses::MarketNavigationResponse;
 use crate::presentation::market::{MarketData, MarketNode};
 use std::future::Future;
 use std::pin::Pin;
-use tracing::{debug, error, info};
+use tracing::{debug, error, warn};
 
 /// Builds a market hierarchy recursively by traversing the navigation tree
 ///
@@ -41,29 +41,36 @@ pub fn build_market_hierarchy<'a>(
     Box::pin(async move {
         // Limit the depth to avoid infinite loops
         if depth > 7 {
-            debug!("Reached maximum depth of 5, stopping recursion");
+            debug!(
+                depth,
+                max_depth = 7,
+                "reached maximum recursion depth, stopping"
+            );
             return Ok(Vec::new());
         }
 
         // Get the nodes and markets at the current level
         let navigation: MarketNavigationResponse = match node_id {
             Some(id) => {
-                debug!("Getting navigation node: {}", id);
+                debug!(node_id = %id, "getting navigation node");
                 match client.get_market_navigation_node(id).await {
                     Ok(response) => {
                         debug!(
-                            "Response received for node {}: {} nodes, {} markets",
-                            id,
-                            response.nodes.len(),
-                            response.markets.len()
+                            node_id = %id,
+                            nodes = response.nodes.len(),
+                            markets = response.markets.len(),
+                            "navigation node response received"
                         );
                         response
                     }
                     Err(e) => {
-                        error!("Error getting node {}: {:?}", id, e);
+                        error!(node_id = %id, error = ?e, "error getting navigation node");
                         // If we hit a rate limit, return empty results instead of failing
                         if matches!(e, AppError::RateLimitExceeded | AppError::Unexpected(_)) {
-                            info!("Rate limit or API error encountered, returning partial results");
+                            warn!(
+                                node_id = %id,
+                                "rate limit or API error encountered, returning partial results"
+                            );
                             return Ok(Vec::new());
                         }
                         return Err(e);
@@ -71,18 +78,18 @@ pub fn build_market_hierarchy<'a>(
                 }
             }
             None => {
-                debug!("Getting top-level navigation nodes");
+                debug!("getting top-level navigation nodes");
                 match client.get_market_navigation().await {
                     Ok(response) => {
                         debug!(
-                            "Response received for top-level nodes: {} nodes, {} markets",
-                            response.nodes.len(),
-                            response.markets.len()
+                            nodes = response.nodes.len(),
+                            markets = response.markets.len(),
+                            "top-level navigation response received"
                         );
                         response
                     }
                     Err(e) => {
-                        error!("Error getting top-level nodes: {:?}", e);
+                        error!(error = ?e, "error getting top-level navigation nodes");
                         return Err(e);
                     }
                 }
@@ -102,7 +109,12 @@ pub fn build_market_hierarchy<'a>(
             // Recursively get the children of this node
             match build_market_hierarchy(client, Some(&node.id), depth + 1).await {
                 Ok(children) => {
-                    info!("Adding node {} with {} children", node.name, children.len());
+                    debug!(
+                        node_id = %node.id,
+                        node_name = %node.name,
+                        count = children.len(),
+                        "adding node to hierarchy"
+                    );
                     nodes.push(MarketNode {
                         id: node.id.clone(),
                         name: node.name.clone(),
@@ -111,7 +123,7 @@ pub fn build_market_hierarchy<'a>(
                     });
                 }
                 Err(e) => {
-                    error!("Error building hierarchy for node {}: {:?}", node.id, e);
+                    error!(node_id = %node.id, error = ?e, "error building hierarchy for node");
                     // Continue with other nodes even if one fails
                     if depth < 7 {
                         nodes.push(MarketNode {
@@ -128,7 +140,11 @@ pub fn build_market_hierarchy<'a>(
         // Process all markets in this node
         let markets_to_process = navigation.markets;
         for market in markets_to_process {
-            debug!("Adding market: {}", market.instrument_name);
+            debug!(
+                epic = %market.epic,
+                instrument_name = %market.instrument_name,
+                "adding market to hierarchy"
+            );
             nodes.push(MarketNode {
                 id: market.epic.clone(),
                 name: market.instrument_name.clone(),

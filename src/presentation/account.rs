@@ -7,6 +7,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Add;
 
+/// Returns `true` if an instrument name denotes a call option.
+///
+/// IG encodes the option right in the human-readable `instrumentName` (for
+/// example `"...CALL..."`). The check is a case-sensitive substring match on
+/// the upper-case token IG uses. Shared by every `is_call` accessor in this
+/// module so the classification stays in one place.
+#[must_use]
+#[inline]
+fn is_call_name(name: &str) -> bool {
+    name.contains("CALL")
+}
+
+/// Returns `true` if an instrument name denotes a put option.
+///
+/// Counterpart to [`is_call_name`]: a case-sensitive substring match on the
+/// upper-case `"PUT"` token IG places in `instrumentName`. Shared by every
+/// `is_put` accessor in this module.
+#[must_use]
+#[inline]
+fn is_put_name(name: &str) -> bool {
+    name.contains("PUT")
+}
+
 /// Account information
 #[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize)]
 pub struct AccountInfo {
@@ -324,7 +347,7 @@ impl Position {
     #[must_use]
     #[inline]
     pub fn is_call(&self) -> bool {
-        self.market.instrument_name.contains("CALL")
+        is_call_name(&self.market.instrument_name)
     }
 
     /// Checks if the financial instrument is a "PUT" option.
@@ -341,7 +364,7 @@ impl Position {
     #[must_use]
     #[inline]
     pub fn is_put(&self) -> bool {
-        self.market.instrument_name.contains("PUT")
+        is_put_name(&self.market.instrument_name)
     }
 }
 
@@ -476,7 +499,7 @@ pub struct PositionMarket {
     pub epic: String,
     /// Type of the instrument
     #[serde(rename = "instrumentType")]
-    pub instrument_type: String,
+    pub instrument_type: InstrumentType,
     /// Size of one lot
     #[serde(rename = "lotSize")]
     pub lot_size: f64,
@@ -500,15 +523,15 @@ pub struct PositionMarket {
     /// UTC time of the last price update
     #[serde(rename = "updateTimeUTC")]
     pub update_time_utc: String,
-    /// Delay time in milliseconds for market data
+    /// Delay time in minutes for market data
     #[serde(rename = "delayTime")]
     pub delay_time: i64,
     /// Whether streaming prices are available for this market
     #[serde(rename = "streamingPricesAvailable")]
     pub streaming_prices_available: bool,
-    /// Current status of the market (e.g., "OPEN", "CLOSED")
+    /// Current status of the market (e.g., `TRADEABLE`, `CLOSED`)
     #[serde(rename = "marketStatus")]
-    pub market_status: String,
+    pub market_status: MarketState,
     /// Factor for scaling prices
     #[serde(rename = "scalingFactor")]
     pub scaling_factor: i64,
@@ -527,8 +550,10 @@ impl PositionMarket {
     /// * `true` if the instrument's name contains the substring `"CALL"`, indicating it is a call option.
     /// * `false` otherwise.
     ///
+    #[must_use]
+    #[inline]
     pub fn is_call(&self) -> bool {
-        self.instrument_name.contains("CALL")
+        is_call_name(&self.instrument_name)
     }
 
     /// Checks if the financial instrument is a "PUT" option.
@@ -542,8 +567,10 @@ impl PositionMarket {
     /// * `true` - If `instrument_name` contains the substring "PUT".
     /// * `false` - If `instrument_name` does not contain the substring "PUT".
     ///
+    #[must_use]
+    #[inline]
     pub fn is_put(&self) -> bool {
-        self.instrument_name.contains("PUT")
+        is_put_name(&self.instrument_name)
     }
 }
 
@@ -662,7 +689,7 @@ pub struct AccountMarketData {
     /// UTC time of the last price update
     #[serde(rename = "updateTimeUTC")]
     pub update_time_utc: String,
-    /// Delay time in milliseconds for market data
+    /// Delay time in minutes for market data
     #[serde(rename = "delayTime")]
     pub delay_time: i64,
     /// Whether streaming prices are available for this market
@@ -686,8 +713,10 @@ impl AccountMarketData {
     /// * `true` if the instrument's name contains the substring `"CALL"`, indicating it is a call option.
     /// * `false` otherwise.
     ///
+    #[must_use]
+    #[inline]
     pub fn is_call(&self) -> bool {
-        self.instrument_name.contains("CALL")
+        is_call_name(&self.instrument_name)
     }
 
     /// Checks if the financial instrument is a "PUT" option.
@@ -701,8 +730,10 @@ impl AccountMarketData {
     /// * `true` - If `instrument_name` contains the substring "PUT".
     /// * `false` - If `instrument_name` does not contain the substring "PUT".
     ///
+    #[must_use]
+    #[inline]
     pub fn is_put(&self) -> bool {
-        self.instrument_name.contains("PUT")
+        is_put_name(&self.instrument_name)
     }
 }
 
@@ -782,8 +813,10 @@ impl AccountTransaction {
     /// * `true` if the instrument's name contains the substring `"CALL"`, indicating it is a call option.
     /// * `false` otherwise.
     ///
+    #[must_use]
+    #[inline]
     pub fn is_call(&self) -> bool {
-        self.instrument_name.contains("CALL")
+        is_call_name(&self.instrument_name)
     }
 
     /// Checks if the financial instrument is a "PUT" option.
@@ -797,8 +830,10 @@ impl AccountTransaction {
     /// * `true` - If `instrument_name` contains the substring "PUT".
     /// * `false` - If `instrument_name` does not contain the substring "PUT".
     ///
+    #[must_use]
+    #[inline]
     pub fn is_put(&self) -> bool {
-        self.instrument_name.contains("PUT")
+        is_put_name(&self.instrument_name)
     }
 }
 
@@ -989,7 +1024,7 @@ mod tests {
             instrument_name: "US 500 6910 PUT ($1)".to_string(),
             expiry: "DEC-25".to_string(),
             epic: "OP.D.OTCSPX3.6910P.IP".to_string(),
-            instrument_type: "UNKNOWN".to_string(),
+            instrument_type: InstrumentType::Unknown,
             lot_size: 1.0,
             high: Some(153.43),
             low: Some(147.42),
@@ -1001,7 +1036,7 @@ mod tests {
             update_time_utc: "05:55:59".to_string(),
             delay_time: 0,
             streaming_prices_available: true,
-            market_status: "TRADEABLE".to_string(),
+            market_status: MarketState::Tradeable,
             scaling_factor: 1,
         }
     }

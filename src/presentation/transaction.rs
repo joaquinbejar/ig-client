@@ -5,6 +5,16 @@ use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+/// Absolute P&L magnitude, in EUR, below which a `WITH` (withdrawal / adjustment)
+/// transaction is classified as a fee rather than a realised trade result.
+///
+/// IG reports commissions, overnight funding and similar small charges as `WITH`
+/// transactions carrying a P&L close to zero, whereas a genuine cash movement of
+/// that type has a larger magnitude. Any `WITH` transaction whose absolute
+/// `pnl_eur` is strictly below this threshold is treated as a fee. Denominated in
+/// EUR because `pnl_eur` is normalised to EUR upstream.
+const FEE_THRESHOLD_EUR: f64 = 1.0;
+
 /// Represents a processed transaction from IG Markets with parsed fields
 #[derive(DebugPretty, DisplaySimple, Serialize, Deserialize, PartialEq, Clone, Default)]
 pub struct StoreTransaction {
@@ -97,6 +107,9 @@ impl From<AccountTransaction> for StoreTransaction {
         let deal_date = NaiveDateTime::parse_from_str(&raw.date_utc, "%Y-%m-%dT%H:%M:%S")
             .map(|naive| naive.and_utc())
             .unwrap_or_else(|_| Utc::now());
+        // An unparseable P&L string falls back to 0.0; combined with the fee
+        // classification below, a `WITH` transaction whose amount cannot be parsed
+        // is therefore treated as a fee (0.0 is below `FEE_THRESHOLD_EUR`).
         let pnl_eur = raw
             .profit_and_loss
             .trim_start_matches('E')
@@ -106,7 +119,7 @@ impl From<AccountTransaction> for StoreTransaction {
 
         let expiry = parse_period(&raw.period);
 
-        let is_fee = raw.transaction_type == "WITH" && pnl_eur.abs() < 1.0;
+        let is_fee = raw.transaction_type == "WITH" && pnl_eur.abs() < FEE_THRESHOLD_EUR;
 
         StoreTransaction {
             deal_date,

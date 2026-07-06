@@ -1,4 +1,6 @@
 use ig_client::presentation::account::{Position, PositionDetails, PositionMarket};
+use ig_client::presentation::instrument::InstrumentType;
+use ig_client::presentation::market::MarketState;
 use ig_client::presentation::order::Direction;
 use ig_client::utils::finance::{calculate_percentage_return, calculate_pnl};
 
@@ -13,7 +15,7 @@ fn create_test_position(
         instrument_name: "Test Instrument".into(),
         expiry: "-".into(),
         epic: "TEST.EPIC".into(),
-        instrument_type: "SHARES".into(),
+        instrument_type: InstrumentType::Shares,
         lot_size: 1.0,
         high: None,
         low: None,
@@ -25,7 +27,7 @@ fn create_test_position(
         update_time_utc: "2024-01-01T00:00:00Z".into(),
         delay_time: 0,
         streaming_prices_available: true,
-        market_status: "TRADEABLE".into(),
+        market_status: MarketState::Tradeable,
         scaling_factor: 1,
     };
 

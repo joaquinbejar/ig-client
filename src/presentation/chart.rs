@@ -365,16 +365,22 @@ impl ChartData {
     }
 
     /// Checks if these chart data are of type TICK
+    #[must_use]
+    #[inline]
     pub fn is_tick(&self) -> bool {
         matches!(self.scale, ChartScale::Tick)
     }
 
     /// Checks if these chart data are of type CANDLE (any time scale)
+    #[must_use]
+    #[inline]
     pub fn is_candle(&self) -> bool {
         !self.is_tick()
     }
 
     /// Gets the time scale of the data
+    #[must_use]
+    #[inline]
     pub fn get_scale(&self) -> &ChartScale {
         &self.scale
     }

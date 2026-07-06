@@ -92,6 +92,15 @@ pub const DEFAULT_ORDER_BUY_LEVEL: f64 = 10000.0;
 /// attempt to switch to this value.
 pub const DEFAULT_ACCOUNT_ID: &str = "default_account_id";
 
+/// Credential-less placeholder used for `DATABASE_URL` when it is not configured.
+///
+/// Persistence is optional, so an unset `DATABASE_URL` is not fatal at config
+/// construction; this placeholder lets `Config::new` produce a value while
+/// deliberately carrying NO username or password. It is not a working
+/// connection string — any component that actually needs Postgres must fail
+/// when it tries to connect. Never hard-code real credentials here.
+pub const DEFAULT_DATABASE_URL: &str = "postgres://localhost/ig";
+
 /// Lifetime of an IG API v2 (CST / X-SECURITY-TOKEN) session, in seconds
 /// (21600 = 6 hours).
 ///

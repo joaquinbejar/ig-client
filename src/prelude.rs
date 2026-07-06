@@ -16,6 +16,22 @@
 //! let client = Client::try_new()?;
 //! let markets = client.search_markets("EUR").await?;
 //! ```
+//!
+//! The prelude is self-sufficient for the streaming API: `StreamerClient`,
+//! `DynamicMarketStreamer`, the `Streaming*Field` selectors and the
+//! [`PriceData`](crate::presentation::price::PriceData) DTO all resolve from a
+//! single glob import, with no extra `use` lines.
+//!
+//! ```rust
+//! use ig_client::prelude::*;
+//!
+//! // Both the streaming client type and the price DTO resolve through the
+//! // prelude alone — no additional imports are required.
+//! fn accepts_price(_price: &PriceData) {}
+//! fn returns_streamer(client: StreamerClient) -> StreamerClient {
+//!     client
+//! }
+//! ```
 
 // Core client
 pub use crate::application::client::Client;
@@ -36,9 +52,17 @@ pub use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
 
 // Service interfaces
 pub use crate::application::interfaces::account::AccountService;
+pub use crate::application::interfaces::costs::CostsService;
 pub use crate::application::interfaces::listener::ListenerResult;
 pub use crate::application::interfaces::market::MarketService;
+pub use crate::application::interfaces::operations::OperationsService;
 pub use crate::application::interfaces::order::OrderService;
+pub use crate::application::interfaces::sentiment::SentimentService;
+pub use crate::application::interfaces::watchlist::WatchlistService;
+
+// Streaming client and subscription manager
+pub use crate::application::client::StreamerClient;
+pub use crate::application::dynamic_streamer::DynamicMarketStreamer;
 
 // Error handling
 pub use crate::error::AppError;
@@ -49,6 +73,7 @@ pub use crate::presentation::chart::*;
 pub use crate::presentation::instrument::*;
 pub use crate::presentation::market::*;
 pub use crate::presentation::order::*;
+pub use crate::presentation::price::PriceData;
 pub use crate::presentation::trade::*;
 pub use crate::presentation::transaction::*;
 
@@ -58,7 +83,18 @@ pub use crate::model::requests::*;
 // Response models
 pub use crate::model::responses::*;
 
-pub use crate::utils::*;
+// Streaming field selectors
+pub use crate::model::streaming::{
+    StreamingAccountDataField, StreamingChartField, StreamingMarketField, StreamingPriceField,
+};
+
+// Utility helpers
+pub use crate::utils::finance::{calculate_percentage_return, calculate_pnl};
+pub use crate::utils::id::get_id;
+pub use crate::utils::logger::setup_logger;
+pub use crate::utils::parsing::{
+    ParsedMarketData, ParsedOptionInfo, normalize_text, parse_instrument_name,
+};
 
 // Re-export commonly used external types
 pub use async_trait::async_trait;

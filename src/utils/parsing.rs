@@ -37,31 +37,32 @@ impl ParsedMarketData {
     ///
     /// A call option is a financial derivative that gives the holder the right (but not the obligation)
     /// to buy an underlying asset at a specified price within a specified time period. This method checks
-    /// whether the instrument represented by this instance is a call option by inspecting the `instrument_name`
-    /// field.
+    /// whether the instrument is a call option by inspecting the already-parsed `option_type` field.
     ///
     /// # Returns
     ///
-    /// * `true` if the instrument's name contains the substring `"CALL"`, indicating it is a call option.
+    /// * `true` if the parsed `option_type` is exactly `"CALL"`, indicating it is a call option.
     /// * `false` otherwise.
     ///
+    #[must_use]
+    #[inline]
     pub fn is_call(&self) -> bool {
-        self.instrument_name.contains("CALL")
+        self.option_type.as_deref() == Some("CALL")
     }
 
     /// Checks if the financial instrument is a "PUT" option.
     ///
-    /// This method examines the `instrument_name` field of the struct to determine
-    /// if it contains the substring "PUT". If the substring is found, the method
-    /// returns `true`, indicating that the instrument is categorized as a "PUT" option.
-    /// Otherwise, it returns `false`.
+    /// This method inspects the already-parsed `option_type` field rather than
+    /// re-scanning the instrument name, so it stays in sync with the parser.
     ///
     /// # Returns
-    /// * `true` - If `instrument_name` contains the substring "PUT".
-    /// * `false` - If `instrument_name` does not contain the substring "PUT".
+    /// * `true` - If the parsed `option_type` is exactly `"PUT"`.
+    /// * `false` - Otherwise.
     ///
+    #[must_use]
+    #[inline]
     pub fn is_put(&self) -> bool {
-        self.instrument_name.contains("PUT")
+        self.option_type.as_deref() == Some("PUT")
     }
 }
 
@@ -270,6 +271,40 @@ mod tests {
         assert_eq!(info.asset_name, "Germany 40");
         assert_eq!(info.strike, None);
         assert_eq!(info.option_type, None);
+    }
+
+    fn market_with_option_type(option_type: Option<&str>) -> ParsedMarketData {
+        ParsedMarketData {
+            epic: "OP.D.OTCSPX3.6910C.IP".to_string(),
+            instrument_name: "US 500 6910 CALL ($1)".to_string(),
+            expiry: "DEC-25".to_string(),
+            asset_name: "US 500".to_string(),
+            strike: Some("6910".to_string()),
+            option_type: option_type.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_parsed_market_data_is_call_uses_parsed_option_type() {
+        let call = market_with_option_type(Some("CALL"));
+        assert!(call.is_call());
+        assert!(!call.is_put());
+    }
+
+    #[test]
+    fn test_parsed_market_data_is_put_uses_parsed_option_type() {
+        let put = market_with_option_type(Some("PUT"));
+        assert!(put.is_put());
+        assert!(!put.is_call());
+    }
+
+    #[test]
+    fn test_parsed_market_data_no_option_type_is_neither() {
+        // A non-option instrument has `option_type == None`, so neither
+        // predicate fires even though the name might contain other tokens.
+        let none = market_with_option_type(None);
+        assert!(!none.is_call());
+        assert!(!none.is_put());
     }
 
     #[test]

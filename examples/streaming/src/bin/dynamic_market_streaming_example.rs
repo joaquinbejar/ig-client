@@ -43,7 +43,7 @@ async fn main() -> Result<(), AppError> {
     ]);
 
     // Create the dynamic streamer
-    let mut streamer = DynamicMarketStreamer::new(fields).await?;
+    let mut streamer = DynamicMarketStreamer::new(fields);
     info!("Dynamic market streamer created");
 
     // Get the receiver for price updates (can only be called once)

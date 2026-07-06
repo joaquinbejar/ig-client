@@ -145,7 +145,7 @@ pub struct MarketSnapshot {
     #[serde(rename = "updateTime")]
     pub update_time: Option<String>,
 
-    /// Delay time in milliseconds for market data
+    /// Delay time in minutes for market data
     #[serde(rename = "delayTime")]
     pub delay_time: Option<i64>,
 
@@ -231,6 +231,8 @@ impl MarketData {
     /// * `true` if the instrument's name contains the substring `"CALL"`, indicating it is a call option.
     /// * `false` otherwise.
     ///
+    #[must_use]
+    #[inline]
     pub fn is_call(&self) -> bool {
         self.instrument_name.contains("CALL")
     }
@@ -246,6 +248,8 @@ impl MarketData {
     /// * `true` - If `instrument_name` contains the substring "PUT".
     /// * `false` - If `instrument_name` does not contain the substring "PUT".
     ///
+    #[must_use]
+    #[inline]
     pub fn is_put(&self) -> bool {
         self.instrument_name.contains("PUT")
     }
