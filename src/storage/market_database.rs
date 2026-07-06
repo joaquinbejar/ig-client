@@ -6,6 +6,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use tracing::info;
 
+/// Maximum number of rows sent per multi-row (`UNNEST`) `INSERT` statement.
+///
+/// Each `UNNEST` insert binds a fixed set of array parameters regardless of the
+/// row count, so this bounds per-statement memory / server-side work rather than
+/// a Postgres bind-parameter limit. A full-exchange refresh is a handful of
+/// round trips at this size instead of tens of thousands of single-row inserts.
+const HIERARCHY_INSERT_BATCH_SIZE: usize = 5_000;
+
 /// Service for managing market data persistence in PostgreSQL
 pub struct MarketDatabaseService {
     pool: PgPool,
@@ -151,6 +159,17 @@ impl MarketDatabaseService {
     }
 
     /// Stores the complete market hierarchy in the database
+    ///
+    /// Full-refresh semantics for the exchange are preserved: existing rows are
+    /// deleted and the incoming hierarchy is re-inserted. The re-insert is
+    /// batched with multi-row `INSERT ... SELECT * FROM UNNEST(...)` statements
+    /// (a few round trips) instead of one prepared statement per row. All values
+    /// still travel as bound array parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`sqlx::Error`] if any statement fails; the transaction rolls back
+    /// on drop so a partial hierarchy is never observable.
     pub async fn store_market_hierarchy(
         &self,
         hierarchy: &[MarketNode],
@@ -159,6 +178,32 @@ impl MarketDatabaseService {
             "Storing market hierarchy with {} top-level nodes",
             hierarchy.len()
         );
+
+        // Flatten the hierarchy into row structs first (network-free). Pre-size
+        // the collected vectors from an exact traversal count so there are no
+        // intermediate reallocations. `process_node_recursive` yields nodes in
+        // topological order (parent before child), which the batched insert and
+        // the self-referential `parent_id` FK rely on.
+        let (node_capacity, instrument_capacity) = count_hierarchy(hierarchy);
+        let mut all_nodes: Vec<MarketHierarchyNode> = Vec::with_capacity(node_capacity);
+        let mut all_instruments: Vec<MarketInstrument> = Vec::with_capacity(instrument_capacity);
+
+        for node in hierarchy {
+            let (nodes, instruments) = self.process_node_recursive(node, None, 0, "").await?;
+            all_nodes.extend(nodes);
+            all_instruments.extend(instruments);
+        }
+
+        // Dedupe by primary key. A multi-row `INSERT ... ON CONFLICT DO UPDATE`
+        // errors if the same key appears twice in one statement, so duplicates
+        // must be collapsed here. Keep the first occurrence's position (parents
+        // stay before children for the FK) but the last occurrence's data,
+        // matching the previous per-row `ON CONFLICT DO UPDATE` last-wins result.
+        let nodes = dedupe_by_key(all_nodes, |node| &node.id);
+        let instruments = dedupe_by_key(all_instruments, |instrument| &instrument.epic);
+
+        let node_count = nodes.len();
+        let instrument_count = instruments.len();
 
         // Start a transaction
         let mut tx = self.pool.begin().await?;
@@ -174,24 +219,14 @@ impl MarketDatabaseService {
             .execute(&mut *tx)
             .await?;
 
-        // Store hierarchy nodes and instruments
-        let mut node_count = 0;
-        let mut instrument_count = 0;
+        // Insert nodes before instruments (instruments FK-reference node ids),
+        // both chunked into bounded multi-row statements.
+        for chunk in nodes.chunks(HIERARCHY_INSERT_BATCH_SIZE) {
+            insert_hierarchy_nodes_batch(&mut tx, chunk).await?;
+        }
 
-        for node in hierarchy {
-            let (nodes, instruments) = self.process_node_recursive(node, None, 0, "").await?;
-            node_count += nodes.len();
-            instrument_count += instruments.len();
-
-            // Insert nodes
-            for node in nodes {
-                self.insert_hierarchy_node(&mut tx, &node).await?;
-            }
-
-            // Insert instruments
-            for instrument in instruments {
-                self.insert_market_instrument(&mut tx, &instrument).await?;
-            }
+        for chunk in instruments.chunks(HIERARCHY_INSERT_BATCH_SIZE) {
+            insert_market_instruments_batch(&mut tx, chunk).await?;
         }
 
         // Commit transaction
@@ -471,97 +506,6 @@ impl MarketDatabaseService {
         instrument
     }
 
-    /// Inserts a hierarchy node into the database
-    async fn insert_hierarchy_node(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        node: &MarketHierarchyNode,
-    ) -> Result<(), sqlx::Error> {
-        tx.execute(
-            sqlx::query(
-                r#"
-                INSERT INTO market_hierarchy_nodes 
-                (id, name, parent_id, exchange, level, path, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    parent_id = EXCLUDED.parent_id,
-                    exchange = EXCLUDED.exchange,
-                    level = EXCLUDED.level,
-                    path = EXCLUDED.path,
-                    updated_at = EXCLUDED.updated_at
-                "#,
-            )
-            .bind(&node.id)
-            .bind(&node.name)
-            .bind(&node.parent_id)
-            .bind(&node.exchange)
-            .bind(node.level)
-            .bind(&node.path)
-            .bind(node.created_at)
-            .bind(node.updated_at),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Inserts a market instrument into the database
-    async fn insert_market_instrument(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        instrument: &MarketInstrument,
-    ) -> Result<(), sqlx::Error> {
-        tx.execute(
-            sqlx::query(
-                r#"
-                INSERT INTO market_instruments 
-                (epic, instrument_name, instrument_type, node_id, exchange, expiry,
-                 high_limit_price, low_limit_price, market_status, net_change, 
-                 percentage_change, update_time, update_time_utc, bid, offer, 
-                 created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                ON CONFLICT (epic) DO UPDATE SET
-                    instrument_name = EXCLUDED.instrument_name,
-                    instrument_type = EXCLUDED.instrument_type,
-                    node_id = EXCLUDED.node_id,
-                    exchange = EXCLUDED.exchange,
-                    expiry = EXCLUDED.expiry,
-                    high_limit_price = EXCLUDED.high_limit_price,
-                    low_limit_price = EXCLUDED.low_limit_price,
-                    market_status = EXCLUDED.market_status,
-                    net_change = EXCLUDED.net_change,
-                    percentage_change = EXCLUDED.percentage_change,
-                    update_time = EXCLUDED.update_time,
-                    update_time_utc = EXCLUDED.update_time_utc,
-                    bid = EXCLUDED.bid,
-                    offer = EXCLUDED.offer,
-                    updated_at = EXCLUDED.updated_at
-                "#,
-            )
-            .bind(&instrument.epic)
-            .bind(&instrument.instrument_name)
-            .bind(&instrument.instrument_type)
-            .bind(&instrument.node_id)
-            .bind(&instrument.exchange)
-            .bind(&instrument.expiry)
-            .bind(instrument.high_limit_price)
-            .bind(instrument.low_limit_price)
-            .bind(&instrument.market_status)
-            .bind(instrument.net_change)
-            .bind(instrument.percentage_change)
-            .bind(&instrument.update_time)
-            .bind(instrument.update_time_utc)
-            .bind(instrument.bid)
-            .bind(instrument.offer)
-            .bind(instrument.created_at)
-            .bind(instrument.updated_at),
-        )
-        .await?;
-
-        Ok(())
-    }
-
     /// Retrieves market hierarchy from the database
     pub async fn get_market_hierarchy(&self) -> Result<Vec<MarketHierarchyNode>, sqlx::Error> {
         let nodes = sqlx::query_as::<_, MarketHierarchyNode>(
@@ -656,6 +600,217 @@ impl MarketDatabaseService {
             max_hierarchy_depth: max_depth,
         })
     }
+}
+
+/// Counts `(nodes, instruments)` across the whole hierarchy (including
+/// descendants) so the flattened storage vectors can be pre-allocated exactly.
+fn count_hierarchy(nodes: &[MarketNode]) -> (usize, usize) {
+    let mut node_count = 0usize;
+    let mut instrument_count = 0usize;
+    for node in nodes {
+        node_count += 1;
+        instrument_count += node.markets.len();
+        let (child_nodes, child_instruments) = count_hierarchy(&node.children);
+        node_count += child_nodes;
+        instrument_count += child_instruments;
+    }
+    (node_count, instrument_count)
+}
+
+/// Dedupes `items` by a string primary key.
+///
+/// Keeps the first occurrence's position (preserving topological order for the
+/// self-referential `parent_id` FK) while adopting the last occurrence's data,
+/// reproducing the previous per-row `ON CONFLICT DO UPDATE` last-wins behaviour.
+/// This is required because a multi-row `INSERT ... ON CONFLICT DO UPDATE`
+/// errors if the same key appears twice in one statement.
+fn dedupe_by_key<T, F>(items: Vec<T>, key: F) -> Vec<T>
+where
+    F: Fn(&T) -> &str,
+{
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(items.len());
+    let mut deduped: Vec<T> = Vec::with_capacity(items.len());
+    for item in items {
+        let k = key(&item).to_owned();
+        if let Some(&i) = index.get(&k) {
+            deduped[i] = item;
+        } else {
+            index.insert(k, deduped.len());
+            deduped.push(item);
+        }
+    }
+    deduped
+}
+
+/// Inserts a batch of hierarchy nodes with a single multi-row statement.
+///
+/// Values are bound as parallel arrays and expanded server-side via `UNNEST`;
+/// no value is interpolated into the SQL string.
+async fn insert_hierarchy_nodes_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    nodes: &[MarketHierarchyNode],
+) -> Result<(), sqlx::Error> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+
+    let len = nodes.len();
+    let mut ids: Vec<String> = Vec::with_capacity(len);
+    let mut names: Vec<String> = Vec::with_capacity(len);
+    let mut parent_ids: Vec<Option<String>> = Vec::with_capacity(len);
+    let mut exchanges: Vec<String> = Vec::with_capacity(len);
+    let mut levels: Vec<i32> = Vec::with_capacity(len);
+    let mut paths: Vec<String> = Vec::with_capacity(len);
+    let mut created_ats: Vec<DateTime<Utc>> = Vec::with_capacity(len);
+    let mut updated_ats: Vec<DateTime<Utc>> = Vec::with_capacity(len);
+
+    for node in nodes {
+        ids.push(node.id.clone());
+        names.push(node.name.clone());
+        parent_ids.push(node.parent_id.clone());
+        exchanges.push(node.exchange.clone());
+        levels.push(node.level);
+        paths.push(node.path.clone());
+        created_ats.push(node.created_at);
+        updated_ats.push(node.updated_at);
+    }
+
+    tx.execute(
+        sqlx::query(
+            r#"
+            INSERT INTO market_hierarchy_nodes
+                (id, name, parent_id, exchange, level, path, created_at, updated_at)
+            SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[],
+                $5::int4[], $6::text[], $7::timestamptz[], $8::timestamptz[]
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                parent_id = EXCLUDED.parent_id,
+                exchange = EXCLUDED.exchange,
+                level = EXCLUDED.level,
+                path = EXCLUDED.path,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(ids)
+        .bind(names)
+        .bind(parent_ids)
+        .bind(exchanges)
+        .bind(levels)
+        .bind(paths)
+        .bind(created_ats)
+        .bind(updated_ats),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Inserts a batch of market instruments with a single multi-row statement.
+///
+/// Values are bound as parallel arrays and expanded server-side via `UNNEST`;
+/// no value is interpolated into the SQL string.
+async fn insert_market_instruments_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instruments: &[MarketInstrument],
+) -> Result<(), sqlx::Error> {
+    if instruments.is_empty() {
+        return Ok(());
+    }
+
+    let len = instruments.len();
+    let mut epics: Vec<String> = Vec::with_capacity(len);
+    let mut instrument_names: Vec<String> = Vec::with_capacity(len);
+    let mut instrument_types: Vec<String> = Vec::with_capacity(len);
+    let mut node_ids: Vec<String> = Vec::with_capacity(len);
+    let mut exchanges: Vec<String> = Vec::with_capacity(len);
+    let mut expiries: Vec<String> = Vec::with_capacity(len);
+    let mut high_limit_prices: Vec<Option<f64>> = Vec::with_capacity(len);
+    let mut low_limit_prices: Vec<Option<f64>> = Vec::with_capacity(len);
+    let mut market_statuses: Vec<String> = Vec::with_capacity(len);
+    let mut net_changes: Vec<Option<f64>> = Vec::with_capacity(len);
+    let mut percentage_changes: Vec<Option<f64>> = Vec::with_capacity(len);
+    let mut update_times: Vec<Option<String>> = Vec::with_capacity(len);
+    let mut update_time_utcs: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(len);
+    let mut bids: Vec<Option<f64>> = Vec::with_capacity(len);
+    let mut offers: Vec<Option<f64>> = Vec::with_capacity(len);
+    let mut created_ats: Vec<DateTime<Utc>> = Vec::with_capacity(len);
+    let mut updated_ats: Vec<DateTime<Utc>> = Vec::with_capacity(len);
+
+    for instrument in instruments {
+        epics.push(instrument.epic.clone());
+        instrument_names.push(instrument.instrument_name.clone());
+        instrument_types.push(instrument.instrument_type.clone());
+        node_ids.push(instrument.node_id.clone());
+        exchanges.push(instrument.exchange.clone());
+        expiries.push(instrument.expiry.clone());
+        high_limit_prices.push(instrument.high_limit_price);
+        low_limit_prices.push(instrument.low_limit_price);
+        market_statuses.push(instrument.market_status.clone());
+        net_changes.push(instrument.net_change);
+        percentage_changes.push(instrument.percentage_change);
+        update_times.push(instrument.update_time.clone());
+        update_time_utcs.push(instrument.update_time_utc);
+        bids.push(instrument.bid);
+        offers.push(instrument.offer);
+        created_ats.push(instrument.created_at);
+        updated_ats.push(instrument.updated_at);
+    }
+
+    tx.execute(
+        sqlx::query(
+            r#"
+            INSERT INTO market_instruments
+                (epic, instrument_name, instrument_type, node_id, exchange, expiry,
+                 high_limit_price, low_limit_price, market_status, net_change,
+                 percentage_change, update_time, update_time_utc, bid, offer,
+                 created_at, updated_at)
+            SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                $7::float8[], $8::float8[], $9::text[], $10::float8[], $11::float8[],
+                $12::text[], $13::timestamptz[], $14::float8[], $15::float8[],
+                $16::timestamptz[], $17::timestamptz[]
+            )
+            ON CONFLICT (epic) DO UPDATE SET
+                instrument_name = EXCLUDED.instrument_name,
+                instrument_type = EXCLUDED.instrument_type,
+                node_id = EXCLUDED.node_id,
+                exchange = EXCLUDED.exchange,
+                expiry = EXCLUDED.expiry,
+                high_limit_price = EXCLUDED.high_limit_price,
+                low_limit_price = EXCLUDED.low_limit_price,
+                market_status = EXCLUDED.market_status,
+                net_change = EXCLUDED.net_change,
+                percentage_change = EXCLUDED.percentage_change,
+                update_time = EXCLUDED.update_time,
+                update_time_utc = EXCLUDED.update_time_utc,
+                bid = EXCLUDED.bid,
+                offer = EXCLUDED.offer,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(epics)
+        .bind(instrument_names)
+        .bind(instrument_types)
+        .bind(node_ids)
+        .bind(exchanges)
+        .bind(expiries)
+        .bind(high_limit_prices)
+        .bind(low_limit_prices)
+        .bind(market_statuses)
+        .bind(net_changes)
+        .bind(percentage_changes)
+        .bind(update_times)
+        .bind(update_time_utcs)
+        .bind(bids)
+        .bind(offers)
+        .bind(created_ats)
+        .bind(updated_ats),
+    )
+    .await?;
+
+    Ok(())
 }
 
 /// Statistics about the stored market data
@@ -762,5 +917,83 @@ mod tests {
             .instrument_type;
         assert_eq!(currencies, "CURRENCIES");
         assert!(!currencies.contains('"'));
+    }
+
+    fn market_node(id: &str, children: Vec<MarketNode>, markets: usize) -> MarketNode {
+        MarketNode {
+            id: id.to_string(),
+            name: format!("Node {id}"),
+            children,
+            markets: (0..markets)
+                .map(|_| market_data_with_type(InstrumentType::Indices))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_count_hierarchy_counts_nodes_and_markets_recursively() {
+        // root(2 markets) -> child_a(1 market) -> grandchild(3 markets)
+        //                 -> child_b(0 markets)
+        let grandchild = market_node("gc", vec![], 3);
+        let child_a = market_node("a", vec![grandchild], 1);
+        let child_b = market_node("b", vec![], 0);
+        let root = market_node("root", vec![child_a, child_b], 2);
+
+        let (nodes, instruments) = count_hierarchy(&[root]);
+        assert_eq!(nodes, 4, "root + a + gc + b");
+        assert_eq!(instruments, 6, "2 + 1 + 3 + 0");
+    }
+
+    #[test]
+    fn test_count_hierarchy_empty_is_zero() {
+        assert_eq!(count_hierarchy(&[]), (0, 0));
+    }
+
+    #[test]
+    fn test_dedupe_by_key_keeps_first_position_last_data() {
+        let node = |id: &str, name: &str| MarketHierarchyNode {
+            id: id.to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            exchange: "IG".to_string(),
+            level: 0,
+            path: format!("/{name}"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let input = vec![
+            node("parent", "Parent"),
+            node("child", "Child"),
+            node("parent", "Parent Updated"),
+        ];
+
+        let deduped = dedupe_by_key(input, |n| &n.id);
+
+        // Two unique ids remain.
+        assert_eq!(deduped.len(), 2);
+        // First occurrence position preserved: "parent" is still index 0 so it
+        // is inserted before any child that references it (FK safety).
+        assert_eq!(deduped[0].id, "parent");
+        assert_eq!(deduped[1].id, "child");
+        // Last occurrence's data won.
+        assert_eq!(deduped[0].name, "Parent Updated");
+    }
+
+    #[test]
+    fn test_dedupe_by_key_no_duplicates_is_identity_order() {
+        let inst = |epic: &str| {
+            MarketInstrument::new(
+                epic.to_string(),
+                epic.to_string(),
+                "INDICES".to_string(),
+                "node".to_string(),
+                "IG".to_string(),
+            )
+        };
+
+        let deduped = dedupe_by_key(vec![inst("A"), inst("B"), inst("C")], |i| &i.epic);
+        let epics: Vec<&str> = deduped.iter().map(|i| i.epic.as_str()).collect();
+        assert_eq!(epics, ["A", "B", "C"]);
     }
 }

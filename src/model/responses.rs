@@ -358,6 +358,7 @@ impl PositionsResponse {
     ///
     /// # Returns
     /// A vector of positions with unique epics
+    #[must_use]
     pub fn compact_by_epic(positions: Vec<Position>) -> Vec<Position> {
         let mut epic_map: HashMap<String, Position> = std::collections::HashMap::new();
 

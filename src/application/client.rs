@@ -47,6 +47,7 @@ use crate::prelude::{
 use crate::presentation::market::{MarketData, MarketDetails};
 use crate::presentation::price::PriceData;
 use async_trait::async_trait;
+use futures::StreamExt;
 use lightstreamer_rs::client::{LightstreamerClient, LogType, Transport};
 use lightstreamer_rs::subscription::{
     ChannelSubscriptionListener, Snapshot, Subscription, SubscriptionMode,
@@ -63,6 +64,13 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const MAX_CONNECTION_ATTEMPTS: u64 = 3;
+
+/// Maximum number of concurrent `get_market_details` requests issued while
+/// resolving per-symbol expiry dates in [`Client::get_vec_db_entries`].
+///
+/// Kept small so the shared [`RateLimiter`] stays in control: this only overlaps
+/// network latency, it does not widen the request budget.
+const MARKET_DETAILS_CONCURRENCY: usize = 6;
 
 /// Server-supplied close reason IG sends on a streaming session once it has no
 /// active subscriptions left to serve.
@@ -436,8 +444,17 @@ impl MarketService for Client {
             root_response.markets.len()
         );
 
-        let mut all_markets = root_response.markets.clone();
-        let mut nodes_to_process = root_response.nodes.clone();
+        // Move the root response fields out instead of cloning the (potentially
+        // large) DTO. The same market epic can appear under multiple navigation
+        // nodes, so track seen epics and keep only the first occurrence.
+        let mut seen_epics: HashSet<String> = HashSet::new();
+        let mut all_markets: Vec<MarketData> = Vec::new();
+        for market in root_response.markets {
+            if seen_epics.insert(market.epic.clone()) {
+                all_markets.push(market);
+            }
+        }
+        let mut nodes_to_process = root_response.nodes;
         let mut processed_levels = 0;
 
         while !nodes_to_process.is_empty() && processed_levels < max_depth {
@@ -463,8 +480,14 @@ impl MarketService for Client {
                             );
                         }
 
-                        all_markets.extend(node_response.markets);
-                        level_market_count += node_markets;
+                        // Deduplicate by epic across nodes to avoid storing the
+                        // same market many times.
+                        for market in node_response.markets {
+                            if seen_epics.insert(market.epic.clone()) {
+                                all_markets.push(market);
+                                level_market_count += 1;
+                            }
+                        }
                         next_level_nodes.extend(node_response.nodes);
                     }
                     Err(e) => {
@@ -512,52 +535,63 @@ impl MarketService for Client {
 
         info!("Created {} DB entries from markets", vec_db_entries.len());
 
-        // Collect unique symbols
-        let unique_symbols: std::collections::HashSet<String> = vec_db_entries
-            .iter()
-            .map(|entry| entry.symbol.clone())
-            .filter(|symbol| !symbol.is_empty())
-            .collect();
+        // Build `symbol -> (representative epic, fallback expiry)` in ONE pass
+        // instead of re-scanning the full entries Vec per unique symbol
+        // (previously O(symbols x entries)). The first entry seen for a symbol
+        // supplies both the epic to query and the fallback expiry, matching the
+        // previous `find`-first behaviour.
+        let mut symbol_info: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        for entry in &vec_db_entries {
+            if entry.symbol.is_empty() || entry.epic.is_empty() {
+                continue;
+            }
+            symbol_info
+                .entry(entry.symbol.clone())
+                .or_insert_with(|| (entry.epic.clone(), entry.expiry.clone()));
+        }
 
         info!(
             "Found {} unique symbols to fetch expiry dates for",
-            unique_symbols.len()
+            symbol_info.len()
         );
 
-        let mut symbol_expiry_map: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        // Fetch market details with bounded concurrency. The shared `RateLimiter`
+        // still paces the underlying requests; `buffer_unordered` just overlaps
+        // the network latency instead of issuing one request at a time.
+        let symbol_expiry_map: std::collections::HashMap<String, String> =
+            futures::stream::iter(symbol_info)
+                .map(|(symbol, (epic, fallback_expiry))| async move {
+                    match self.get_market_details(&epic).await {
+                        Ok(market_details) => {
+                            let expiry_date = market_details
+                                .instrument
+                                .expiry_details
+                                .as_ref()
+                                .map(|details| details.last_dealing_date.clone())
+                                .unwrap_or_else(|| market_details.instrument.expiry.clone());
 
-        for symbol in unique_symbols {
-            if let Some(entry) = vec_db_entries
-                .iter()
-                .find(|e| e.symbol == symbol && !e.epic.is_empty())
-            {
-                match self.get_market_details(&entry.epic).await {
-                    Ok(market_details) => {
-                        let expiry_date = market_details
-                            .instrument
-                            .expiry_details
-                            .as_ref()
-                            .map(|details| details.last_dealing_date.clone())
-                            .unwrap_or_else(|| market_details.instrument.expiry.clone());
-
-                        symbol_expiry_map.insert(symbol.clone(), expiry_date);
-                        if let Some(expiry) = symbol_expiry_map.get(&symbol) {
-                            info!("Fetched expiry date for symbol {}: {}", symbol, expiry);
+                            info!(
+                                symbol = %symbol,
+                                expiry = %expiry_date,
+                                "fetched expiry date for symbol"
+                            );
+                            (symbol, expiry_date)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to get market details for epic {} (symbol {}): {:?}",
+                                epic,
+                                symbol,
+                                e
+                            );
+                            (symbol, fallback_expiry)
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to get market details for epic {} (symbol {}): {:?}",
-                            entry.epic,
-                            symbol,
-                            e
-                        );
-                        symbol_expiry_map.insert(symbol.clone(), entry.expiry.clone());
-                    }
-                }
-            }
-        }
+                })
+                .buffer_unordered(MARKET_DETAILS_CONCURRENCY)
+                .collect()
+                .await;
 
         for entry in &mut vec_db_entries {
             if let Some(expiry_date) = symbol_expiry_map.get(&entry.symbol) {
