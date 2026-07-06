@@ -24,11 +24,14 @@ pub struct RecentPricesRequest<'a> {
     /// Optional end date time (yyyy-MM-dd'T'HH:mm:ss)
     pub to: Option<&'a str>,
     /// Optional max number of price points (default: 10)
-    pub max_points: Option<i32>,
+    #[serde(rename = "max")]
+    pub max_points: Option<u32>,
     /// Optional page size (default: 20, disable paging = 0)
-    pub page_size: Option<i32>,
+    #[serde(rename = "pageSize")]
+    pub page_size: Option<u32>,
     /// Optional page number (default: 1)
-    pub page_number: Option<i32>,
+    #[serde(rename = "pageNumber")]
+    pub page_number: Option<u32>,
 }
 
 impl<'a> RecentPricesRequest<'a> {
@@ -64,21 +67,21 @@ impl<'a> RecentPricesRequest<'a> {
 
     /// Set the max points
     #[must_use]
-    pub fn with_max_points(mut self, max_points: i32) -> Self {
+    pub fn with_max_points(mut self, max_points: u32) -> Self {
         self.max_points = Some(max_points);
         self
     }
 
     /// Set the page size
     #[must_use]
-    pub fn with_page_size(mut self, page_size: i32) -> Self {
+    pub fn with_page_size(mut self, page_size: u32) -> Self {
         self.page_size = Some(page_size);
         self
     }
 
     /// Set the page number
     #[must_use]
-    pub fn with_page_number(mut self, page_number: i32) -> Self {
+    pub fn with_page_number(mut self, page_number: u32) -> Self {
         self.page_number = Some(page_number);
         self
     }

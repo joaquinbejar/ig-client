@@ -396,7 +396,7 @@ pub struct PresentationMarketData {
     /// Name of the item this data belongs to
     pub item_name: String,
     /// Position of the item in the subscription
-    pub item_pos: i32,
+    pub item_pos: usize,
     /// All market fields
     pub fields: MarketFields,
     /// Fields that have changed in this update
@@ -434,7 +434,7 @@ impl PresentationMarketData {
 
         Ok(PresentationMarketData {
             item_name: item_name.unwrap_or_default().to_string(),
-            item_pos: item_pos as i32,
+            item_pos,
             fields,
             changed_fields,
             is_snapshot,
@@ -612,10 +612,10 @@ pub struct CategoryInstrument {
 pub struct CategoryInstrumentsMetadata {
     /// Current page number
     #[serde(rename = "pageNumber")]
-    pub page_number: i32,
+    pub page_number: i64,
     /// Number of items per page
     #[serde(rename = "pageSize")]
-    pub page_size: i32,
+    pub page_size: i64,
 }
 
 /// Fields containing market price and status information
@@ -745,6 +745,25 @@ mod tests {
         };
         assert!(!market.is_call());
         assert!(!market.is_put());
+    }
+
+    #[test]
+    fn test_category_instruments_metadata_deserialize_and_roundtrip() {
+        // Sanitized shape of the `metadata` object IG returns from
+        // `categories/{id}/instruments`. `pageNumber` / `pageSize` are i64.
+        let json = r#"{ "pageNumber": 2, "pageSize": 1000 }"#;
+
+        let meta: CategoryInstrumentsMetadata =
+            serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(meta.page_number, 2);
+        assert_eq!(meta.page_size, 1000);
+
+        let serialized = serde_json::to_string(&meta).expect("serialize failed");
+        let re: CategoryInstrumentsMetadata =
+            serde_json::from_str(&serialized).expect("re-deserialize failed");
+        assert_eq!(re, meta);
+        assert!(serialized.contains("\"pageNumber\":2"));
+        assert!(serialized.contains("\"pageSize\":1000"));
     }
 
     #[test]

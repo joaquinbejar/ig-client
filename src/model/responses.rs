@@ -985,13 +985,13 @@ pub struct ApplicationDetailsResponse {
     pub status: String,
     /// Overall allowance for the account
     #[serde(rename = "allowanceAccountOverall")]
-    pub allowance_account_overall: Option<i32>,
+    pub allowance_account_overall: Option<i64>,
     /// Trading allowance for the account
     #[serde(rename = "allowanceAccountTrading")]
-    pub allowance_account_trading: Option<i32>,
+    pub allowance_account_trading: Option<i64>,
     /// Concurrent connections allowance
     #[serde(rename = "concurrentSubscriptionsLimit")]
-    pub concurrent_subscriptions_limit: Option<i32>,
+    pub concurrent_subscriptions_limit: Option<i64>,
     /// Creation date
     #[serde(rename = "createdDate")]
     pub created_date: Option<String>,
@@ -1009,13 +1009,13 @@ pub struct ApplicationInfo {
     pub status: String,
     /// Overall allowance for the account
     #[serde(rename = "allowanceAccountOverall")]
-    pub allowance_account_overall: Option<i32>,
+    pub allowance_account_overall: Option<i64>,
     /// Trading allowance for the account
     #[serde(rename = "allowanceAccountTrading")]
-    pub allowance_account_trading: Option<i32>,
+    pub allowance_account_trading: Option<i64>,
     /// Concurrent connections allowance
     #[serde(rename = "concurrentSubscriptionsLimit")]
-    pub concurrent_subscriptions_limit: Option<i32>,
+    pub concurrent_subscriptions_limit: Option<i64>,
     /// Creation date
     #[serde(rename = "createdDate")]
     pub created_date: Option<String>,
@@ -1450,11 +1450,13 @@ mod tests {
 
     #[test]
     fn test_application_details_response_deserialize_and_roundtrip() {
+        // `allowanceAccountOverall` is deliberately > i32::MAX (2_147_483_647)
+        // to prove the field widening to i64 — an i32 field would overflow here.
         let json = r#"{
             "apiKey": "FAKE-API-KEY",
             "name": "My App",
             "status": "ENABLED",
-            "allowanceAccountOverall": 10000,
+            "allowanceAccountOverall": 3000000000,
             "allowanceAccountTrading": 1000,
             "concurrentSubscriptionsLimit": 40,
             "createdDate": "2025-01-01"
@@ -1465,12 +1467,40 @@ mod tests {
         assert_eq!(resp.api_key, "FAKE-API-KEY");
         assert_eq!(resp.name.as_deref(), Some("My App"));
         assert_eq!(resp.status, "ENABLED");
-        assert_eq!(resp.allowance_account_overall, Some(10000));
+        assert!(resp.allowance_account_overall > Some(i64::from(i32::MAX)));
+        assert_eq!(resp.allowance_account_overall, Some(3_000_000_000));
         assert_eq!(resp.concurrent_subscriptions_limit, Some(40));
 
         let re = roundtrip(&resp);
         assert_eq!(re.api_key, "FAKE-API-KEY");
+        assert_eq!(re.allowance_account_overall, Some(3_000_000_000));
         assert_eq!(re.allowance_account_trading, Some(1000));
+    }
+
+    #[test]
+    fn test_application_info_deserialize_and_roundtrip() {
+        // Mirrors `ApplicationDetailsResponse`; the overall allowance again
+        // exceeds i32::MAX to lock in the i64 widening for `ApplicationInfo`.
+        let json = r#"{
+            "apiKey": "FAKE-API-KEY",
+            "name": "My App",
+            "status": "ENABLED",
+            "allowanceAccountOverall": 3000000000,
+            "allowanceAccountTrading": 1000,
+            "concurrentSubscriptionsLimit": 40,
+            "createdDate": "2025-01-01"
+        }"#;
+
+        let resp: ApplicationInfo = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(resp.api_key, "FAKE-API-KEY");
+        assert!(resp.allowance_account_overall > Some(i64::from(i32::MAX)));
+        assert_eq!(resp.allowance_account_overall, Some(3_000_000_000));
+        assert_eq!(resp.allowance_account_trading, Some(1000));
+        assert_eq!(resp.concurrent_subscriptions_limit, Some(40));
+
+        let re = roundtrip(&resp);
+        assert_eq!(re.allowance_account_overall, Some(3_000_000_000));
+        assert_eq!(re.concurrent_subscriptions_limit, Some(40));
     }
 
     #[test]

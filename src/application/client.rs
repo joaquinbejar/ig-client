@@ -376,7 +376,7 @@ impl MarketService for Client {
         &self,
         epic: &str,
         resolution: &str,
-        num_points: i32,
+        num_points: u32,
     ) -> Result<HistoricalPricesResponse, AppError> {
         let path = format!("prices/{}/{}/{}", epic, resolution, num_points);
         info!(
@@ -396,7 +396,7 @@ impl MarketService for Client {
         &self,
         epic: &str,
         resolution: &str,
-        num_points: i32,
+        num_points: u32,
     ) -> Result<HistoricalPricesResponse, AppError> {
         let path = format!("prices/{}/{}/{}", epic, resolution, num_points);
         info!(
@@ -616,8 +616,8 @@ impl MarketService for Client {
     async fn get_category_instruments(
         &self,
         category_id: &str,
-        page_number: Option<i32>,
-        page_size: Option<i32>,
+        page_number: Option<u32>,
+        page_size: Option<u32>,
     ) -> Result<CategoryInstrumentsResponse, AppError> {
         let mut path = format!("categories/{}/instruments", category_id);
 

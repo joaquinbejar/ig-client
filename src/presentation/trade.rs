@@ -12,7 +12,7 @@ pub struct TradeData {
     /// Name of the subscribed item
     pub item_name: String,
     /// Position of the item in the subscription
-    pub item_pos: i32,
+    pub item_pos: usize,
     /// Trade fields data
     pub fields: TradeFields,
     /// Changed fields data
@@ -202,7 +202,7 @@ impl TradeData {
 
         Ok(TradeData {
             item_name: item_name.unwrap_or_default().to_string(),
-            item_pos: item_pos as i32,
+            item_pos,
             fields,
             changed_fields,
             is_snapshot,

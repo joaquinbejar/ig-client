@@ -29,8 +29,8 @@ async fn main() -> IgResult<()> {
         .unwrap_or_else(|| "VANILLA_OPTIONS".to_string());
 
     // Optional pagination parameters
-    let page_number: Option<i32> = std::env::args().nth(2).and_then(|s| s.parse().ok());
-    let page_size: Option<i32> = std::env::args().nth(3).and_then(|s| s.parse().ok());
+    let page_number: Option<u32> = std::env::args().nth(2).and_then(|s| s.parse().ok());
+    let page_size: Option<u32> = std::env::args().nth(3).and_then(|s| s.parse().ok());
 
     info!(
         "Fetching instruments for category: {} (page: {:?}, size: {:?})",

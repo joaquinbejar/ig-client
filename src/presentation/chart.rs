@@ -51,7 +51,7 @@ pub struct ChartData {
     /// The full Lightstreamer item name (e.g., `CHART:EPIC:TIMESCALE`)
     pub item_name: String,
     /// The 1-based position of the item in the subscription
-    pub item_pos: i32,
+    pub item_pos: usize,
     /// Resolved chart scale for this update (derived from item name or `scale`)
     #[serde(default)]
     pub scale: ChartScale, // Derived from the item name or the {scale} field
@@ -277,7 +277,7 @@ impl ChartData {
 
         Ok(ChartData {
             item_name: item_name.unwrap_or_default().to_string(),
-            item_pos: item_pos as i32,
+            item_pos,
             scale,
             fields: parsed_fields,
             changed_fields: parsed_changed_fields,

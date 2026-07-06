@@ -25,6 +25,23 @@ fn recent_prices_request_builders() {
     assert_eq!(req.max_points, Some(100));
     assert_eq!(req.page_size, Some(50));
     assert_eq!(req.page_number, Some(2));
+
+    // The numeric paging fields must serialize to IG's wire names: the count
+    // fields are renamed to `max` / `pageSize` / `pageNumber`.
+    let json = json_value(&req);
+    assert_eq!(json.get("max").unwrap(), 100);
+    assert_eq!(json.get("pageSize").unwrap(), 50);
+    assert_eq!(json.get("pageNumber").unwrap(), 2);
+    assert!(json.get("max_points").is_none());
+    assert!(json.get("page_size").is_none());
+    assert!(json.get("page_number").is_none());
+
+    // Round-trip through the renamed shape.
+    let raw = serde_json::to_string(&req).unwrap();
+    let re: RecentPricesRequest<'_> = serde_json::from_str(&raw).unwrap();
+    assert_eq!(re.max_points, Some(100));
+    assert_eq!(re.page_size, Some(50));
+    assert_eq!(re.page_number, Some(2));
 }
 
 #[test]

@@ -17,7 +17,7 @@ async fn main() -> IgResult<()> {
         .nth(2)
         .unwrap_or_else(|| "HOUR".to_string());
 
-    let num_points: i32 = std::env::args()
+    let num_points: u32 = std::env::args()
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
