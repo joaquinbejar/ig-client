@@ -13,7 +13,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
     // Create client - authentication happens automatically
     info!("Creating client and authenticating...");
-    let client = Client::default();
+    let client = Client::try_new()?;
     info!("✓ Client created and authenticated");
 
     let epic = "OP.D.OTCGC3.4050C.IP";

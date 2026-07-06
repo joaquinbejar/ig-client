@@ -32,7 +32,7 @@ async fn main() -> Result<(), AppError> {
         EPICS.len()
     );
 
-    let client = Client::default();
+    let client = Client::try_new()?;
     info!("Client created and authenticated");
 
     for epic in EPICS {

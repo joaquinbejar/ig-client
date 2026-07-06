@@ -21,7 +21,7 @@ fn callback(update: &PriceData) -> Result<(), AppError> {
 #[tokio::main]
 async fn main() -> Result<(), ig_client::error::AppError> {
     setup_logger();
-    let http_client = Client::default();
+    let http_client = Client::try_new()?;
     let ws_info = http_client.ws_info().await?;
     let password = ws_info.get_ws_password();
     debug!(

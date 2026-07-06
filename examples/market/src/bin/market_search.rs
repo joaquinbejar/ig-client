@@ -6,7 +6,7 @@ use tracing::info;
 async fn main() -> IgResult<()> {
     setup_logger();
 
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Get the search term from command line arguments or use a default
     let search_term = std::env::args()

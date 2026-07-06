@@ -24,7 +24,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting preferences example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     println!("\n=== Account Preferences ===\n");
 

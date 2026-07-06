@@ -24,7 +24,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting watchlist create example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let watchlist_name = "My API Watchlist";
     let initial_epics = vec![

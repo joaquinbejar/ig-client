@@ -27,7 +27,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting costs close example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let deal_id = std::env::args()
         .nth(1)

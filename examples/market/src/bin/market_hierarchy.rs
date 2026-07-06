@@ -7,7 +7,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     // Configure logger with more detail for debugging
     setup_logger();
 
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     match client.get_market_navigation().await {
         Ok(response) => {

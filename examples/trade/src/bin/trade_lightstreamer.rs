@@ -19,7 +19,7 @@ fn callback(update: &TradeData) -> Result<(), AppError> {
 #[tokio::main]
 async fn main() -> Result<(), ig_client::error::AppError> {
     setup_logger();
-    let client = Client::default();
+    let client = Client::try_new()?;
     let ws_info = client.ws_info().await?;
     let password = ws_info.get_ws_password();
 

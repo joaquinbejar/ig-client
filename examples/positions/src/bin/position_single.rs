@@ -24,7 +24,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting position single example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     let deal_id = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("Usage: cargo run --bin position_single -- <DEAL_ID>");

@@ -10,7 +10,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG CFD Order Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     let epic = "CS.D.EURUSD.CEEM.IP"; // Example epic for testing
     let _expiry = Some(

@@ -25,7 +25,7 @@ async fn main() -> Result<(), AppError> {
 
     info!("Starting watchlist CRUD example");
 
-    let client = Client::new();
+    let client = Client::try_new()?;
 
     println!("\n=== Step 1: Create Watchlist ===");
     let result = client.create_watchlist("CRUD Test Watchlist", None).await?;

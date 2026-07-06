@@ -9,7 +9,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== IG Positions Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Get open positions
     info!("Fetching open positions...");

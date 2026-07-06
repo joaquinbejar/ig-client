@@ -21,7 +21,7 @@ use tracing::info;
 async fn main() -> IgResult<()> {
     setup_logger();
 
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Get the category ID from command line arguments or use VANILLA_OPTIONS as default
     let category_id = std::env::args()

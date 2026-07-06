@@ -8,7 +8,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== Activity Example ===");
 
     // Create client
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Get account activity with detailed information
     info!("Fetching account activity with details...");

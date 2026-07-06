@@ -9,7 +9,7 @@ const BATCH_SIZE: usize = 25; // Number of EPICs to process before saving result
 async fn main() -> IgResult<()> {
     // Set up logging
     setup_logger();
-    let client = Client::default();
+    let client = Client::try_new()?;
 
     // Get the EPICs from command line arguments or use the default range
     let epics_arg = std::env::args().nth(1);

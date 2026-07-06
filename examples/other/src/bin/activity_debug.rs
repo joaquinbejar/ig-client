@@ -8,8 +8,8 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("=== Activity Debug Example ===");
 
     // Create HTTP client and config
-    let http_client = HttpClient::default();
     let config = Config::default();
+    let http_client = HttpClient::new_lazy(config.clone())?;
     let session = http_client.get_session().await?;
     info!("Session started successfully");
 

@@ -177,27 +177,11 @@ pub struct Client {
 }
 
 impl Client {
-    /// Creates a new client instance
-    ///
-    /// # Returns
-    /// A new Client with default configuration
-    ///
-    /// # Panics
-    /// Panics if the underlying [`HttpClient`] cannot be constructed at
-    /// startup — typically a missing TLS backend, but also invalid proxy or
-    /// certificate configuration. This is an unrecoverable environment
-    /// invariant at construction time. For graceful handling use
-    /// [`Client::try_new`], which returns a typed [`AppError`] instead of
-    /// panicking.
-    pub fn new() -> Self {
-        Self::try_new().expect("failed to create HTTP client")
-    }
-
     /// Creates a new client instance without performing initial authentication,
     /// returning an error if the underlying HTTP client cannot be constructed.
     ///
-    /// This is the fallible counterpart to [`Client::new`]: it builds the
-    /// underlying [`HttpClient`] via [`HttpClient::new_lazy`] and surfaces a
+    /// This is the sole constructor for [`Client`]: it builds the underlying
+    /// [`HttpClient`] via [`HttpClient::new_lazy`] and surfaces a
     /// client-construction failure as a typed [`AppError`] instead of panicking.
     ///
     /// # Returns
@@ -238,12 +222,6 @@ impl Client {
     )]
     pub async fn get_ws_info(&self) -> WebsocketInfo {
         self.ws_info().await.unwrap_or_default()
-    }
-}
-
-impl Default for Client {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1295,7 +1273,8 @@ impl StreamerClient {
     /// Returns [`AppError`] if the login / session lookup or Lightstreamer
     /// client initialization fails.
     pub async fn new() -> Result<Self, AppError> {
-        Self::with_client(&Client::new()).await
+        let client = Client::try_new()?;
+        Self::with_client(&client).await
     }
 
     /// Creates a new streaming client that reuses the caller's existing REST
