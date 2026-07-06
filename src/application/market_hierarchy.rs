@@ -3,9 +3,19 @@
    Email: jb@taunais.com
    Date: 20/10/25
 ******************************************************************************/
-use crate::prelude::{
-    AppError, Client, IgResult, MarketData, MarketNavigationResponse, MarketNode, MarketService,
-};
+
+//! Market navigation hierarchy traversal.
+//!
+//! These helpers drive HTTP calls through `Client` (via the
+//! [`MarketService`](crate::application::interfaces::market::MarketService)
+//! trait), so they live in the application layer rather than the pure `model`
+//! layer.
+
+use crate::application::client::Client;
+use crate::application::interfaces::market::MarketService;
+use crate::error::AppError;
+use crate::model::responses::MarketNavigationResponse;
+use crate::presentation::market::{MarketData, MarketNode};
 use std::future::Future;
 use std::pin::Pin;
 use tracing::{debug, error, info};
@@ -19,11 +29,15 @@ use tracing::{debug, error, info};
 ///
 /// # Returns
 /// Vector of MarketNode representing the hierarchy at this level
+///
+/// # Errors
+/// Returns [`AppError`] when a navigation request fails with a non-recoverable
+/// error (rate limits and generic API errors degrade to partial results).
 pub fn build_market_hierarchy<'a>(
     client: &'a Client,
     node_id: Option<&'a str>,
     depth: usize,
-) -> Pin<Box<dyn Future<Output = IgResult<Vec<MarketNode>>> + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<Vec<MarketNode>, AppError>> + 'a>> {
     Box::pin(async move {
         // Limit the depth to avoid infinite loops
         if depth > 7 {

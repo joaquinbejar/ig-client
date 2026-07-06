@@ -4,6 +4,14 @@
    Date: 20/10/25
 ******************************************************************************/
 
+//! HTTP client and request execution for the IG Markets API.
+//!
+//! This module owns all outbound HTTP I/O: the shared `reqwest` client, rate
+//! limiting, finite retry with backoff, and the automatic token
+//! refresh-and-replay contract. It lives in the `application` layer because it
+//! depends on `Auth`, `Session`, `Config` and `RateLimiter` — the pure `model`
+//! layer must not perform I/O.
+
 use crate::application::auth::{Auth, Session, WebsocketInfo};
 use crate::application::config::Config;
 use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
@@ -382,7 +390,7 @@ impl Default for HttpClient {
 /// # Example
 ///
 /// ```ignore
-/// use ig_client::model::http::make_http_request;
+/// use ig_client::application::http::make_http_request;
 /// use ig_client::model::retry::RetryConfig;
 /// use reqwest::{Client, Method};
 ///

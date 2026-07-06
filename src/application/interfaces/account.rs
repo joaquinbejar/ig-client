@@ -1,8 +1,7 @@
 use crate::error::AppError;
-use crate::model::responses::AccountPreferencesResponse;
-use crate::prelude::{
-    AccountActivityResponse, AccountsResponse, PositionsResponse, TransactionHistoryResponse,
-    WorkingOrdersResponse,
+use crate::model::responses::{
+    AccountActivityResponse, AccountPreferencesResponse, AccountsResponse, PositionsResponse,
+    TransactionHistoryResponse, WorkingOrdersResponse,
 };
 use async_trait::async_trait;
 

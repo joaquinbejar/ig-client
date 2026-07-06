@@ -5,9 +5,9 @@
 //! number of attempts (retries + 1).
 
 use ig_client::application::config::RateLimiterConfig;
+use ig_client::application::http::make_http_request;
 use ig_client::application::rate_limiter::RateLimiter;
 use ig_client::error::AppError;
-use ig_client::model::http::make_http_request;
 use ig_client::model::retry::RetryConfig;
 use reqwest::{Client, Method, StatusCode};
 use wiremock::matchers::{method, path};

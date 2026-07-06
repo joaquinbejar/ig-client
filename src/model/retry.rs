@@ -7,9 +7,9 @@ use crate::constants::{
     DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY_SECS, DEPRECATED_INFINITE_RETRY_CAP,
     MAX_RETRY_DELAY_SECS,
 };
-use crate::prelude::{Deserialize, Serialize};
 use crate::utils::config::get_env_or_none;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Configuration for HTTP request retry behavior.

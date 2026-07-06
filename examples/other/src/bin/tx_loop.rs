@@ -26,17 +26,20 @@ async fn main() -> Result<(), ig_client::error::AppError> {
         "Configuration: interval={} hours, page_size={}, lookback={} days",
         config.sleep_hours, config.page_size, config.days_to_look_back
     );
-    debug!("Loaded config: database={}", config.database);
+    debug!(
+        "Loaded config: database max_connections={}",
+        config.database.max_connections
+    );
 
     // Build the Postgres pool once at startup
-    let pool = match config.pg_pool().await {
+    let pool = match create_connection_pool(&config.database).await {
         Ok(pool) => {
             info!("Postgres pool established");
             pool
         }
         Err(e) => {
             error!("Failed to establish database connection: {}", e);
-            return Err(e.into());
+            return Err(e);
         }
     };
 

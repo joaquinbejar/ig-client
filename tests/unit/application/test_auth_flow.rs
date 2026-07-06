@@ -6,8 +6,8 @@ use ig_client::application::auth::Auth;
 use ig_client::application::config::{
     Config, Credentials, RateLimiterConfig, RestApiConfig, WebSocketConfig,
 };
+use ig_client::application::http::HttpClient;
 use ig_client::error::AppError;
-use ig_client::model::http::HttpClient;
 use ig_client::storage::config::DatabaseConfig;
 use std::sync::Arc;
 use wiremock::matchers::{method, path};

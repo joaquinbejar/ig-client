@@ -13,227 +13,31 @@
 //! - Automatic re-authentication when tokens expire
 
 use crate::application::config::Config;
+use crate::application::http::make_http_request;
 use crate::application::rate_limiter::RateLimiter;
 use crate::constants::USER_AGENT;
 use crate::error::AppError;
-pub(crate) use crate::model::auth::{OAuthToken, SecurityHeaders, SessionResponse};
-use crate::model::http::make_http_request;
+pub(crate) use crate::model::auth::{SecurityHeaders, SessionResponse};
 use crate::model::retry::RetryConfig;
-use chrono::Utc;
 use reqwest::{Client, Method};
-use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+// `OAuthToken` and `chrono::Utc` are only referenced from the unit tests below
+// (the `Session` data type that used them in production moved to
+// `crate::model::auth`), so they are imported under `cfg(test)` to keep the
+// non-test build free of unused-import warnings.
+#[cfg(test)]
+use crate::model::auth::OAuthToken;
+#[cfg(test)]
+use chrono::Utc;
 
-/// WebSocket connection information for Lightstreamer
-///
-/// Contains the necessary credentials and endpoint information
-/// to establish a WebSocket connection to IG's Lightstreamer service.
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub struct WebsocketInfo {
-    /// Lightstreamer endpoint URL
-    pub server: String,
-    /// CST token for authentication (API v2)
-    pub cst: Option<String>,
-    /// X-SECURITY-TOKEN for authentication (API v2)
-    pub x_security_token: Option<String>,
-    /// Account ID for the WebSocket connection
-    pub account_id: String,
-}
-
-/// Renders an optional secret as `Some(<redacted>)` / `None`, never exposing
-/// the underlying token value in `Debug` / `Display` output or logs.
-struct RedactedOption<'a>(&'a Option<String>);
-
-impl fmt::Debug for RedactedOption<'_> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(_) => f.write_str("Some(<redacted>)"),
-            None => f.write_str("None"),
-        }
-    }
-}
-
-// Manual redacting `Debug` — `cst` / `x_security_token` are credentials and
-// must never reach logs or panics. All non-secret fields stay visible.
-impl fmt::Debug for WebsocketInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WebsocketInfo")
-            .field("server", &self.server)
-            .field("cst", &RedactedOption(&self.cst))
-            .field("x_security_token", &RedactedOption(&self.x_security_token))
-            .field("account_id", &self.account_id)
-            .finish()
-    }
-}
-
-// Manual redacting `Display` — the derived `DisplaySimple` serializes via serde
-// and would leak the tokens, so it is replaced with a masking implementation.
-impl fmt::Display for WebsocketInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "WebsocketInfo {{ server: {}, cst: {:?}, x_security_token: {:?}, account_id: {} }}",
-            self.server,
-            RedactedOption(&self.cst),
-            RedactedOption(&self.x_security_token),
-            self.account_id,
-        )
-    }
-}
-
-impl WebsocketInfo {
-    /// Generates the WebSocket password for Lightstreamer authentication
-    ///
-    /// # Returns
-    /// * Password in format "CST-{cst}|XST-{token}" if both tokens are available
-    /// * Empty string if tokens are not available
-    #[must_use]
-    pub fn get_ws_password(&self) -> String {
-        match (&self.cst, &self.x_security_token) {
-            (Some(cst), Some(x_security_token)) => {
-                format!("CST-{}|XST-{}", cst, x_security_token)
-            }
-            _ => String::new(),
-        }
-    }
-}
-
-/// Session information for authenticated requests
-#[derive(Clone)]
-pub struct Session {
-    /// Account ID
-    pub account_id: String,
-    /// Client ID (for OAuth)
-    pub client_id: String,
-    /// Lightstreamer endpoint
-    pub lightstreamer_endpoint: String,
-    /// CST token (API v2)
-    pub cst: Option<String>,
-    /// X-SECURITY-TOKEN (API v2)
-    pub x_security_token: Option<String>,
-    /// OAuth token (API v3)
-    pub oauth_token: Option<OAuthToken>,
-    /// API version used
-    pub api_version: u8,
-    /// Unix timestamp when session expires (seconds since epoch)
-    /// - OAuth (v3): expires in 30 seconds
-    /// - API v2: expires in 6 hours (21600 seconds)
-    pub expires_at: u64,
-}
-
-// Manual redacting `Debug` — `cst`, `x_security_token` and the OAuth token are
-// credentials. The `OAuthToken` `Debug` impl is itself redacting, so printing
-// `oauth_token` here stays safe. All non-secret fields remain visible.
-impl fmt::Debug for Session {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Session")
-            .field("account_id", &self.account_id)
-            .field("client_id", &self.client_id)
-            .field("lightstreamer_endpoint", &self.lightstreamer_endpoint)
-            .field("cst", &RedactedOption(&self.cst))
-            .field("x_security_token", &RedactedOption(&self.x_security_token))
-            .field("oauth_token", &self.oauth_token)
-            .field("api_version", &self.api_version)
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
-}
-
-impl Session {
-    /// Checks if this session uses OAuth authentication
-    #[must_use]
-    #[inline]
-    pub fn is_oauth(&self) -> bool {
-        self.oauth_token.is_some()
-    }
-
-    /// Checks if session is expired or will expire soon
-    ///
-    /// # Arguments
-    /// * `margin_seconds` - Safety margin in seconds (default: 60 = 1 minute)
-    ///
-    /// # Returns
-    /// * `true` if session is expired or will expire within margin
-    /// * `false` if session is still valid
-    #[must_use]
-    #[inline]
-    pub fn is_expired(&self, margin_seconds: Option<u64>) -> bool {
-        let margin = margin_seconds.unwrap_or(60);
-        let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
-        // Saturating: a large margin against a small `expires_at` must not
-        // underflow (debug panic / bogus huge threshold in release).
-        now >= self.expires_at.saturating_sub(margin)
-    }
-
-    /// Gets the number of whole seconds until the session expires.
-    ///
-    /// # Returns
-    /// * The number of seconds remaining before expiry.
-    /// * `0` when the session is already expired — the result saturates at zero
-    ///   (a `u64` cannot be negative), so an expired session never reports a
-    ///   spuriously large remaining time.
-    #[must_use]
-    #[inline]
-    pub fn seconds_until_expiry(&self) -> u64 {
-        let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
-        self.expires_at.saturating_sub(now)
-    }
-
-    /// Returns the time remaining until the session expires as a
-    /// [`std::time::Duration`].
-    ///
-    /// # Returns
-    /// * The remaining time before expiry.
-    /// * [`std::time::Duration::ZERO`] when the session is already expired.
-    #[must_use]
-    #[inline]
-    pub fn time_until_expiry(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.seconds_until_expiry())
-    }
-
-    /// Checks if OAuth token needs refresh (alias for is_expired for backwards compatibility)
-    ///
-    /// # Arguments
-    /// * `margin_seconds` - Safety margin in seconds (default: 60 = 1 minute)
-    #[must_use]
-    #[inline]
-    pub fn needs_token_refresh(&self, margin_seconds: Option<u64>) -> bool {
-        self.is_expired(margin_seconds)
-    }
-
-    /// Extracts WebSocket connection information from the session
-    ///
-    /// # Returns
-    /// * `WebsocketInfo` containing endpoint and authentication tokens
-    #[must_use]
-    pub fn get_websocket_info(&self) -> WebsocketInfo {
-        // Ensure the server URL has the https:// prefix
-        let server = if self.lightstreamer_endpoint.starts_with("http://")
-            || self.lightstreamer_endpoint.starts_with("https://")
-        {
-            format!("{}/lightstreamer", self.lightstreamer_endpoint)
-        } else {
-            format!("https://{}/lightstreamer", self.lightstreamer_endpoint)
-        };
-
-        WebsocketInfo {
-            server,
-            cst: self.cst.clone(),
-            x_security_token: self.x_security_token.clone(),
-            account_id: self.account_id.clone(),
-        }
-    }
-}
-
-impl From<SessionResponse> for Session {
-    fn from(v: SessionResponse) -> Self {
-        v.get_session()
-    }
-}
+// `Session` and `WebsocketInfo` are pure data types and live in the model
+// layer (`crate::model::auth`). They are re-exported here so the historical
+// public paths `crate::application::auth::Session` /
+// `crate::application::auth::WebsocketInfo` keep resolving, and so the auth
+// I/O manager below can reference them unqualified.
+pub use crate::model::auth::{Session, WebsocketInfo};
 
 /// Merges freshly-issued v2 security tokens into a session after an account
 /// switch.
@@ -683,7 +487,7 @@ impl Auth {
     /// It cannot loop back through the 401 handler: [`login`](Self::login) issues
     /// its HTTP requests through
     /// [`make_http_request`] directly, not
-    /// through the [`HttpClient`](crate::model::http::HttpClient) refresh-and-replay
+    /// through the [`HttpClient`](crate::application::http::HttpClient) refresh-and-replay
     /// path, so a 401 encountered *during* login surfaces as a typed error rather
     /// than recursing into `force_refresh`.
     ///

@@ -2,7 +2,6 @@ use crate::presentation::instrument::InstrumentType;
 use crate::presentation::market::MarketState;
 use crate::presentation::order::{Direction, OrderType, Status, TimeInForce};
 use crate::presentation::serialization::string_as_float_opt;
-use lightstreamer_rs::subscription::ItemUpdate;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -883,36 +882,35 @@ pub struct AccountFields {
 }
 
 impl AccountData {
-    /// Converts an ItemUpdate from the Lightstreamer API to an AccountData object
+    /// Builds an [`AccountData`] from pre-extracted streaming fields.
+    ///
+    /// This is transport-agnostic: it takes plain field maps rather than a
+    /// Lightstreamer `ItemUpdate`, so the presentation layer carries no
+    /// dependency on the streaming transport. The `ItemUpdate` adapter lives in
+    /// [`crate::application::streaming_convert`].
     ///
     /// # Arguments
-    /// * `item_update` - The ItemUpdate received from the Lightstreamer API
+    /// * `item_name` - Subscription item name (`None` when subscribed by position)
+    /// * `item_pos` - 1-based position of the item in the subscription
+    /// * `is_snapshot` - Whether this update is a snapshot
+    /// * `fields` - Current field values for the item
+    /// * `changed_fields` - Field values that changed in this update
     ///
     /// # Returns
     /// * `Result<Self, String>` - The converted AccountData or an error message
-    pub fn from_item_update(item_update: &ItemUpdate) -> Result<Self, String> {
-        // Extract the item_name, defaulting to an empty string if None
-        let item_name = item_update.item_name.clone().unwrap_or_default();
-
-        // Convert item_pos from usize to i32
-        let item_pos = item_update.item_pos as i32;
-
-        // Extract is_snapshot
-        let is_snapshot = item_update.is_snapshot;
-
-        // Convert fields
-        let fields = Self::create_account_fields(&item_update.fields)?;
-
-        // Convert changed_fields by first creating a HashMap<String, Option<String>>
-        let mut changed_fields_map: HashMap<String, Option<String>> = HashMap::new();
-        for (key, value) in &item_update.changed_fields {
-            changed_fields_map.insert(key.clone(), Some(value.clone()));
-        }
-        let changed_fields = Self::create_account_fields(&changed_fields_map)?;
+    pub fn from_fields(
+        item_name: Option<&str>,
+        item_pos: usize,
+        is_snapshot: bool,
+        fields: &HashMap<String, Option<String>>,
+        changed_fields: &HashMap<String, Option<String>>,
+    ) -> Result<Self, String> {
+        let fields = Self::create_account_fields(fields)?;
+        let changed_fields = Self::create_account_fields(changed_fields)?;
 
         Ok(AccountData {
-            item_name,
-            item_pos,
+            item_name: item_name.unwrap_or_default().to_string(),
+            item_pos: item_pos as i32,
             fields,
             changed_fields,
             is_snapshot,
@@ -957,12 +955,6 @@ impl AccountData {
             equity: parse_float("EQUITY")?,
             equity_used: parse_float("EQUITY_USED")?,
         })
-    }
-}
-
-impl From<&ItemUpdate> for AccountData {
-    fn from(item_update: &ItemUpdate) -> Self {
-        Self::from_item_update(item_update).unwrap_or_else(|_| AccountData::default())
     }
 }
 

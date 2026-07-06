@@ -21,7 +21,7 @@
 pub use crate::application::client::Client;
 
 // HTTP client
-pub use crate::model::http::HttpClient;
+pub use crate::application::http::HttpClient;
 
 // Authentication
 pub use crate::application::auth::{Auth, Session};
@@ -64,7 +64,9 @@ pub use crate::utils::*;
 pub use async_trait::async_trait;
 pub use serde::{Deserialize, Serialize};
 
-pub use crate::model::utils::{build_market_hierarchy, extract_markets_from_hierarchy};
+pub use crate::application::market_hierarchy::{
+    build_market_hierarchy, extract_markets_from_hierarchy,
+};
 pub use crate::presentation::order::{Direction, Status};
 pub use crate::storage::market_database::MarketDatabaseService;
 

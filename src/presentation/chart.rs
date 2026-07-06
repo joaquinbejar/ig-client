@@ -1,5 +1,4 @@
 use crate::presentation::serialization::string_as_float_opt;
-use lightstreamer_rs::subscription::ItemUpdate;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt};
@@ -222,34 +221,45 @@ pub struct ChartFields {
 }
 
 impl ChartData {
-    /// Converts a Lightstreamer ItemUpdate to a ChartData object
+    /// Builds a [`ChartData`] from pre-extracted streaming fields.
+    ///
+    /// This is transport-agnostic: it takes plain field maps rather than a
+    /// Lightstreamer `ItemUpdate`, so the presentation layer carries no
+    /// dependency on the streaming transport. The `ItemUpdate` adapter lives in
+    /// [`crate::application::streaming_convert`]. The chart scale is derived from
+    /// the item name suffix (or the `{scale}` field as a fallback).
     ///
     /// # Arguments
-    ///
-    /// * `item_update` - The ItemUpdate from Lightstreamer containing chart data
+    /// * `item_name` - Subscription item name (`None` when subscribed by position)
+    /// * `item_pos` - 1-based position of the item in the subscription
+    /// * `is_snapshot` - Whether this update is a snapshot
+    /// * `fields` - Current field values for the item
+    /// * `changed_fields` - Field values that changed in this update
     ///
     /// # Returns
-    ///
     /// A Result containing either the parsed ChartData or an error message
-    pub fn from_item_update(item_update: &ItemUpdate) -> Result<Self, String> {
-        // Extract the item_name, defaulting to an empty string if None
-        let item_name = item_update.item_name.clone().unwrap_or_default();
-
+    pub fn from_fields(
+        item_name: Option<&str>,
+        item_pos: usize,
+        is_snapshot: bool,
+        fields: &HashMap<String, Option<String>>,
+        changed_fields: &HashMap<String, Option<String>>,
+    ) -> Result<Self, String> {
         // Determine the chart scale from the item name
-        let scale = if let Some(item_name) = &item_update.item_name {
-            if item_name.ends_with(":TICK") {
+        let scale = if let Some(name) = item_name {
+            if name.ends_with(":TICK") {
                 ChartScale::Tick
-            } else if item_name.ends_with(":SECOND") {
+            } else if name.ends_with(":SECOND") {
                 ChartScale::Second
-            } else if item_name.ends_with(":1MINUTE") {
+            } else if name.ends_with(":1MINUTE") {
                 ChartScale::OneMinute
-            } else if item_name.ends_with(":5MINUTE") {
+            } else if name.ends_with(":5MINUTE") {
                 ChartScale::FiveMinute
-            } else if item_name.ends_with(":HOUR") {
+            } else if name.ends_with(":HOUR") {
                 ChartScale::Hour
             } else {
                 // Try to determine the scale from a {scale} field if it exists
-                match item_update.fields.get("{scale}").and_then(|s| s.as_ref()) {
+                match fields.get("{scale}").and_then(|s| s.as_ref()) {
                     Some(s) if s == "SECOND" => ChartScale::Second,
                     Some(s) if s == "1MINUTE" => ChartScale::OneMinute,
                     Some(s) if s == "5MINUTE" => ChartScale::FiveMinute,
@@ -261,28 +271,16 @@ impl ChartData {
             ChartScale::default()
         };
 
-        // Convert item_pos from usize to i32
-        let item_pos = item_update.item_pos as i32;
-
-        // Extract is_snapshot
-        let is_snapshot = item_update.is_snapshot;
-
         // Convert fields
-        let fields = Self::create_chart_fields(&item_update.fields)?;
-
-        // Convert changed_fields by first creating a HashMap<String, Option<String>>
-        let mut changed_fields_map: HashMap<String, Option<String>> = HashMap::new();
-        for (key, value) in &item_update.changed_fields {
-            changed_fields_map.insert(key.clone(), Some(value.clone()));
-        }
-        let changed_fields = Self::create_chart_fields(&changed_fields_map)?;
+        let parsed_fields = Self::create_chart_fields(fields)?;
+        let parsed_changed_fields = Self::create_chart_fields(changed_fields)?;
 
         Ok(ChartData {
-            item_name,
-            item_pos,
+            item_name: item_name.unwrap_or_default().to_string(),
+            item_pos: item_pos as i32,
             scale,
-            fields,
-            changed_fields,
+            fields: parsed_fields,
+            changed_fields: parsed_changed_fields,
             is_snapshot,
         })
     }
@@ -352,12 +350,6 @@ impl ChartData {
     /// Gets the time scale of the data
     pub fn get_scale(&self) -> &ChartScale {
         &self.scale
-    }
-}
-
-impl From<&ItemUpdate> for ChartData {
-    fn from(item_update: &ItemUpdate) -> Self {
-        Self::from_item_update(item_update).unwrap_or_default()
     }
 }
 
