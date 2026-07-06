@@ -14,12 +14,33 @@ use tracing::log::debug;
 /// can embed it in [`Config`] without depending on the storage layer. The
 /// storage layer re-exports it (see `storage::config`) and owns the actual pool
 /// construction (`storage::utils::create_connection_pool`).
-#[derive(Debug, DisplaySimple, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DatabaseConfig {
     /// Database connection URL
     pub url: String,
     /// Maximum number of connections in the connection pool
     pub max_connections: u32,
+}
+
+// The connection `url` commonly embeds a password, so `Debug`/`Display` must
+// never print it — they redact the URL and show only `max_connections`.
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &"<redacted>")
+            .field("max_connections", &self.max_connections)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DatabaseConfig {{ url: <redacted>, max_connections: {} }}",
+            self.max_connections
+        )
+    }
 }
 
 #[derive(DebugPretty, DisplaySimple, Serialize, Deserialize, Clone)]
