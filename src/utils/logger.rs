@@ -25,9 +25,9 @@ pub(crate) fn level_from_str(s: &str) -> Level {
 
 /// Sets up the logger for the application.
 ///
-/// The logger level is determined by the `LOGLEVEL` environment variable and
-/// mapped via [`level_from_str`]. If the variable is not set or holds an
-/// unrecognized value, it defaults to `INFO`.
+/// The logger level is determined by the `LOGLEVEL` environment variable
+/// (case-insensitive). If the variable is not set or holds an unrecognized
+/// value, it defaults to `INFO`.
 ///
 /// This installs a global subscriber and is intended for binaries, examples,
 /// and tests only — library code must not install a global subscriber.
