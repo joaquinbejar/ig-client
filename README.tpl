@@ -12,6 +12,13 @@
 
 {{readme}}
 
+## What's New in 0.12.1
+
+- The `historical_prices` unique-constraint migration now tolerates
+  PostgreSQL SQLSTATE `42P07` ("relation already exists") when an index with
+  the constraint's name already exists without an attached constraint —
+  previously this failed application startup on every run ([#79](https://github.com/joaquinbejar/ig-client/issues/79)).
+
 ## What's New in 0.12.0
 
 A large correctness, safety, and API-consistency release. Highlights:

@@ -64,9 +64,11 @@ pub async fn initialize_historical_prices_table(pool: &PgPool) -> Result<(), sql
     // NOT dropped here: `CREATE TABLE ... UNIQUE(epic, resolution, snapshot_time)`
     // above already creates it (auto-named `historical_prices_epic_resolution_snapshot_time_key`),
     // so dropping and re-adding it on every startup would churn an
-    // AccessExclusive lock for nothing. The tolerant ADD below handles both the
-    // fresh case (constraint already present → 42710 → skipped) and the migration
-    // case (old two-column DB whose legacy constraint was just dropped).
+    // AccessExclusive lock for nothing. The tolerant ADD below handles the
+    // fresh case (constraint already present → 42710 → skipped), the migration
+    // case (old two-column DB whose legacy constraint was just dropped), and
+    // the orphan-index case (an index by the constraint's name exists without
+    // an attached constraint → 42P07 → skipped).
     sqlx::query(
         "ALTER TABLE historical_prices \
          DROP CONSTRAINT IF EXISTS historical_prices_epic_snapshot_time_key",
@@ -75,8 +77,9 @@ pub async fn initialize_historical_prices_table(pool: &PgPool) -> Result<(), sql
     .await?;
 
     // Add the three-column unique constraint. There is no `IF NOT EXISTS` for
-    // `ADD CONSTRAINT`, so tolerate a duplicate-object error (SQLSTATE 42710)
-    // when it already exists while surfacing any other failure.
+    // `ADD CONSTRAINT`, so tolerate the "already exists" SQLSTATEs (42710 for
+    // the constraint, 42P07 for its backing index) while surfacing any other
+    // failure.
     if let Err(e) = sqlx::query(
         "ALTER TABLE historical_prices \
          ADD CONSTRAINT historical_prices_epic_resolution_snapshot_time_key \
@@ -86,11 +89,11 @@ pub async fn initialize_historical_prices_table(pool: &PgPool) -> Result<(), sql
     .await
     {
         match e.as_database_error().and_then(|db| db.code()) {
-            // 42710 = duplicate_object: the constraint already exists.
-            Some(code) if code == "42710" => {
+            Some(code) if is_benign_already_exists(&code) => {
                 warn!(
                     constraint = "historical_prices_epic_resolution_snapshot_time_key",
-                    "unique constraint already exists, skipping add"
+                    sqlstate = %code,
+                    "unique constraint or its backing index already exists, skipping add"
                 );
             }
             _ => return Err(e),
@@ -145,6 +148,18 @@ pub async fn initialize_historical_prices_table(pool: &PgPool) -> Result<(), sql
 
     info!("✅ Historical prices table initialized successfully");
     Ok(())
+}
+
+/// Returns `true` for the PostgreSQL SQLSTATEs that mean the unique
+/// constraint (or its backing index) already exists: `42710`
+/// (duplicate_object — the constraint is already present) and `42P07`
+/// (duplicate_table — `ADD CONSTRAINT ... UNIQUE` implicitly creates a
+/// backing index of the same name, so a pre-existing relation by that name
+/// surfaces as "relation already exists").
+#[must_use]
+#[inline]
+fn is_benign_already_exists(code: &str) -> bool {
+    matches!(code, "42710" | "42P07")
 }
 
 /// Storage statistics for tracking insert/update operations
@@ -558,5 +573,25 @@ mod tests {
             let result = parse_snapshot_time(&timestamp);
             assert!(result.is_ok(), "Failed for month: {}", month);
         }
+    }
+
+    #[test]
+    fn test_is_benign_already_exists_duplicate_object_true() {
+        // 42710 = duplicate_object: the constraint itself already exists.
+        assert!(is_benign_already_exists("42710"));
+    }
+
+    #[test]
+    fn test_is_benign_already_exists_duplicate_relation_true() {
+        // 42P07 = duplicate_table: the backing index name already exists.
+        assert!(is_benign_already_exists("42P07"));
+    }
+
+    #[test]
+    fn test_is_benign_already_exists_other_code_false() {
+        // Unrelated SQLSTATEs must keep propagating as errors.
+        assert!(!is_benign_already_exists("23505")); // unique_violation
+        assert!(!is_benign_already_exists("42P01")); // undefined_table
+        assert!(!is_benign_already_exists(""));
     }
 }
