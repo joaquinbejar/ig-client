@@ -116,16 +116,23 @@ async fn test_initialize_tolerates_orphan_backing_index() {
     // constraint is attached (manually created index, pg_restore, partial
     // migration). `ADD CONSTRAINT ... UNIQUE` then fails with SQLSTATE 42P07
     // ("relation already exists") while trying to create the backing index.
-    // Both statements run in one transaction so concurrent ignored tests
-    // never observe a window without the unique index.
+    // All statements run in one transaction so concurrent ignored tests
+    // never observe a window without the unique index. `IF EXISTS` on both
+    // drops makes the setup idempotent when a prior failed run left the
+    // schema in the orphan-index state: dropping the constraint also drops
+    // its backing index, and the second drop clears a leftover orphan index.
     let mut tx = pool.begin().await.expect("transaction should start");
     sqlx::query(
         "ALTER TABLE historical_prices \
-         DROP CONSTRAINT historical_prices_epic_resolution_snapshot_time_key",
+         DROP CONSTRAINT IF EXISTS historical_prices_epic_resolution_snapshot_time_key",
     )
     .execute(&mut *tx)
     .await
     .expect("dropping the constraint should succeed");
+    sqlx::query("DROP INDEX IF EXISTS historical_prices_epic_resolution_snapshot_time_key")
+        .execute(&mut *tx)
+        .await
+        .expect("dropping a leftover orphan index should succeed");
     sqlx::query(
         "CREATE UNIQUE INDEX historical_prices_epic_resolution_snapshot_time_key \
          ON historical_prices (epic, resolution, snapshot_time)",
@@ -143,10 +150,19 @@ async fn test_initialize_tolerates_orphan_backing_index() {
     let tolerate_result = initialize_historical_prices_table(&pool).await;
 
     // Restore the canonical constraint-backed state for the other tests.
-    // Valid in both outcomes: whether the init tolerated the orphan index or
-    // errored, the state is still index-present / constraint-absent.
+    // Dropping the constraint (if any) before the index keeps the cleanup
+    // robust even if a future `initialize_historical_prices_table()` were to
+    // attach a constraint to the orphan index — a bare `DROP INDEX` would
+    // then fail on the dependency.
     let mut tx = pool.begin().await.expect("transaction should start");
-    sqlx::query("DROP INDEX historical_prices_epic_resolution_snapshot_time_key")
+    sqlx::query(
+        "ALTER TABLE historical_prices \
+         DROP CONSTRAINT IF EXISTS historical_prices_epic_resolution_snapshot_time_key",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("dropping a constraint attached to the index should succeed");
+    sqlx::query("DROP INDEX IF EXISTS historical_prices_epic_resolution_snapshot_time_key")
         .execute(&mut *tx)
         .await
         .expect("dropping the orphan index should succeed");
