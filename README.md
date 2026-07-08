@@ -55,7 +55,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ig-client = "0.12.0"
+ig-client = "0.12.1"
 tokio = { version = "1", features = ["full"] }  # Async runtime
 tracing = "0.1"                                  # Logging facade
 # Optional, only if you use the PostgreSQL persistence layer:
@@ -362,6 +362,13 @@ Contributions are welcome:
 
 Please make sure your code passes all tests and linting checks before
 submitting a pull request.
+
+## What's New in 0.12.1
+
+- The `historical_prices` unique-constraint migration now tolerates
+  PostgreSQL SQLSTATE `42P07` ("relation already exists") when an index with
+  the constraint's name already exists without an attached constraint —
+  previously this failed application startup on every run ([#79](https://github.com/joaquinbejar/ig-client/issues/79)).
 
 ## What's New in 0.12.0
 

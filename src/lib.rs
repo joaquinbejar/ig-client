@@ -43,7 +43,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = "0.12.0"
+//! ig-client = "0.12.1"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
