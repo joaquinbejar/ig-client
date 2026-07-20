@@ -5,6 +5,8 @@ pub mod client;
 /// Application configuration module
 pub mod config;
 /// Dynamic market streamer with thread-safe subscription management
+#[cfg(feature = "streaming")]
+#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub mod dynamic_streamer;
 /// HTTP client and request execution with rate limiting and finite retry
 pub mod http;
@@ -15,4 +17,6 @@ pub mod market_hierarchy;
 /// Rate limiter module for API request throttling
 pub mod rate_limiter;
 /// Adapters from Lightstreamer `ItemUpdate` to presentation-layer DTOs
+#[cfg(feature = "streaming")]
+#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub mod streaming_convert;

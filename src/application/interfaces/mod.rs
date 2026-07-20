@@ -3,6 +3,8 @@ pub mod account;
 /// Indicative costs and charges service interface
 pub mod costs;
 /// Listener interface for streaming data
+#[cfg(feature = "streaming")]
+#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub mod listener;
 /// Market service interface
 pub mod market;

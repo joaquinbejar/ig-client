@@ -10,8 +10,7 @@ use dotenv::dotenv;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::env;
-use tracing::error;
-use tracing::log::debug;
+use tracing::{debug, error};
 
 /// Configuration for database connections
 ///

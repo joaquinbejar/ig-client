@@ -17,10 +17,13 @@
 //! let markets = client.search_markets("EUR").await?;
 //! ```
 //!
-//! The prelude is self-sufficient for the streaming API: `StreamerClient`,
-//! `DynamicMarketStreamer`, the `Streaming*Field` selectors and the
+//! With the default `streaming` feature enabled, the prelude is self-sufficient
+//! for the streaming API too: `StreamerClient`, `DynamicMarketStreamer`, the
+//! `Streaming*Field` selectors and the
 //! [`PriceData`](crate::presentation::price::PriceData) DTO all resolve from a
-//! single glob import, with no extra `use` lines.
+//! single glob import, with no extra `use` lines. The `Streaming*Field`
+//! selectors and the presentation DTOs are plain data types and stay available
+//! even with `streaming` off; only the client types go away.
 //!
 //! ```rust
 //! use ig_client::prelude::*;
@@ -28,6 +31,8 @@
 //! // Both the streaming client type and the price DTO resolve through the
 //! // prelude alone — no additional imports are required.
 //! fn accepts_price(_price: &PriceData) {}
+//!
+//! # #[cfg(feature = "streaming")]
 //! fn returns_streamer(client: StreamerClient) -> StreamerClient {
 //!     client
 //! }
@@ -53,6 +58,7 @@ pub use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
 // Service interfaces
 pub use crate::application::interfaces::account::AccountService;
 pub use crate::application::interfaces::costs::CostsService;
+#[cfg(feature = "streaming")]
 pub use crate::application::interfaces::listener::ListenerResult;
 pub use crate::application::interfaces::market::MarketService;
 pub use crate::application::interfaces::operations::OperationsService;
@@ -60,8 +66,10 @@ pub use crate::application::interfaces::order::OrderService;
 pub use crate::application::interfaces::sentiment::SentimentService;
 pub use crate::application::interfaces::watchlist::WatchlistService;
 
-// Streaming client and subscription manager
+// Streaming client and subscription manager (feature `streaming`)
+#[cfg(feature = "streaming")]
 pub use crate::application::client::StreamerClient;
+#[cfg(feature = "streaming")]
 pub use crate::application::dynamic_streamer::DynamicMarketStreamer;
 
 // Error handling
@@ -104,8 +112,11 @@ pub use crate::application::market_hierarchy::{
     build_market_hierarchy, extract_markets_from_hierarchy,
 };
 pub use crate::presentation::order::{Direction, Status};
+// Persistence layer (feature `persistence`)
+#[cfg(feature = "persistence")]
 pub use crate::storage::market_database::MarketDatabaseService;
 
+#[cfg(feature = "persistence")]
 pub use crate::storage::utils::{create_connection_pool, create_database_config_from_env};
 
 /// Result type alias for IG client operations

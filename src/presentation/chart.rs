@@ -234,7 +234,7 @@ impl ChartData {
     /// This is transport-agnostic: it takes plain field maps rather than a
     /// Lightstreamer `ItemUpdate`, so the presentation layer carries no
     /// dependency on the streaming transport. The `ItemUpdate` adapter lives in
-    /// [`crate::application::streaming_convert`]. The chart scale is derived from
+    /// `application::streaming_convert` (feature `streaming`). The chart scale is derived from
     /// the third `:`-separated segment of the item name (`CHART:{epic}:{scale}`).
     ///
     /// # Arguments

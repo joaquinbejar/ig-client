@@ -27,15 +27,17 @@
 //! - **Client Sentiment**: Sentiment for single, multiple, and related markets.
 //! - **Indicative Costs**: Costs and charges for opening, closing, or editing
 //!   positions, plus cost history.
-//! - **Real-time Streaming**: Market, price, trade, and account updates over
-//!   Lightstreamer, with thread-safe dynamic subscription management.
+//! - **Real-time Streaming** (feature `streaming`, on by default): Market,
+//!   price, trade, and account updates over Lightstreamer, with thread-safe
+//!   dynamic subscription management.
 //! - **Rate Limiting**: `governor`-backed pacing configured per IG's trading vs
 //!   non-trading budgets.
 //! - **Finite Retry**: Exponential backoff with jitter via `RetryConfig`
 //!   (bounded — no unbounded retry loops).
 //! - **Type Safety**: Strongly typed request / response DTOs and domain enums.
 //! - **Async**: Built on `tokio` with a shared, pooled `reqwest` client.
-//! - **Persistence (optional)**: PostgreSQL storage via `sqlx`.
+//! - **Persistence** (feature `persistence`, on by default): PostgreSQL storage
+//!   via `sqlx`.
 //!
 //! ## Installation
 //!
@@ -43,7 +45,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = "0.12.2"
+//! ig-client = "0.12.3"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
@@ -55,6 +57,45 @@
 //! and must not read a `.env` file or the `IG_*` namespace, use
 //! `Config::from_credentials()` with `Client::with_config()` instead (see
 //! [Programmatic configuration](#programmatic-configuration-embedders)).
+//!
+//! ### Cargo features
+//!
+//! | Feature | Default | Pulls in | Gives you |
+//! |---|---|---|---|
+//! | `streaming` | on | `lightstreamer-rs` | `StreamerClient`, `DynamicMarketStreamer`, the `ItemUpdate` adapters, `application::interfaces::listener` |
+//! | `persistence` | on | `sqlx` | the `storage` module: `MarketDatabaseService`, historical prices, connection pooling |
+//!
+//! Both are on by default, so the crate behaves exactly as before unless you
+//! opt out. Turn them off for a REST/poll-only client:
+//!
+//! ```toml
+//! [dependencies]
+//! ig-client = { version = "0.12.3", default-features = false }
+//! ```
+//!
+//! That leaves `Client`, `Client::with_config`, every REST service trait
+//! (`MarketService`, `AccountService`, `OrderService`, …), the DTOs and the
+//! rate limiter fully available, with neither `lightstreamer-rs` nor `sqlx` in
+//! the dependency graph. Two reasons to care:
+//!
+//! - **License**: `lightstreamer-rs` is **GPL-3.0-only**. A permissively
+//!   licensed (MIT / Apache-2.0) consumer with a copyleft-rejecting
+//!   `cargo deny` policy cannot take it, and with `streaming` off it never
+//!   enters the graph.
+//! - **Build weight**: `sqlx` brings a full PostgreSQL driver that a
+//!   market-data-only integration never uses.
+//!
+//! Turning `streaming` off removes the streaming client types; the
+//! `Streaming*Field` selectors and the presentation DTOs are plain data types
+//! and stay available either way. Turning `persistence` off removes everything
+//! under `storage` except `storage::config` (a re-export of the sqlx-free
+//! `application::config::DatabaseConfig`), along with the `AppError::Db`
+//! variant.
+//!
+//! One side effect worth knowing: `sqlx` enables `tracing`'s `log` feature, so
+//! with `persistence` on this crate's events are also emitted as `log` records.
+//! With it off they are tracing events only, which matters if your application
+//! collects logs through the `log` facade.
 //!
 //! ### Requirements
 //!
@@ -141,9 +182,9 @@
 //! Non-credential fields default to the IG **demo** endpoints; see
 //! `examples/simples/src/bin/client_with_config.rs` for a runnable version.
 //!
-//! For streaming, build the streamer from the injected client with
-//! `StreamerClient::with_client(&client)` — `StreamerClient::new()` goes
-//! through `Client::try_new()` and therefore back to `.env` / `IG_*`.
+//! For streaming (feature `streaming`), build the streamer from the injected
+//! client with `StreamerClient::with_client(&client)` — `StreamerClient::new()`
+//! goes through `Client::try_new()` and therefore back to `.env` / `IG_*`.
 //!
 //! Two knobs are still resolved from the process environment on the injected
 //! path, because they are not part of `Config`:
@@ -241,6 +282,8 @@
 //!
 //! ### Real-time streaming
 //!
+//! *Requires the default `streaming` feature.*
+//!
 //! `DynamicMarketStreamer` wraps the lower-level `StreamerClient` and manages
 //! subscriptions in a thread-safe way. Its constructor is **synchronous** — it
 //! only wires up in-memory channels; the network connection is established later
@@ -250,6 +293,7 @@
 //! use ig_client::prelude::*;
 //! use std::collections::HashSet;
 //!
+//! # #[cfg(feature = "streaming")]
 //! #[tokio::main]
 //! async fn main() -> Result<(), AppError> {
 //!     // Fields to receive on each market tick.
@@ -272,6 +316,8 @@
 //!     }
 //!     Ok(())
 //! }
+//! # #[cfg(not(feature = "streaming"))]
+//! # fn main() {}
 //! ```
 //!
 //! ## Available Services
@@ -350,8 +396,8 @@
 //!   DTOs, and the retry policy. Serde only; no I/O.
 //! - **`presentation`** — domain entities per area: account, chart, instrument,
 //!   market, order, price, trade, transaction. Serde only; no I/O.
-//! - **`storage`** — optional PostgreSQL persistence via `sqlx` (sits on top of
-//!   `model` / `presentation`).
+//! - **`storage`** — PostgreSQL persistence via `sqlx`, behind the
+//!   `persistence` feature (sits on top of `model` / `presentation`).
 //! - **`utils`** — leaf helpers: env-var config, logging, finance (P&L), parsing,
 //!   deal-reference id generation.
 //! - **`error`** — canonical typed error enums: `AppError`, `AuthError`, and
@@ -381,7 +427,7 @@
 //! │   └── dynamic_streamer.rs  # DynamicMarketStreamer (subscriptions)
 //! ├── model/             # Pure DTOs: requests, responses, streaming, retry
 //! ├── presentation/      # Domain entities (account, market, order, price, …)
-//! ├── storage/           # Optional PostgreSQL persistence via sqlx
+//! ├── storage/           # PostgreSQL persistence via sqlx (feature `persistence`)
 //! ├── utils/             # config, logger, finance, parsing, id helpers
 //! ├── constants.rs       # Endpoint paths, header names, defaults
 //! ├── error.rs           # AppError / AuthError / FetchError
@@ -418,6 +464,10 @@
 //!
 //! Please make sure your code passes all tests and linting checks before
 //! submitting a pull request.
+
+// Enables the "Available on crate feature ..." badges on docs.rs. Inert on
+// stable: nothing sets `docsrs` outside the docs.rs builder.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// Core application logic and services
 pub mod application;
