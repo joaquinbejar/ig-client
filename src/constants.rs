@@ -101,6 +101,54 @@ pub const DEFAULT_ACCOUNT_ID: &str = "default_account_id";
 /// when it tries to connect. Never hard-code real credentials here.
 pub const DEFAULT_DATABASE_URL: &str = "postgres://localhost/ig";
 
+/// Default size of the Postgres connection pool
+/// ([`crate::application::config::DatabaseConfig::max_connections`]).
+pub const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 5;
+
+/// Default IG REST gateway: the **demo** environment.
+///
+/// Pointing the client at production requires an explicit opt-in (setting
+/// `IG_REST_BASE_URL` or supplying a
+/// [`crate::application::config::RestApiConfig`] directly).
+pub const DEFAULT_REST_BASE_URL: &str = "https://demo-api.ig.com/gateway/deal";
+
+/// Default REST request timeout in seconds
+/// ([`crate::application::config::RestApiConfig::timeout`]).
+pub const DEFAULT_REST_TIMEOUT_SECS: u64 = 30;
+
+/// Default Lightstreamer endpoint: the **demo** environment. Production
+/// requires an explicit opt-in via `IG_WS_URL` or a
+/// [`crate::application::config::WebSocketConfig`] supplied by the caller.
+pub const DEFAULT_WS_URL: &str = "wss://demo-apd.marketdatasystems.com";
+
+/// Default delay between Lightstreamer reconnection attempts, in seconds
+/// ([`crate::application::config::WebSocketConfig::reconnect_interval`]).
+pub const DEFAULT_WS_RECONNECT_INTERVAL_SECS: u64 = 5;
+
+/// Default request budget of the configured rate limiter
+/// ([`crate::application::config::RateLimiterConfig::max_requests`]).
+///
+/// Distinct from the per-endpoint-class limits above: this is the general
+/// non-trading budget applied when nothing else is configured. Not to be
+/// confused with [`FALLBACK_RATE_LIMIT_MAX_REQUESTS`], which is the floor
+/// applied when a caller configures a budget of zero.
+pub const DEFAULT_CONFIG_RATE_LIMIT_MAX_REQUESTS: u32 = 4;
+
+/// Default period of the configured rate limiter, in seconds
+/// ([`crate::application::config::RateLimiterConfig::period_seconds`]).
+pub const DEFAULT_CONFIG_RATE_LIMIT_PERIOD_SECONDS: u64 = 12;
+
+/// Default burst size of the configured rate limiter
+/// ([`crate::application::config::RateLimiterConfig::burst_size`]).
+///
+/// Not to be confused with [`DEFAULT_RATE_LIMIT_BURST_SIZE`], which is the
+/// fallback applied when a caller configures a burst size of zero.
+pub const DEFAULT_CONFIG_RATE_LIMIT_BURST_SIZE: u32 = 3;
+
+/// Default IG API version used for authentication when `IG_API_VERSION` is not
+/// set: v3 (OAuth).
+pub const DEFAULT_API_VERSION: u8 = 3;
+
 /// Lifetime of an IG API v2 (CST / X-SECURITY-TOKEN) session, in seconds
 /// (21600 = 6 hours).
 ///

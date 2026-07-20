@@ -1,4 +1,10 @@
-use crate::constants::{DAYS_TO_BACK_LOOK, DEFAULT_PAGE_SIZE, DEFAULT_SLEEP_TIME};
+use crate::constants::{
+    DAYS_TO_BACK_LOOK, DEFAULT_API_VERSION, DEFAULT_CONFIG_RATE_LIMIT_BURST_SIZE,
+    DEFAULT_CONFIG_RATE_LIMIT_MAX_REQUESTS, DEFAULT_CONFIG_RATE_LIMIT_PERIOD_SECONDS,
+    DEFAULT_DATABASE_MAX_CONNECTIONS, DEFAULT_DATABASE_URL, DEFAULT_PAGE_SIZE,
+    DEFAULT_REST_BASE_URL, DEFAULT_REST_TIMEOUT_SECS, DEFAULT_SLEEP_TIME,
+    DEFAULT_WS_RECONNECT_INTERVAL_SECS, DEFAULT_WS_URL,
+};
 use crate::utils::config::get_env_or_default;
 use dotenv::dotenv;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
@@ -127,7 +133,10 @@ pub struct Config {
     pub page_size: u32,
     /// Number of days to look back when fetching historical data
     pub days_to_look_back: i64,
-    /// API version to use for authentication (2 or 3). If None, auto-detect based on available tokens
+    /// API version to use for authentication: `Some(2)` for CST /
+    /// X-SECURITY-TOKEN, `Some(3)` for OAuth. Both constructors set
+    /// `Some(3)` ([`crate::constants::DEFAULT_API_VERSION`]); an explicit
+    /// `None` makes login fall back to v2.
     pub api_version: Option<u8>,
 }
 
@@ -184,19 +193,155 @@ pub struct RateLimiterConfig {
     pub burst_size: u32,
 }
 
+// The `Default` impls below are the single source of truth for the
+// non-credential defaults: they hold the literals and `Config::new()` uses them
+// as its `get_env_or_default` fallbacks. They read no environment variable and
+// load no `.env` file, so they are usable from the injection path
+// ([`Config::from_credentials`] / `Client::with_config`).
+
+impl Default for RestApiConfig {
+    /// IG **demo** REST gateway with a 30 second request timeout.
+    fn default() -> Self {
+        Self {
+            base_url: String::from(DEFAULT_REST_BASE_URL),
+            timeout: DEFAULT_REST_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl Default for WebSocketConfig {
+    /// IG **demo** Lightstreamer endpoint with a 5 second reconnect interval.
+    fn default() -> Self {
+        Self {
+            url: String::from(DEFAULT_WS_URL),
+            reconnect_interval: DEFAULT_WS_RECONNECT_INTERVAL_SECS,
+        }
+    }
+}
+
+impl Default for RateLimiterConfig {
+    /// The crate-wide non-trading budget: 4 requests per 12 seconds, burst 3.
+    fn default() -> Self {
+        Self {
+            max_requests: DEFAULT_CONFIG_RATE_LIMIT_MAX_REQUESTS,
+            period_seconds: DEFAULT_CONFIG_RATE_LIMIT_PERIOD_SECONDS,
+            burst_size: DEFAULT_CONFIG_RATE_LIMIT_BURST_SIZE,
+        }
+    }
+}
+
+impl Default for DatabaseConfig {
+    /// Credential-less placeholder URL — persistence will not connect until the
+    /// caller supplies a real one.
+    fn default() -> Self {
+        Self {
+            url: String::from(DEFAULT_DATABASE_URL),
+            max_connections: DEFAULT_DATABASE_MAX_CONNECTIONS,
+        }
+    }
+}
+
+impl Credentials {
+    /// Builds credentials from the four required fields, leaving both session
+    /// tokens unset.
+    ///
+    /// The tokens (`client_token` / `account_token`) are populated by the
+    /// session layer on login, so callers never provide them.
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - IG account username
+    /// * `password` - IG account password
+    /// * `account_id` - IG account identifier
+    /// * `api_key` - IG API key
+    #[must_use]
+    pub fn new(username: String, password: String, account_id: String, api_key: String) -> Self {
+        Self {
+            username,
+            password,
+            account_id,
+            api_key,
+            client_token: None,
+            account_token: None,
+        }
+    }
+}
+
 impl Default for Config {
+    /// Delegates to [`Config::new`] and therefore loads a `.env` file and reads
+    /// the `IG_*` namespace — unlike the section-level `Default` impls above,
+    /// which are env-free. `Config { .., ..Config::default() }` still touches
+    /// the environment; use [`Config::from_credentials`] as the base value when
+    /// that is not acceptable.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Config {
-    /// Creates a new configuration instance with a specific rate limit type
+    /// Creates a configuration from caller-supplied credentials, reading **no**
+    /// environment variable and loading **no** `.env` file.
+    ///
+    /// This is the injection path for embedding applications that own their
+    /// configuration source (their own namespaced env vars, a config file, a
+    /// secrets manager). Pair it with
+    /// [`Client::with_config`](crate::application::client::Client::with_config).
+    /// [`Config::new`] remains the `.env` / `IG_*` convenience path.
+    ///
+    /// Every non-credential field takes its documented default (IG **demo**
+    /// endpoints — see the `Default` impls of [`RestApiConfig`],
+    /// [`WebSocketConfig`], [`RateLimiterConfig`] and [`DatabaseConfig`]).
+    /// Override individual sections with a struct-update expression, which
+    /// stays env-free because the base value is this constructor:
+    ///
+    /// ```rust
+    /// use ig_client::prelude::*;
+    ///
+    /// let credentials = Credentials::new(
+    ///     "user".to_string(),
+    ///     "password".to_string(),
+    ///     "ABC123".to_string(),
+    ///     "api-key".to_string(),
+    /// );
+    /// let config = Config {
+    ///     rest_api: RestApiConfig {
+    ///         base_url: "https://demo-api.ig.com/gateway/deal".to_string(),
+    ///         timeout: 30,
+    ///     },
+    ///     ..Config::from_credentials(credentials)
+    /// };
+    /// assert_eq!(config.rest_api.base_url, "https://demo-api.ig.com/gateway/deal");
+    /// ```
     ///
     /// # Arguments
     ///
-    /// * `rate_limit_type` - The type of rate limit to enforce
-    /// * `safety_margin` - A value between 0.0 and 1.0 representing the percentage of the actual limit to use
+    /// * `credentials` - IG credentials supplied by the caller
+    ///
+    /// # Returns
+    ///
+    /// A `Config` built entirely from `credentials` plus the documented defaults
+    #[must_use]
+    pub fn from_credentials(credentials: Credentials) -> Self {
+        Config {
+            credentials,
+            rest_api: RestApiConfig::default(),
+            websocket: WebSocketConfig::default(),
+            database: DatabaseConfig::default(),
+            rate_limiter: RateLimiterConfig::default(),
+            sleep_hours: DEFAULT_SLEEP_TIME,
+            page_size: DEFAULT_PAGE_SIZE,
+            days_to_look_back: DAYS_TO_BACK_LOOK,
+            api_version: Some(DEFAULT_API_VERSION),
+        }
+    }
+
+    /// Creates a new configuration instance from the environment.
+    ///
+    /// Loads a local `.env` file (via `dotenv`) and reads the `IG_*` /
+    /// `DATABASE_*` / `TX_*` environment variables, falling back to the
+    /// documented defaults for anything unset. Embedders that must not touch
+    /// the `.env` file or the `IG_*` namespace should use
+    /// [`Config::from_credentials`] instead.
     ///
     /// # Returns
     ///
@@ -216,10 +361,14 @@ impl Config {
         let page_size = get_env_or_default("TX_PAGE_SIZE", DEFAULT_PAGE_SIZE);
         let days_to_look_back = get_env_or_default("TX_DAYS_LOOKBACK", DAYS_TO_BACK_LOOK);
 
-        let database_url = get_env_or_default(
-            "DATABASE_URL",
-            String::from(crate::constants::DEFAULT_DATABASE_URL),
-        );
+        // Defaults come from the `Default` impls so the env path and the
+        // env-free path (`from_credentials`) cannot drift apart.
+        let rest_defaults = RestApiConfig::default();
+        let ws_defaults = WebSocketConfig::default();
+        let rate_limit_defaults = RateLimiterConfig::default();
+        let database_defaults = DatabaseConfig::default();
+
+        let database_url = get_env_or_default("DATABASE_URL", database_defaults.url);
 
         // Check if we are using default values
         if username == "default_username" {
@@ -256,27 +405,36 @@ impl Config {
                 account_token: None,
             },
             rest_api: RestApiConfig {
-                base_url: get_env_or_default(
-                    "IG_REST_BASE_URL",
-                    String::from("https://demo-api.ig.com/gateway/deal"),
-                ),
-                timeout: get_env_or_default("IG_REST_TIMEOUT", 30),
+                base_url: get_env_or_default("IG_REST_BASE_URL", rest_defaults.base_url),
+                timeout: get_env_or_default("IG_REST_TIMEOUT", rest_defaults.timeout),
             },
             websocket: WebSocketConfig {
-                url: get_env_or_default(
-                    "IG_WS_URL",
-                    String::from("wss://demo-apd.marketdatasystems.com"),
+                url: get_env_or_default("IG_WS_URL", ws_defaults.url),
+                reconnect_interval: get_env_or_default(
+                    "IG_WS_RECONNECT_INTERVAL",
+                    ws_defaults.reconnect_interval,
                 ),
-                reconnect_interval: get_env_or_default("IG_WS_RECONNECT_INTERVAL", 5),
             },
             database: DatabaseConfig {
                 url: database_url,
-                max_connections: get_env_or_default("DATABASE_MAX_CONNECTIONS", 5),
+                max_connections: get_env_or_default(
+                    "DATABASE_MAX_CONNECTIONS",
+                    database_defaults.max_connections,
+                ),
             },
             rate_limiter: RateLimiterConfig {
-                max_requests: get_env_or_default("IG_RATE_LIMIT_MAX_REQUESTS", 4), // 3
-                period_seconds: get_env_or_default("IG_RATE_LIMIT_PERIOD_SECONDS", 12), // 10
-                burst_size: get_env_or_default("IG_RATE_LIMIT_BURST_SIZE", 3),
+                max_requests: get_env_or_default(
+                    "IG_RATE_LIMIT_MAX_REQUESTS",
+                    rate_limit_defaults.max_requests,
+                ),
+                period_seconds: get_env_or_default(
+                    "IG_RATE_LIMIT_PERIOD_SECONDS",
+                    rate_limit_defaults.period_seconds,
+                ),
+                burst_size: get_env_or_default(
+                    "IG_RATE_LIMIT_BURST_SIZE",
+                    rate_limit_defaults.burst_size,
+                ),
             },
             sleep_hours,
             page_size,
@@ -285,8 +443,131 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<u8>().ok())
                 .filter(|&v| v == 2 || v == 3)
-                .or(Some(3)), // Default to API v3 (OAuth) if not specified
+                .or(Some(DEFAULT_API_VERSION)), // Default to API v3 (OAuth) if not specified
         }
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+
+    fn injected_credentials() -> Credentials {
+        Credentials::new(
+            "embedder-user".to_string(),
+            "embedder-password".to_string(),
+            "EMBEDDER-ACC".to_string(),
+            "embedder-api-key".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_credentials_new_leaves_session_tokens_unset() {
+        let credentials = injected_credentials();
+        assert_eq!(credentials.username, "embedder-user");
+        assert_eq!(credentials.password, "embedder-password");
+        assert_eq!(credentials.account_id, "EMBEDDER-ACC");
+        assert_eq!(credentials.api_key, "embedder-api-key");
+        assert!(credentials.client_token.is_none());
+        assert!(credentials.account_token.is_none());
+    }
+
+    #[test]
+    fn test_config_from_credentials_keeps_injected_credentials_and_env_free_defaults() {
+        // No environment is mutated here (`set_var` is `unsafe` on edition 2024
+        // and racy under the parallel harness), so this asserts the contract
+        // rather than proving env-independence by construction: the injected
+        // credentials survive and every other field equals its documented
+        // default. The end-to-end env-independence check lives in
+        // `tests/unit/application/test_client.rs`, where the injected values
+        // cannot coincide with anything the environment holds.
+        let config = Config::from_credentials(injected_credentials());
+
+        assert_eq!(config.credentials.username, "embedder-user");
+        assert_eq!(config.credentials.api_key, "embedder-api-key");
+        assert_eq!(config.rest_api.base_url, DEFAULT_REST_BASE_URL);
+        assert_eq!(config.rest_api.timeout, DEFAULT_REST_TIMEOUT_SECS);
+        assert_eq!(config.websocket.url, DEFAULT_WS_URL);
+        assert_eq!(
+            config.websocket.reconnect_interval,
+            DEFAULT_WS_RECONNECT_INTERVAL_SECS
+        );
+        assert_eq!(config.database.url, DEFAULT_DATABASE_URL);
+        assert_eq!(
+            config.database.max_connections,
+            DEFAULT_DATABASE_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            config.rate_limiter.max_requests,
+            DEFAULT_CONFIG_RATE_LIMIT_MAX_REQUESTS
+        );
+        assert_eq!(
+            config.rate_limiter.period_seconds,
+            DEFAULT_CONFIG_RATE_LIMIT_PERIOD_SECONDS
+        );
+        assert_eq!(
+            config.rate_limiter.burst_size,
+            DEFAULT_CONFIG_RATE_LIMIT_BURST_SIZE
+        );
+        assert_eq!(config.sleep_hours, DEFAULT_SLEEP_TIME);
+        assert_eq!(config.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(config.days_to_look_back, DAYS_TO_BACK_LOOK);
+        assert_eq!(config.api_version, Some(DEFAULT_API_VERSION));
+    }
+
+    #[test]
+    fn test_config_from_credentials_struct_update_overrides_section() {
+        // The documented override pattern must not fall back to `Config::new()`
+        // (which would run `dotenv()`); the base value is the env-free ctor.
+        let config = Config {
+            rest_api: RestApiConfig {
+                base_url: "https://demo-api.ig.com/gateway/deal".to_string(),
+                timeout: 7,
+            },
+            ..Config::from_credentials(injected_credentials())
+        };
+
+        assert_eq!(
+            config.rest_api.base_url,
+            "https://demo-api.ig.com/gateway/deal"
+        );
+        assert_eq!(config.rest_api.timeout, 7);
+        // Untouched sections keep their env-free defaults.
+        assert_eq!(config.websocket.url, DEFAULT_WS_URL);
+    }
+
+    #[test]
+    fn test_section_defaults_match_documented_constants() {
+        // Guards the refactor that made `Config::new()` use these `Default`
+        // impls as its env fallbacks: the two paths must not drift apart.
+        let rest = RestApiConfig::default();
+        let ws = WebSocketConfig::default();
+        let rate_limiter = RateLimiterConfig::default();
+        let database = DatabaseConfig::default();
+
+        assert_eq!(rest.base_url, DEFAULT_REST_BASE_URL);
+        assert_eq!(rest.timeout, DEFAULT_REST_TIMEOUT_SECS);
+        assert_eq!(ws.url, DEFAULT_WS_URL);
+        assert_eq!(ws.reconnect_interval, DEFAULT_WS_RECONNECT_INTERVAL_SECS);
+        assert_eq!(
+            rate_limiter.max_requests,
+            DEFAULT_CONFIG_RATE_LIMIT_MAX_REQUESTS
+        );
+        assert_eq!(
+            rate_limiter.period_seconds,
+            DEFAULT_CONFIG_RATE_LIMIT_PERIOD_SECONDS
+        );
+        assert_eq!(
+            rate_limiter.burst_size,
+            DEFAULT_CONFIG_RATE_LIMIT_BURST_SIZE
+        );
+        assert_eq!(database.url, DEFAULT_DATABASE_URL);
+        assert_eq!(database.max_connections, DEFAULT_DATABASE_MAX_CONNECTIONS);
+        // The rate-limiter default is NOT the zero-burst fallback constant.
+        assert_ne!(
+            rate_limiter.burst_size,
+            crate::constants::DEFAULT_RATE_LIMIT_BURST_SIZE
+        );
     }
 }
 

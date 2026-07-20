@@ -44,7 +44,7 @@ pub use crate::application::auth::{Auth, Session};
 
 // Configuration
 pub use crate::application::config::{
-    Config, Credentials, RateLimiterConfig, RestApiConfig, WebSocketConfig,
+    Config, Credentials, DatabaseConfig, RateLimiterConfig, RestApiConfig, WebSocketConfig,
 };
 
 // Rate limiter
