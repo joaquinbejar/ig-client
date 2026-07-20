@@ -10,6 +10,22 @@ The new `Client` API provides a dramatically simplified interface for using the 
 - ✅ Transparent error handling and retry logic
 - ✅ Simple, clean API for making requests
 
+## Cargo features
+
+Everything documented here — `Client`, `Client::with_config` and the REST
+service traits — is available with **no features enabled**. Two default-ON
+features gate the heavy legs:
+
+- `streaming` (pulls `lightstreamer-rs`, GPL-3.0-only) — `StreamerClient`,
+  `DynamicMarketStreamer`, `Listener`.
+- `persistence` (pulls `sqlx`) — the `storage` module.
+
+For a REST/poll-only client with neither crate in the dependency graph:
+
+```toml
+ig-client = { version = "0.12.3", default-features = false }
+```
+
 ## Quick Start
 
 ### Basic Usage

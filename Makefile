@@ -60,7 +60,44 @@ fix:
 	cargo fix --allow-staged --allow-dirty
 
 .PHONY: pre-push
-pre-push: fix fmt lint-fix test readme doc
+pre-push: fix fmt lint-fix test readme doc check-features
+
+# Build, lint and test every supported feature combination for the `ig-client`
+# package (scoped with -p so the workspace example crates, which depend on
+# default features, are not dragged into --no-default-features builds), then
+# assert that lightstreamer-rs (GPL-3.0-only) and sqlx stay out of the
+# --no-default-features dependency graph.
+.PHONY: check-features
+check-features:
+	@for features in "--no-default-features" "--no-default-features --features persistence" "--no-default-features --features streaming" "--all-features"; do \
+		echo "==> cargo build -p ig-client $$features"; \
+		cargo build -p ig-client $$features || exit 1; \
+		echo "==> cargo clippy -p ig-client --all-targets $$features -- -D warnings"; \
+		cargo clippy -p ig-client --all-targets $$features -- -D warnings || exit 1; \
+		echo "==> cargo test -p ig-client $$features"; \
+		cargo test -p ig-client $$features || exit 1; \
+		echo "==> cargo doc -p ig-client --no-deps $$features"; \
+		RUSTDOCFLAGS="-D warnings" cargo doc -p ig-client --no-deps $$features || exit 1; \
+	done
+	@echo "==> dependency-graph assertions"
+	@FAILED=0; \
+	check() { \
+		TREE="$$(cargo tree -p ig-client $$1 -e normal)" || exit 1; \
+		if echo "$$TREE" | grep -q "$$2"; then FOUND=present; else FOUND=absent; fi; \
+		if [ "$$FOUND" != "$$3" ]; then \
+			echo "$$2 is $$FOUND in the '$$1' dependency graph, expected $$3"; \
+			FAILED=1; \
+		else \
+			echo "ok: $$2 $$FOUND with '$$1'"; \
+		fi; \
+	}; \
+	check "--no-default-features" lightstreamer-rs absent; \
+	check "--no-default-features --features persistence" lightstreamer-rs absent; \
+	check "--no-default-features --features streaming" lightstreamer-rs present; \
+	check "--no-default-features" sqlx absent; \
+	check "--no-default-features --features streaming" sqlx absent; \
+	check "--no-default-features --features persistence" sqlx present; \
+	exit $$FAILED
 
 .PHONY: doc
 doc:

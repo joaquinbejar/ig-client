@@ -13,6 +13,9 @@
 //! - Account data (P&L, margin, equity)
 
 use serde::{Deserialize, Serialize};
+// Used by the `streaming`-gated field-selector helpers below, and by the test
+// module in every feature configuration.
+#[cfg(any(feature = "streaming", test))]
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 
@@ -80,6 +83,7 @@ impl Display for StreamingMarketField {
 ///
 /// A `Vec<String>` where each `String` is the exact IG Lightstreamer wire name
 /// of a `StreamingMarketField` from the input set.
+#[cfg(feature = "streaming")]
 pub(crate) fn get_streaming_market_fields(fields: &HashSet<StreamingMarketField>) -> Vec<String> {
     // `Display` (via the `Debug` impl above) emits the exact IG Lightstreamer
     // wire field name for every variant, so no fallible serialization is needed.
@@ -382,6 +386,7 @@ impl Display for StreamingPriceField {
 ///
 /// A `Vec<String>` where each `String` is the exact IG Lightstreamer wire name
 /// of a `StreamingPriceField` from the input set.
+#[cfg(feature = "streaming")]
 pub(crate) fn get_streaming_price_fields(fields: &HashSet<StreamingPriceField>) -> Vec<String> {
     // `Display` (via the `Debug` impl above) is the single source of truth for
     // the exact IG Lightstreamer wire field name of every variant, so no
@@ -459,6 +464,7 @@ impl Display for StreamingAccountDataField {
 ///
 /// A `Vec<String>` where each `String` is the exact IG Lightstreamer wire name
 /// of a `StreamingAccountDataField` from the input set.
+#[cfg(feature = "streaming")]
 pub(crate) fn get_streaming_account_data_fields(
     fields: &HashSet<StreamingAccountDataField>,
 ) -> Vec<String> {
@@ -583,6 +589,7 @@ impl std::fmt::Display for StreamingChartField {
 ///
 /// A `Vec<String>` of exact IG Lightstreamer wire field names for
 /// subscriptions.
+#[cfg(feature = "streaming")]
 pub(crate) fn get_streaming_chart_fields(fields: &HashSet<StreamingChartField>) -> Vec<String> {
     // `Display` (via the `Debug` impl above) emits the exact IG Lightstreamer
     // wire field name for every variant, so no fallible serialization is needed.
@@ -631,6 +638,7 @@ mod tests {
         assert_eq!(format!("{}", StreamingMarketField::Offer), "OFFER");
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_market_fields_empty() {
         let fields: HashSet<StreamingMarketField> = HashSet::new();
@@ -638,6 +646,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_market_fields_single() {
         let mut fields = HashSet::new();
@@ -647,6 +656,7 @@ mod tests {
         assert!(result.contains(&"BID".to_string()));
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_market_fields_multiple() {
         let mut fields = HashSet::new();
@@ -660,6 +670,7 @@ mod tests {
         assert!(result.contains(&"HIGH".to_string()));
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_account_data_fields_wire_names() {
         // Pins the exact IG Lightstreamer wire names produced by the getter
@@ -720,6 +731,7 @@ mod tests {
         assert_eq!(format!("{}", StreamingAccountDataField::Equity), "EQUITY");
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_account_fields_empty() {
         let fields: HashSet<StreamingAccountDataField> = HashSet::new();
@@ -727,6 +739,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_account_fields_multiple() {
         let mut fields = HashSet::new();
@@ -761,6 +774,7 @@ mod tests {
         assert_eq!(format!("{}", StreamingChartField::Ofr), "OFR");
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_chart_fields_empty() {
         let fields: HashSet<StreamingChartField> = HashSet::new();
@@ -768,6 +782,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_chart_fields_multiple() {
         let mut fields = HashSet::new();
@@ -1134,6 +1149,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "streaming")]
     #[test]
     fn test_get_streaming_price_fields_uses_display_wire_names() {
         // The price getter now derives wire names from `Display`; pin a couple of

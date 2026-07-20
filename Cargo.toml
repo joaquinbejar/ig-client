@@ -1,6 +1,6 @@
 [package]
 name = "ig-client"
-version = "0.12.2"
+version = "0.12.3"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "This crate provides a client for the IG Markets API"
@@ -25,6 +25,20 @@ include = [
     "Docker/**/*",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Both heavy legs are on by default, so existing users are unaffected.
+default = ["persistence", "streaming"]
+# PostgreSQL persistence (`ig_client::storage`) via sqlx.
+persistence = ["dep:sqlx"]
+# Real-time Lightstreamer streaming (`StreamerClient`, `DynamicMarketStreamer`).
+# `lightstreamer-rs` is GPL-3.0-only, so a permissively-licensed consumer that
+# only needs the REST path can turn this off and keep it out of its graph.
+streaming = ["dep:lightstreamer-rs"]
+
 [dependencies]
 tokio = { workspace = true}
 chrono = { workspace = true}
@@ -33,11 +47,11 @@ tracing-subscriber = { workspace = true}
 serde = { workspace = true}
 serde_json = { workspace = true}
 reqwest ={ workspace = true}
-sqlx = { workspace = true}
+sqlx = { workspace = true, optional = true }
 async-trait = { workspace = true}
 regex = { workspace = true}
 dotenv = { workspace = true}
-lightstreamer-rs = { workspace = true}
+lightstreamer-rs = { workspace = true, optional = true }
 lazy_static = { workspace = true}
 nanoid = { workspace = true}
 pretty-simple-display = { workspace = true}
@@ -86,7 +100,7 @@ members = [
 
 [workspace.dependencies]
 ig-client=  { path = "." }
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

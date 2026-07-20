@@ -11,6 +11,11 @@ ERROR: Response body: {"errorCode":"error.security.oauth-token-invalid"}
 
 This means your OAuth access token has expired and needs to be refreshed. This guide explains how to integrate automatic token refresh into your existing application.
 
+> **Cargo features**: token refresh is part of the REST/session path and works
+> with `default-features = false`. The default-ON `streaming` and `persistence`
+> features only add the Lightstreamer client and the `storage` module
+> respectively.
+
 ## Understanding the Issue
 
 OAuth tokens (API v3) expire after a certain period. When a token expires:

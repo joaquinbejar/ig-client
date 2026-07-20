@@ -1,6 +1,7 @@
 use ig_client::error::{AppError, AuthError};
 use reqwest::StatusCode;
 use serde_json::Error as JsonError;
+#[cfg(feature = "persistence")]
 use sqlx::Error as SqlxError;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -61,6 +62,7 @@ fn test_app_error_from_serde_json_error() {
 }
 
 #[test]
+#[cfg(feature = "persistence")]
 fn test_app_error_from_sqlx_error() {
     // Create a SqlxError (using a simple variant since we can't easily create a real one)
     let sqlx_error = SqlxError::RowNotFound;
@@ -353,6 +355,13 @@ fn test_fetch_error_display() {
     let fetch_error = FetchError::Parser("parsing failed".to_string());
     assert_display_contains(&fetch_error, "parser error");
     assert_display_contains(&fetch_error, "parsing failed");
+}
+
+#[test]
+#[cfg(feature = "persistence")]
+#[allow(deprecated)] // FetchError is deprecated; this pins its Display until removal.
+fn test_fetch_error_sqlx_display() {
+    use ig_client::error::FetchError;
 
     let fetch_error = FetchError::Sqlx(SqlxError::RowNotFound);
     assert_display_contains(&fetch_error, "db error");

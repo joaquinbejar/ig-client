@@ -11,7 +11,7 @@ use std::io;
 /// # Deprecated
 /// This enum is dead: no library code constructs or returns it. Every fetch,
 /// network, database, and parse failure surfaces through [`AppError`] instead
-/// ([`AppError::Network`], [`AppError::Db`], [`AppError::Deserialization`]).
+/// ([`AppError::Network`], `AppError::Db`, [`AppError::Deserialization`]).
 /// It is kept only for backward compatibility and will be removed in a future
 /// release — migrate to [`AppError`].
 #[deprecated(
@@ -24,6 +24,7 @@ pub enum FetchError {
     #[error("network error: {0}")]
     Reqwest(#[from] reqwest::Error),
     /// Database error from sqlx
+    #[cfg(feature = "persistence")]
     #[error("db error: {0}")]
     Sqlx(#[from] sqlx::Error),
     /// Error during parsing
@@ -128,6 +129,7 @@ pub enum AppError {
     #[error("unexpected http status: {0}")]
     Unexpected(StatusCode),
     /// Database error from sqlx
+    #[cfg(feature = "persistence")]
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),
     /// Unauthorized access error
@@ -201,6 +203,7 @@ impl From<String> for AppError {
     }
 }
 
+#[cfg(feature = "streaming")]
 impl From<lightstreamer_rs::utils::LightstreamerError> for AppError {
     #[cold]
     fn from(e: lightstreamer_rs::utils::LightstreamerError) -> Self {

@@ -922,7 +922,7 @@ impl AccountData {
     /// This is transport-agnostic: it takes plain field maps rather than a
     /// Lightstreamer `ItemUpdate`, so the presentation layer carries no
     /// dependency on the streaming transport. The `ItemUpdate` adapter lives in
-    /// [`crate::application::streaming_convert`].
+    /// `application::streaming_convert` (feature `streaming`).
     ///
     /// # Arguments
     /// * `item_name` - Subscription item name (`None` when subscribed by position)

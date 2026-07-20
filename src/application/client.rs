@@ -38,32 +38,45 @@ use crate::model::responses::{
     ClosePositionResponse, CreateOrderResponse, CreateWorkingOrderResponse, UpdatePositionResponse,
 };
 use crate::model::retry::backoff_delay;
+#[cfg(feature = "streaming")]
 use crate::model::streaming::{
     StreamingAccountDataField, StreamingChartField, StreamingMarketField, StreamingPriceField,
     get_streaming_account_data_fields, get_streaming_chart_fields, get_streaming_market_fields,
     get_streaming_price_fields,
 };
+#[cfg(feature = "streaming")]
 use crate::presentation::account::AccountFields;
+#[cfg(feature = "streaming")]
 use crate::presentation::chart::{ChartData, ChartScale};
 use crate::presentation::market::{MarketData, MarketDetails};
+#[cfg(feature = "streaming")]
 use crate::presentation::price::PriceData;
+#[cfg(feature = "streaming")]
 use crate::presentation::trade::TradeFields;
 use async_trait::async_trait;
 use futures::StreamExt;
+#[cfg(feature = "streaming")]
 use lightstreamer_rs::client::{LightstreamerClient, LogType, Transport};
+#[cfg(feature = "streaming")]
 use lightstreamer_rs::subscription::{
     ChannelSubscriptionListener, Snapshot, Subscription, SubscriptionMode,
 };
+#[cfg(feature = "streaming")]
 use lightstreamer_rs::utils::{LightstreamerError, setup_signal_hook};
 use reqwest::StatusCode;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "streaming")]
 use tokio::sync::{Mutex, Notify, mpsc};
+#[cfg(feature = "streaming")]
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+#[cfg(feature = "streaming")]
+use tracing::error;
+use tracing::{debug, info, warn};
 
+#[cfg(feature = "streaming")]
 const MAX_CONNECTION_ATTEMPTS: u64 = 3;
 
 /// Maximum number of concurrent `get_market_details` requests issued while
@@ -79,6 +92,7 @@ const MARKET_DETAILS_CONCURRENCY: usize = 6;
 /// This is not a dedicated error discriminant: `lightstreamer-rs` surfaces it
 /// as free-form text embedded in a server error payload, so it can only be
 /// matched best-effort (see [`is_graceful_close`]).
+#[cfg(feature = "streaming")]
 const GRACEFUL_CLOSE_MARKER: &str = "No more requests to fulfill";
 
 /// Returns `true` if `error` represents a graceful, server-initiated close
@@ -92,6 +106,7 @@ const GRACEFUL_CLOSE_MARKER: &str = "No more requests to fulfill";
 /// classify the typed error on the variants that can carry a server-supplied
 /// reason and match [`GRACEFUL_CLOSE_MARKER`] against the variant's message
 /// payload directly — never against the `Debug` representation.
+#[cfg(feature = "streaming")]
 #[must_use]
 #[inline]
 fn is_graceful_close(error: &LightstreamerError) -> bool {
@@ -118,6 +133,7 @@ fn is_graceful_close(error: &LightstreamerError) -> bool {
 ///
 /// The returned [`JoinHandle`] must be aborted once all connections have
 /// finished so the forwarder does not outlive them.
+#[cfg(feature = "streaming")]
 #[must_use]
 fn spawn_shutdown_fanout(source: Arc<Notify>, targets: Vec<Arc<Notify>>) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -134,6 +150,7 @@ fn spawn_shutdown_fanout(source: Arc<Notify>, targets: Vec<Arc<Notify>>) -> Join
 /// Awaiting after `abort` guarantees each task has fully stopped before we
 /// return; the [`tokio::task::JoinError`] produced by cancellation is expected
 /// and ignored.
+#[cfg(feature = "streaming")]
 async fn abort_and_drain_tasks(tasks: &mut Vec<JoinHandle<()>>) {
     for handle in tasks.drain(..) {
         handle.abort();
@@ -223,8 +240,8 @@ impl Client {
     /// sets neither is unaffected.
     ///
     /// For streaming, pair this with
-    /// [`StreamerClient::with_client`](crate::application::client::StreamerClient::with_client):
-    /// [`StreamerClient::new`](crate::application::client::StreamerClient::new)
+    /// `StreamerClient::with_client`:
+    /// `StreamerClient::new`
     /// builds its own client via [`try_new`](Self::try_new) and would go back
     /// to the `.env` / `IG_*` path.
     ///
@@ -1324,6 +1341,8 @@ impl OperationsService for Client {
 ///   Uses the "Pricing" adapter.
 ///
 /// Each connection type can be managed independently and runs in parallel.
+#[cfg(feature = "streaming")]
+#[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub struct StreamerClient {
     account_id: String,
     market_streamer_client: Option<Arc<Mutex<LightstreamerClient>>>,
@@ -1339,6 +1358,7 @@ pub struct StreamerClient {
     converter_tasks: Vec<JoinHandle<()>>,
 }
 
+#[cfg(feature = "streaming")]
 impl StreamerClient {
     /// Creates a new streaming client instance with its own REST session.
     ///
@@ -2093,6 +2113,7 @@ impl StreamerClient {
     }
 }
 
+#[cfg(feature = "streaming")]
 impl Drop for StreamerClient {
     /// Aborts any converter tasks that were not already torn down by
     /// [`StreamerClient::disconnect`], so dropping the client never orphans a
@@ -2156,7 +2177,13 @@ mod tests {
             StatusCode::BAD_REQUEST
         )));
     }
+}
 
+// The streaming helpers these tests exercise only exist with the `streaming`
+// feature, so they live in their own gated module rather than behind per-test
+// attributes.
+#[cfg(all(test, feature = "streaming"))]
+mod streaming_tests {
     use super::{
         GRACEFUL_CLOSE_MARKER, abort_and_drain_tasks, is_graceful_close, spawn_shutdown_fanout,
     };

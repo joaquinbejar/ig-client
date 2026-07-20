@@ -8,8 +8,7 @@ use crate::error::AppError;
 use lightstreamer_rs::subscription::{ItemUpdate, SubscriptionListener};
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
-use tracing::log::debug;
-use tracing::{error, info};
+use tracing::{error, info, trace};
 
 /// Result type for listener operations that don't return a value but may return an error
 pub type ListenerResult = Result<(), AppError>;
@@ -78,8 +77,10 @@ where
         let data: T = T::from(update);
 
         match self.callback(&data) {
-            Ok(_) => debug!("{data}"),
-            Err(e) => error!("Error in trade data callback: {}", e),
+            // TRACE, not DEBUG: this fires on every streaming tick and renders
+            // the whole payload (account updates carry P&L, equity and margin).
+            Ok(_) => trace!(update = %data, "streaming item update"),
+            Err(e) => error!(error = %e, "streaming callback failed"),
         }
     }
 
