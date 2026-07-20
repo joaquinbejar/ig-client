@@ -380,6 +380,18 @@ impl HttpClient {
     pub fn auth(&self) -> &Auth {
         &self.auth
     }
+
+    /// Returns the configuration this HTTP client was built with.
+    ///
+    /// `Config`'s `Debug` / `Display` impls redact credentials and the database
+    /// URL, so the returned value can be rendered that way without leaking
+    /// secrets. Its `Serialize` impl does **not** redact — never serialize a
+    /// `Config` into logs, telemetry or an error payload.
+    #[inline]
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
 }
 
 /// Makes an HTTP request with automatic rate limiting and retry on rate limit errors

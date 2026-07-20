@@ -7,6 +7,10 @@ edition = "2024"
 name = "historical_prices_example"
 path = "src/bin/historical_prices_example.rs"
 
+[[bin]]
+name = "client_with_config"
+path = "src/bin/client_with_config.rs"
+
 [dependencies]
 ig-client = { workspace = true }
 tracing = { workspace = true }

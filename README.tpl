@@ -12,6 +12,21 @@
 
 {{readme}}
 
+## What's New in 0.12.2
+
+- `Client::with_config(config)` builds a client from a caller-supplied
+  `Config`, reading no environment variable and loading no `.env` file — the
+  injection path for applications that own their configuration source.
+  `Client::try_new()` is unchanged and remains the `.env` / `IG_*` convenience
+  path ([#81](https://github.com/joaquinbejar/ig-client/issues/81)).
+- `Config::from_credentials(credentials)` and `Credentials::new(..)` build a
+  configuration entirely from caller-supplied values, with `Default` impls on
+  `RestApiConfig`, `WebSocketConfig`, `RateLimiterConfig` and `DatabaseConfig`
+  supplying the non-credential defaults (the same values `Config::new()` falls
+  back to).
+- `Client::config()` / `HttpClient::config()` expose the effective
+  configuration (secrets stay redacted in `Debug` / `Display`).
+
 ## What's New in 0.12.1
 
 - The `historical_prices` unique-constraint migration now tolerates

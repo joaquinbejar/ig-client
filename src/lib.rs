@@ -43,7 +43,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = "0.12.1"
+//! ig-client = "0.12.2"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
@@ -51,7 +51,10 @@
 //! ```
 //!
 //! You do not need to add `dotenv` yourself — `Config::new()` loads a local
-//! `.env` file internally.
+//! `.env` file internally. If your application supplies its own configuration
+//! and must not read a `.env` file or the `IG_*` namespace, use
+//! `Config::from_credentials()` with `Client::with_config()` instead (see
+//! [Programmatic configuration](#programmatic-configuration-embedders)).
 //!
 //! ### Requirements
 //!
@@ -88,6 +91,71 @@
 //! Live examples and integration tests default to the IG **demo** environment;
 //! pointing anything at production requires an explicit opt-in via
 //! `IG_REST_BASE_URL` / `IG_WS_URL`.
+//!
+//! ### Programmatic configuration (embedders)
+//!
+//! There are two configuration paths and they do not mix:
+//!
+//! - `Config::new()` / `Client::try_new()` — the **convenience path**. Loads a
+//!   local `.env` file and reads the global `IG_*` namespace, as above.
+//! - `Config::from_credentials()` / `Client::with_config()` — the **injection
+//!   path**. Reads no environment variable and loads no `.env` file, for an
+//!   embedding application that owns its configuration source (its own
+//!   namespaced variables, a config file, a secrets manager). Useful under
+//!   `#![forbid(unsafe_code)]`, where pre-populating `IG_*` is not an option
+//!   because `std::env::set_var` is `unsafe` on edition 2024.
+//!
+//! ```rust,no_run
+//! use ig_client::prelude::*;
+//!
+//! // Fail fast on a missing variable: an empty credential would only surface
+//! // later as a confusing authentication failure. Never log the value.
+//! fn required_var(name: &str) -> Result<String, AppError> {
+//!     std::env::var(name).map_err(|_| AppError::InvalidInput(format!("{name} is not set")))
+//! }
+//!
+//! # fn main() -> Result<(), AppError> {
+//! let credentials = Credentials::new(
+//!     required_var("MYAPP_IG_USERNAME")?,
+//!     required_var("MYAPP_IG_PASSWORD")?,
+//!     required_var("MYAPP_IG_ACCOUNT_ID")?,
+//!     required_var("MYAPP_IG_API_KEY")?,
+//! );
+//!
+//! // Struct update overrides individual sections and stays env-free,
+//! // because the base value is the env-free constructor.
+//! let config = Config {
+//!     rest_api: RestApiConfig {
+//!         base_url: "https://demo-api.ig.com/gateway/deal".to_string(),
+//!         timeout: 30,
+//!     },
+//!     ..Config::from_credentials(credentials)
+//! };
+//!
+//! let client = Client::with_config(config)?;
+//! println!("REST base URL: {}", client.config().rest_api.base_url);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Non-credential fields default to the IG **demo** endpoints; see
+//! `examples/simples/src/bin/client_with_config.rs` for a runnable version.
+//!
+//! For streaming, build the streamer from the injected client with
+//! `StreamerClient::with_client(&client)` — `StreamerClient::new()` goes
+//! through `Client::try_new()` and therefore back to `.env` / `IG_*`.
+//!
+//! Two knobs are still resolved from the process environment on the injected
+//! path, because they are not part of `Config`:
+//!
+//! - Retry policy — `MAX_RETRY_COUNT` and `RETRY_DELAY_SECS` are read per
+//!   request via `RetryConfig::default()`; unset means the crate defaults.
+//! - `IG_PRICING_ADAPTER` — the Lightstreamer price adapter name, defaulting
+//!   to `Pricing` when unset.
+//!
+//! Neither carries a credential, and both have safe defaults, so an embedder
+//! that sets neither variable is unaffected. Moving them into `Config` is a
+//! breaking change scheduled for a future minor release.
 //!
 //! ## Usage
 //!

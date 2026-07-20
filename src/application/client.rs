@@ -177,12 +177,15 @@ pub struct Client {
 }
 
 impl Client {
-    /// Creates a new client instance without performing initial authentication,
-    /// returning an error if the underlying HTTP client cannot be constructed.
+    /// Creates a new client instance from the environment, without performing
+    /// initial authentication, returning an error if the underlying HTTP client
+    /// cannot be constructed.
     ///
-    /// This is the sole constructor for [`Client`]: it builds the underlying
-    /// [`HttpClient`] via [`HttpClient::new_lazy`] and surfaces a
-    /// client-construction failure as a typed [`AppError`] instead of panicking.
+    /// This is the environment convenience path: the configuration comes from
+    /// [`Config::default`], which loads a local `.env` file and reads the
+    /// `IG_*` environment namespace. Embedders that supply their own
+    /// configuration should use [`Client::with_config`] instead, which touches
+    /// neither.
     ///
     /// # Returns
     /// * `Ok(Client)` - A client ready to use with the default configuration.
@@ -194,6 +197,85 @@ impl Client {
     pub fn try_new() -> Result<Self, AppError> {
         let http_client = Arc::new(HttpClient::new_lazy(Config::default())?);
         Ok(Self { http_client })
+    }
+
+    /// Creates a new client instance from a caller-supplied [`Config`], without
+    /// reading a `.env` file or the `IG_*` environment namespace.
+    ///
+    /// This is the injection path for applications that own their
+    /// configuration source (their own namespaced environment variables, a
+    /// config file, a secrets manager) and must not have the crate reach for
+    /// globals. Build the `Config` with
+    /// [`Config::from_credentials`](crate::application::config::Config::from_credentials),
+    /// which is likewise env-free; [`Client::try_new`] remains the `.env`
+    /// convenience path.
+    ///
+    /// As with [`try_new`](Self::try_new), no authentication is performed here:
+    /// session login and token refresh happen transparently on the first API
+    /// call.
+    ///
+    /// Two knobs live outside [`Config`] and are still resolved from the
+    /// process environment on this path: the retry policy (`MAX_RETRY_COUNT` /
+    /// `RETRY_DELAY_SECS`, read per request by
+    /// [`RetryConfig::default`](crate::model::retry::RetryConfig)) and
+    /// `IG_PRICING_ADAPTER` (the Lightstreamer price adapter name). Neither
+    /// carries a credential and both have safe defaults, so an embedder that
+    /// sets neither is unaffected.
+    ///
+    /// For streaming, pair this with
+    /// [`StreamerClient::with_client`](crate::application::client::StreamerClient::with_client):
+    /// [`StreamerClient::new`](crate::application::client::StreamerClient::new)
+    /// builds its own client via [`try_new`](Self::try_new) and would go back
+    /// to the `.env` / `IG_*` path.
+    ///
+    /// ```rust,no_run
+    /// use ig_client::prelude::*;
+    ///
+    /// // Fail fast on a missing variable: an empty credential would only
+    /// // surface later as a confusing authentication failure.
+    /// fn required_var(name: &str) -> Result<String, AppError> {
+    ///     std::env::var(name).map_err(|_| AppError::InvalidInput(format!("{name} is not set")))
+    /// }
+    ///
+    /// # fn main() -> Result<(), AppError> {
+    /// let credentials = Credentials::new(
+    ///     required_var("MYAPP_IG_USERNAME")?,
+    ///     required_var("MYAPP_IG_PASSWORD")?,
+    ///     required_var("MYAPP_IG_ACCOUNT_ID")?,
+    ///     required_var("MYAPP_IG_API_KEY")?,
+    /// );
+    /// let client = Client::with_config(Config::from_credentials(credentials))?;
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Arguments
+    /// * `config` - The configuration the client and its session layer will use.
+    ///
+    /// # Returns
+    /// * `Ok(Client)` - A client ready to use with `config`.
+    /// * `Err(AppError)` - If the underlying HTTP client cannot be constructed.
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
+    /// be built (e.g. the system TLS backend fails to initialize).
+    pub fn with_config(config: Config) -> Result<Self, AppError> {
+        let http_client = Arc::new(HttpClient::new_lazy(config)?);
+        Ok(Self { http_client })
+    }
+
+    /// Returns the configuration this client was built with.
+    ///
+    /// Useful to confirm which environment the client is pointed at (e.g.
+    /// `client.config().rest_api.base_url`). `Config`'s `Debug` / `Display`
+    /// redact credentials and the database URL, so rendering it that way is
+    /// safe. Its `Serialize` impl does **not** redact — never serialize a
+    /// `Config` into logs, telemetry or an error payload.
+    #[inline]
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        self.http_client.config()
     }
 
     /// Gets WebSocket connection information for Lightstreamer, reusing the
