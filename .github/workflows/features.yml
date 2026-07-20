@@ -1,0 +1,94 @@
+name: Features
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+
+# Cancel any in-flight jobs for the same PR/branch so there's only one active
+# at a time
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  features:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features persistence"
+          - "--no-default-features --features streaming"
+          - "--all-features"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config build-essential
+
+      - name: Build (${{ matrix.features }})
+        run: cargo build -p ig-client ${{ matrix.features }}
+
+      - name: Clippy (${{ matrix.features }})
+        run: cargo clippy -p ig-client --all-targets ${{ matrix.features }} -- -D warnings
+
+      - name: Test (${{ matrix.features }})
+        run: cargo test -p ig-client ${{ matrix.features }}
+
+      # Intra-doc links can point at items that only exist under some feature
+      # combination; rustdoc only reports that in the combination that lacks them.
+      - name: Doc (${{ matrix.features }})
+        run: cargo doc -p ig-client --no-deps ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  dependency-graph:
+    name: no-default-features dependency graph is clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config build-essential
+
+      - name: Assert each optional dependency appears only with its feature
+        run: |
+          FAILED=0
+          check() {
+            FEATURES="$1"; CRATE="$2"; EXPECTED="$3"
+            TREE="$(cargo tree -p ig-client $FEATURES -e normal)" || exit 1
+            if echo "$TREE" | grep -q "$CRATE"; then FOUND=present; else FOUND=absent; fi
+            if [ "$FOUND" != "$EXPECTED" ]; then
+              echo "::error::$CRATE is $FOUND in the '$FEATURES' dependency graph, expected $EXPECTED"
+              FAILED=1
+            else
+              echo "ok: $CRATE $FOUND with '$FEATURES'"
+            fi
+          }
+          # lightstreamer-rs is GPL-3.0-only: it must appear only with `streaming`.
+          check "--no-default-features" lightstreamer-rs absent
+          check "--no-default-features --features persistence" lightstreamer-rs absent
+          check "--no-default-features --features streaming" lightstreamer-rs present
+          check "--no-default-features" sqlx absent
+          check "--no-default-features --features streaming" sqlx absent
+          check "--no-default-features --features persistence" sqlx present
+          exit $FAILED
