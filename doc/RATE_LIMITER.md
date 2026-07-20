@@ -12,17 +12,23 @@ Rate limiting is configured through environment variables that are loaded when c
 
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
-| `IG_RATE_LIMIT_MAX_REQUESTS` | Maximum number of requests allowed per period | 60 | 60 |
-| `IG_RATE_LIMIT_PERIOD_SECONDS` | Time period in seconds for the rate limit | 60 | 60 |
-| `IG_RATE_LIMIT_BURST_SIZE` | Maximum number of requests that can be made at once (burst) | 10 | 10 |
+| `IG_RATE_LIMIT_MAX_REQUESTS` | Maximum number of requests allowed per period | 4 | 4 |
+| `IG_RATE_LIMIT_PERIOD_SECONDS` | Time period in seconds for the rate limit | 12 | 12 |
+| `IG_RATE_LIMIT_BURST_SIZE` | Maximum number of requests that can be made at once (burst) | 3 | 3 |
+
+The defaults are the canonical `DEFAULT_CONFIG_RATE_LIMIT_MAX_REQUESTS`,
+`DEFAULT_CONFIG_RATE_LIMIT_PERIOD_SECONDS` and
+`DEFAULT_CONFIG_RATE_LIMIT_BURST_SIZE` constants in `src/constants.rs`, which
+also back `RateLimiterConfig::default()` — the value used by the environment-free
+`Config::from_credentials` path.
 
 ### Example .env File
 
 ```env
 # Rate Limiter Configuration
-IG_RATE_LIMIT_MAX_REQUESTS=60
-IG_RATE_LIMIT_PERIOD_SECONDS=60
-IG_RATE_LIMIT_BURST_SIZE=10
+IG_RATE_LIMIT_MAX_REQUESTS=4
+IG_RATE_LIMIT_PERIOD_SECONDS=12
+IG_RATE_LIMIT_BURST_SIZE=3
 ```
 
 ## How It Works
@@ -39,19 +45,19 @@ The rate limiter uses a token bucket algorithm:
 
 #### Scenario 1: Steady Rate
 ```
-Config: 60 requests per 60 seconds, burst size 10
+Config: 4 requests per 12 seconds, burst size 3
 
-- Can make 10 requests immediately (burst)
-- Then limited to ~1 request per second
-- Over 60 seconds, can make 60 requests total
+- Can make 3 requests immediately (burst)
+- Then limited to ~1 request every 3 seconds
+- Over 12 seconds, can make 4 requests total
 ```
 
 #### Scenario 2: Burst Handling
 ```
-Config: 60 requests per 60 seconds, burst size 20
+Config: 4 requests per 12 seconds, burst size 10
 
-- Can make 20 requests immediately (larger burst)
-- Then rate-limited to maintain average of 60/minute
+- Can make 10 requests immediately (larger burst)
+- Then rate-limited to maintain the average of 4 per 12 seconds
 ```
 
 ## Usage
@@ -128,9 +134,9 @@ According to IG Markets documentation, the API has the following limits:
 
 For general use:
 ```env
-IG_RATE_LIMIT_MAX_REQUESTS=60
-IG_RATE_LIMIT_PERIOD_SECONDS=60
-IG_RATE_LIMIT_BURST_SIZE=10
+IG_RATE_LIMIT_MAX_REQUESTS=4
+IG_RATE_LIMIT_PERIOD_SECONDS=12
+IG_RATE_LIMIT_BURST_SIZE=3
 ```
 
 For conservative use (to stay well under limits):
