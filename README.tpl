@@ -12,6 +12,31 @@
 
 {{readme}}
 
+## What's New in 0.12.3
+
+- The crate now has Cargo **features**, both on by default so existing users are
+  unaffected ([#83](https://github.com/joaquinbejar/ig-client/issues/83)):
+  - `streaming` — the Lightstreamer leg (`StreamerClient`,
+    `DynamicMarketStreamer`, `Listener`, the `ItemUpdate` adapters), pulling in
+    `lightstreamer-rs`.
+  - `persistence` — the `storage` module, pulling in `sqlx`.
+- `ig-client = { version = "0.12.3", default-features = false }` gives a
+  REST/poll-only client with **neither** crate in the dependency graph. This
+  matters for licensing: `lightstreamer-rs` is GPL-3.0-only, so a permissively
+  licensed consumer with a copyleft-rejecting `cargo deny` policy previously
+  could not depend on `ig-client` at all.
+- Fixed two latent dependencies on features that only arrived transitively:
+  - Two modules imported `tracing::log::debug`, which resolved only because
+    `sqlx` enabled `tracing`'s `log` feature. These are now native `tracing`
+    events. **Behaviour change:** `tracing::log::debug` emitted a `log` record,
+    and `setup_logger` installs no `log` bridge, so those two `.env`-loading
+    messages were previously discarded — they now appear at DEBUG. Relatedly,
+    the streaming listener's per-tick payload line moved from DEBUG to TRACE:
+    it fires on every tick and renders account payloads (P&L, equity, margin).
+  - `tokio`'s `sync` feature is now declared explicitly. The crate uses
+    `tokio::sync` on the REST path but was receiving the feature only through
+    `reqwest`'s own dependencies.
+
 ## What's New in 0.12.2
 
 - `Client::with_config(config)` builds a client from a caller-supplied
