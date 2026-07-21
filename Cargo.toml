@@ -100,7 +100,7 @@ members = [
 
 [workspace.dependencies]
 ig-client=  { path = "." }
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
@@ -110,13 +110,15 @@ reqwest = { version = "0.13", features = ["json"] }
 criterion = "0.8"
 sqlx = { version = "0.9", features = [ "postgres","macros","chrono","runtime-tokio","tls-native-tls"]}
 async-trait = "0.1"
-regex = "1.12"
+regex = "1.13"
 dotenv = "0.15"
-lightstreamer-rs = "0.3.3"
+# Pointed at the local v1 rewrite (MIT) while it is unpublished. Becomes a
+# plain version requirement once 1.0 is on crates.io.
+lightstreamer-rs = { path = "../lightstreamer-rs" }
 lazy_static = "1.5"
 nanoid = "0.5"
 pretty-simple-display = "0.1"
 governor = "0.10"
 prettytable-rs = "0.10"
 futures = "0.3"
-thiserror = "2"
+thiserror = "2.0"
