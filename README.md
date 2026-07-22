@@ -57,7 +57,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ig-client = "0.12.3"
+ig-client = "0.13.0"
 tokio = { version = "1", features = ["full"] }  # Async runtime
 tracing = "0.1"                                  # Logging facade
 # Optional, only if you use the PostgreSQL persistence layer:
@@ -82,7 +82,7 @@ opt out. Turn them off for a REST/poll-only client:
 
 ```toml
 [dependencies]
-ig-client = { version = "0.12.3", default-features = false }
+ig-client = { version = "0.13.0", default-features = false }
 ```
 
 That leaves `Client`, `Client::with_config`, every REST service trait
@@ -470,6 +470,30 @@ Contributions are welcome:
 
 Please make sure your code passes all tests and linting checks before
 submitting a pull request.
+
+## What's New in 0.13.0
+
+- **`lightstreamer-rs` is now the MIT `1.0`.** The streaming leg previously
+  pulled in `lightstreamer-rs` 0.3.x, which was **GPL-3.0-only**; `1.0` is a
+  from-scratch clean-room rewrite under **MIT**. A permissively-licensed
+  consumer with a copyleft-rejecting `cargo deny` policy can now depend on
+  `ig-client` with `streaming` on. Turning `streaming` off is henceforth a
+  build-weight choice, not a licence one.
+- **Breaking (streaming surface).** The upstream rewrite replaced its
+  listener-trait delivery with typed streams, so the seam this crate exposes
+  changed:
+  - The boundary DTO is now `StreamingUpdate` (a crate-owned, owned, serde
+    type), re-exported from the prelude. It replaces the previously re-exported
+    upstream `ItemUpdate`. Implement `From<&StreamingUpdate>` to plug your own
+    type into `Listener<T>` — the callback `Listener<T>` surface is unchanged.
+  - The internal `Arc<Mutex<LightstreamerClient>>` became a plain `Arc<Client>`
+    (the upstream client is `Send + Sync` and takes `&self`), and the
+    string-sniffing graceful-close detection is gone: a clean shutdown is now a
+    typed `ClosedReason::ByClient`.
+  - Reconnection consequences are surfaced honestly: `SessionEvent::Connected`
+    carries a `Continuity`, and a *replaced* session (stale derived state) is
+    distinguished from a preserved or recovered one.
+- REST, persistence, rate-limiting, retry and the DTOs are unchanged.
 
 ## What's New in 0.12.3
 
