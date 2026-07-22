@@ -13,6 +13,8 @@ use crate::application::interfaces::operations::OperationsService;
 use crate::application::interfaces::order::OrderService;
 use crate::application::interfaces::sentiment::SentimentService;
 use crate::application::interfaces::watchlist::WatchlistService;
+#[cfg(feature = "streaming")]
+use crate::application::streaming_convert::StreamingUpdate;
 use crate::error::AppError;
 use crate::model::requests::RecentPricesRequest;
 use crate::model::requests::{
@@ -56,28 +58,23 @@ use crate::presentation::trade::TradeFields;
 use async_trait::async_trait;
 use futures::StreamExt;
 #[cfg(feature = "streaming")]
-use lightstreamer_rs::client::{LightstreamerClient, LogType, Transport};
-#[cfg(feature = "streaming")]
-use lightstreamer_rs::subscription::{
-    ChannelSubscriptionListener, Snapshot, Subscription, SubscriptionMode,
+use lightstreamer_rs::{
+    Client as LsClient, ClientConfig, ClosedReason, Continuity, Credentials, FieldSchema,
+    ItemGroup, ServerAddress, SessionEvent, SessionEvents, Snapshot, Subscription,
+    SubscriptionEvent, SubscriptionMode,
 };
-#[cfg(feature = "streaming")]
-use lightstreamer_rs::utils::{LightstreamerError, setup_signal_hook};
 use reqwest::StatusCode;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(feature = "streaming")]
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 #[cfg(feature = "streaming")]
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-#[cfg(feature = "streaming")]
-use tracing::error;
 use tracing::{debug, info, warn};
-
 #[cfg(feature = "streaming")]
-const MAX_CONNECTION_ATTEMPTS: u64 = 3;
+use tracing::{error, trace};
 
 /// Maximum number of concurrent `get_market_details` requests issued while
 /// resolving per-symbol expiry dates in [`Client::get_vec_db_entries`].
@@ -86,76 +83,19 @@ const MAX_CONNECTION_ATTEMPTS: u64 = 3;
 /// network latency, it does not widen the request budget.
 const MARKET_DETAILS_CONCURRENCY: usize = 6;
 
-/// Server-supplied close reason IG sends on a streaming session once it has no
-/// active subscriptions left to serve.
+/// Awaits every task in `tasks` and then clears the list.
 ///
-/// This is not a dedicated error discriminant: `lightstreamer-rs` surfaces it
-/// as free-form text embedded in a server error payload, so it can only be
-/// matched best-effort (see [`is_graceful_close`]).
+/// The caller must have signalled the tasks to stop first (see
+/// [`StreamerClient::disconnect`]); this only waits for them to observe it, so
+/// no update is dropped mid-conversion. A task that panicked yields a
+/// [`tokio::task::JoinError`], which is logged and otherwise ignored — teardown
+/// must not fail because a converter did.
 #[cfg(feature = "streaming")]
-const GRACEFUL_CLOSE_MARKER: &str = "No more requests to fulfill";
-
-/// Returns `true` if `error` represents a graceful, server-initiated close
-/// rather than a real connection failure.
-///
-/// IG closes a streaming session with the server reason
-/// "No more requests to fulfill" once it has no active subscriptions. The
-/// upstream [`LightstreamerError`] exposes no graceful-close discriminant — the
-/// reason arrives as free-form text embedded in a server error message
-/// (`conerr` is wrapped into [`LightstreamerError::Connection`]). We therefore
-/// classify the typed error on the variants that can carry a server-supplied
-/// reason and match [`GRACEFUL_CLOSE_MARKER`] against the variant's message
-/// payload directly — never against the `Debug` representation.
-#[cfg(feature = "streaming")]
-#[must_use]
-#[inline]
-fn is_graceful_close(error: &LightstreamerError) -> bool {
-    match error {
-        LightstreamerError::Connection(msg)
-        | LightstreamerError::Protocol(msg)
-        | LightstreamerError::InvalidState(msg) => msg.contains(GRACEFUL_CLOSE_MARKER),
-        _ => false,
-    }
-}
-
-/// Spawns a task that waits for `source` to be notified once and then wakes
-/// every signal in `targets`.
-///
-/// This fans a single shutdown signal out to each per-connection signal so that
-/// *all* streaming connections stop. It works around `Notify::notify_one`
-/// waking only a single waiter: a shared `Notify` cannot shut down both the
-/// market and price connections, so each connection gets its own dedicated
-/// signal woken here.
-///
-/// Each per-connection signal has exactly one waiter, so `notify_one` (which
-/// stores a permit when no waiter is currently parked) wakes it reliably even
-/// if the connection is momentarily busy processing a frame.
-///
-/// The returned [`JoinHandle`] must be aborted once all connections have
-/// finished so the forwarder does not outlive them.
-#[cfg(feature = "streaming")]
-#[must_use]
-fn spawn_shutdown_fanout(source: Arc<Notify>, targets: Vec<Arc<Notify>>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        source.notified().await;
-        for target in &targets {
-            target.notify_one();
-        }
-    })
-}
-
-/// Aborts every task in `tasks` and awaits its termination, then clears the
-/// list.
-///
-/// Awaiting after `abort` guarantees each task has fully stopped before we
-/// return; the [`tokio::task::JoinError`] produced by cancellation is expected
-/// and ignored.
-#[cfg(feature = "streaming")]
-async fn abort_and_drain_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+async fn join_tasks(tasks: &mut Vec<JoinHandle<()>>) {
     for handle in tasks.drain(..) {
-        handle.abort();
-        // Ignore the cancellation `JoinError`; we only need the task to stop.
-        let _ = handle.await;
+        if let Err(e) = handle.await {
+            warn!(error = %e, "streaming converter task did not exit cleanly");
+        }
     }
 }
 
@@ -1334,37 +1274,64 @@ impl OperationsService for Client {
 
 /// Streaming client for IG Markets real-time data.
 ///
-/// This client manages two Lightstreamer connections for different data types:
-/// - **Market streamer**: Handles market data (prices, market state), trade updates (CONFIRMS, OPU, WOU),
-///   and account updates (positions, orders, balance). Uses the default adapter.
-/// - **Price streamer**: Handles detailed price data (bid/ask levels, sizes, multiple currencies).
-///   Uses the "Pricing" adapter.
+/// One Lightstreamer session carries every IG channel: market data
+/// (`MARKET:`), detailed prices (`PRICE:`, served by the `Pricing` data
+/// adapter), trade confirmations (`TRADE:`), account balances (`ACCOUNT:`) and
+/// candles (`CHART:`). The data adapter is a property of the *subscription*, so
+/// one session is enough — the pair of connections this type used to open was a
+/// workaround for the previous client library.
 ///
-/// Each connection type can be managed independently and runs in parallel.
+/// # Lifecycle
+///
+/// The session is opened lazily by the first `*_subscribe` call and lives until
+/// [`disconnect`](Self::disconnect) or `Drop`. [`connect`](Self::connect) does
+/// not open it; it consumes the session event stream and blocks until the
+/// shutdown signal fires or the session ends for good, which is what makes it
+/// usable as the "run until stopped" body of a streaming binary.
+///
+/// # Channels
+///
+/// Each `*_subscribe` returns an unbounded receiver of decoded DTOs. The sender
+/// is owned by a converter task spawned per subscription; when the caller drops
+/// the receiver that task logs and exits, and when the session ends the
+/// subscription stream closes and the task exits. Every one of those tasks is
+/// tracked and joined by [`disconnect`](Self::disconnect), so none outlives the
+/// client.
 #[cfg(feature = "streaming")]
 #[cfg_attr(docsrs, doc(cfg(feature = "streaming")))]
 pub struct StreamerClient {
     account_id: String,
-    market_streamer_client: Option<Arc<Mutex<LightstreamerClient>>>,
-    price_streamer_client: Option<Arc<Mutex<LightstreamerClient>>>,
-    // Flags indicating whether there is at least one active subscription for each client
+    /// The validated session configuration, used to open the session on the
+    /// first subscription. It carries the Lightstreamer password (the IG
+    /// session token), so this type deliberately has no `Debug` impl of its
+    /// own; the upstream `Credentials` redacts the password in its own.
+    config: ClientConfig,
+    /// The live session, `None` until the first subscription and again after
+    /// `disconnect`. `Client::subscribe` takes `&self`, so no lock is needed.
+    client: Option<LsClient>,
+    /// The session event stream, taken by `connect`.
+    session_events: Option<SessionEvents>,
+    /// Shutdown signal for the converter tasks. `watch` rather than `Notify`:
+    /// it is level-triggered, so a task busy converting an update when the
+    /// signal fires still observes it.
+    shutdown_tx: watch::Sender<bool>,
+    /// Handles for the per-subscription update -> DTO converter tasks. Each
+    /// `*_subscribe` call spawns one; `disconnect` signals and joins them so
+    /// they do not idle for the process lifetime.
+    converter_tasks: Vec<JoinHandle<()>>,
+    // Flags indicating whether there is at least one active subscription of
+    // each kind, so `connect` can report what it is actually waiting on.
     has_market_stream_subs: bool,
     has_price_stream_subs: bool,
-    // Handles for the per-subscription `ItemUpdate` -> DTO converter tasks. Each
-    // `*_subscribe` call spawns one; `disconnect` aborts and drains them so they
-    // do not idle for the process lifetime. This field is private and only ever
-    // populated inside this type's methods, so adding it does not change the
-    // constructed-via-`new` public surface.
-    converter_tasks: Vec<JoinHandle<()>>,
 }
 
 #[cfg(feature = "streaming")]
 impl StreamerClient {
     /// Creates a new streaming client instance with its own REST session.
     ///
-    /// This builds a fresh [`Client`], logs in to obtain the Lightstreamer
-    /// connection details, and initializes both streaming clients (market and
-    /// price). No connection is established yet — that happens on `connect()`.
+    /// This builds a fresh [`Client`] and logs in to obtain the Lightstreamer
+    /// endpoint and credentials. No connection is established yet — the session
+    /// opens on the first subscription.
     ///
     /// When the caller already holds a [`Client`] with an active REST session,
     /// prefer [`with_client`](Self::with_client) to reuse that session instead
@@ -1372,8 +1339,9 @@ impl StreamerClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AppError`] if the login / session lookup or Lightstreamer
-    /// client initialization fails.
+    /// Returns [`AppError`] if the login / session lookup fails, or
+    /// [`AppError::InvalidInput`] if IG returned an endpoint the Lightstreamer
+    /// client rejects.
     pub async fn new() -> Result<Self, AppError> {
         let client = Client::try_new()?;
         Self::with_client(&client).await
@@ -1385,57 +1353,146 @@ impl StreamerClient {
     /// Unlike [`new`](Self::new), this does not build a second HTTP client or
     /// perform a second login: it reuses `client`'s cached session (via
     /// [`Client::ws_info`]) to obtain the Lightstreamer endpoint and
-    /// credentials. Both streaming clients (market and price) are initialized
-    /// but no connection is established until `connect()` is called.
+    /// credentials.
     ///
     /// # Errors
     ///
-    /// Returns [`AppError`] if the session lookup or Lightstreamer client
-    /// initialization fails.
+    /// Returns [`AppError`] if the session lookup fails, or
+    /// [`AppError::InvalidInput`] if IG returned an endpoint the Lightstreamer
+    /// client rejects.
     pub async fn with_client(client: &Client) -> Result<Self, AppError> {
         let ws_info = client.ws_info().await?;
-        let password = ws_info.get_ws_password();
 
-        // Market data client (no adapter specified - uses default)
-        let market_streamer_client = Arc::new(Mutex::new(LightstreamerClient::new(
-            Some(ws_info.server.as_str()),
-            None,
-            Some(&ws_info.account_id),
-            Some(&password),
-        )?));
+        // The Lightstreamer password IS the IG session token pair
+        // (`CST-…|XST-…`). It goes into `Credentials`, whose `Debug` redacts
+        // it, and is never logged or echoed anywhere on this path.
+        let config = ClientConfig::builder(ServerAddress::try_new(ws_info.server.as_str())?)
+            .with_credentials(Credentials::new(
+                ws_info.account_id.as_str(),
+                ws_info.get_ws_password(),
+            ))
+            .build()?;
 
-        let price_streamer_client = Arc::new(Mutex::new(LightstreamerClient::new(
-            Some(ws_info.server.as_str()),
-            None,
-            Some(&ws_info.account_id),
-            Some(&password),
-        )?));
-
-        // Force WebSocket streaming transport on both clients to satisfy IG requirements
-        // and configure logging to use tracing levels for proper log propagation
-        {
-            let mut streamer = market_streamer_client.lock().await;
-            streamer
-                .connection_options
-                .set_forced_transport(Some(Transport::WsStreaming));
-            streamer.set_logging_type(LogType::TracingLogs);
-        }
-        {
-            let mut streamer = price_streamer_client.lock().await;
-            streamer
-                .connection_options
-                .set_forced_transport(Some(Transport::WsStreaming));
-            streamer.set_logging_type(LogType::TracingLogs);
-        }
+        let (shutdown_tx, _) = watch::channel(false);
 
         Ok(Self {
             account_id: ws_info.account_id.clone(),
-            market_streamer_client: Some(market_streamer_client),
-            price_streamer_client: Some(price_streamer_client),
+            config,
+            client: None,
+            session_events: None,
+            shutdown_tx,
+            converter_tasks: Vec::new(),
             has_market_stream_subs: false,
             has_price_stream_subs: false,
-            converter_tasks: Vec::new(),
         })
+    }
+
+    /// Opens the Lightstreamer session if it is not open yet, and returns it.
+    ///
+    /// Called by every `*_subscribe`: the session cannot be opened in the
+    /// constructor because `lightstreamer-rs` connects eagerly, and connecting
+    /// before there is anything to subscribe to would open a socket that is
+    /// only ever closed again.
+    ///
+    /// The configuration is kept rather than consumed, so subscribing again
+    /// after [`disconnect`](Self::disconnect) opens a fresh session with the
+    /// same endpoint and credentials.
+    async fn ensure_session(&mut self) -> Result<&LsClient, AppError> {
+        if self.client.is_none() {
+            let (client, events) = LsClient::connect(self.config.clone()).await?;
+            info!(account_id = %self.account_id, "Lightstreamer session opened");
+            self.client = Some(client);
+            self.session_events = Some(events);
+        }
+
+        self.client.as_ref().ok_or_else(|| {
+            AppError::WebSocketError("streaming session not initialized".to_string())
+        })
+    }
+
+    /// Subscribes and spawns the converter task that turns the subscription's
+    /// event stream into a channel of decoded DTOs.
+    ///
+    /// The converter owns the `Updates` stream, so dropping it (when the task
+    /// ends) unsubscribes. It stops on the shutdown signal, on the receiver
+    /// being dropped, or on the stream closing — never on a decode failure,
+    /// which the `From` impls degrade to a default.
+    async fn subscribe_and_convert<T, C>(
+        &mut self,
+        subscription: Subscription,
+        label: &str,
+        convert: C,
+    ) -> Result<mpsc::UnboundedReceiver<T>, AppError>
+    where
+        T: Send + 'static,
+        C: Fn(&StreamingUpdate) -> T + Send + 'static,
+    {
+        let updates = self.ensure_session().await?.subscribe(subscription).await?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut shutdown = self.shutdown_tx.subscribe();
+        let label = label.to_owned();
+
+        let handle = tokio::spawn(async move {
+            let mut updates = updates;
+            loop {
+                let event = tokio::select! {
+                    _ = shutdown.changed() => {
+                        debug!(subscription = %label, "converter stopped by shutdown signal");
+                        return;
+                    }
+                    event = updates.next() => event,
+                };
+
+                let Some(event) = event else {
+                    debug!(subscription = %label, "converter stopped: subscription stream closed");
+                    return;
+                };
+
+                match event {
+                    SubscriptionEvent::Update(update) => {
+                        let data = convert(&StreamingUpdate::from(update.as_ref()));
+                        if tx.send(data).is_err() {
+                            debug!(subscription = %label, "converter stopped: receiver dropped");
+                            return;
+                        }
+                    }
+                    SubscriptionEvent::Activated {
+                        item_count,
+                        field_count,
+                        ..
+                    } => info!(
+                        subscription = %label,
+                        item_count,
+                        field_count,
+                        "subscription started"
+                    ),
+                    // Terminal for this subscription. The server's own code and
+                    // message; never a credential.
+                    SubscriptionEvent::Rejected(e) => {
+                        error!(subscription = %label, error = %e, "IG refused the subscription");
+                        return;
+                    }
+                    SubscriptionEvent::Unsubscribed => {
+                        info!(subscription = %label, "subscription ended");
+                        return;
+                    }
+                    SubscriptionEvent::Overflow {
+                        item_index,
+                        dropped_count,
+                    } => warn!(
+                        subscription = %label,
+                        item_index,
+                        dropped_count,
+                        "IG dropped updates for this item"
+                    ),
+                    other => debug!(subscription = %label, event = ?other, "subscription event"),
+                }
+            }
+        });
+        self.converter_tasks.push(handle);
+
+        Ok(rx)
     }
 
     /// Subscribes to market data updates for the specified instruments.
@@ -1452,6 +1509,12 @@ impl StreamerClient {
     ///
     /// Returns a receiver channel for `PriceData` updates, or an error if
     /// the subscription setup failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::InvalidInput`] if `epics` or `fields` is empty or
+    /// contains a name Lightstreamer rejects, and [`AppError::WebSocketError`]
+    /// if the session cannot be opened or the subscription cannot be sent.
     ///
     /// # Examples
     ///
@@ -1472,58 +1535,25 @@ impl StreamerClient {
         epics: Vec<String>,
         fields: HashSet<StreamingMarketField>,
     ) -> Result<mpsc::UnboundedReceiver<PriceData>, AppError> {
-        // Mark that we have at least one subscription on the market streamer
+        let epic_count = epics.len();
+        let items: Vec<String> = epics
+            .into_iter()
+            .map(|epic| format!("MARKET:{epic}"))
+            .collect();
+        let subscription = Subscription::new(
+            SubscriptionMode::Merge,
+            ItemGroup::from_items(items)?,
+            FieldSchema::from_fields(get_streaming_market_fields(&fields))?,
+        )
+        .with_snapshot(Snapshot::On);
+
+        let receiver = self
+            .subscribe_and_convert(subscription, "market", |update| PriceData::from(update))
+            .await?;
         self.has_market_stream_subs = true;
 
-        let fields = get_streaming_market_fields(&fields);
-        let market_epics: Vec<String> = epics
-            .iter()
-            .map(|epic| "MARKET:".to_string() + epic)
-            .collect();
-        let mut subscription =
-            Subscription::new(SubscriptionMode::Merge, Some(market_epics), Some(fields))?;
-
-        subscription.set_data_adapter(None)?;
-        subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
-
-        // Create channel listener that converts ItemUpdate to PriceData
-        let (listener, item_receiver) = ChannelSubscriptionListener::create_channel();
-        subscription.add_listener(Box::new(listener));
-
-        // Configure client and add subscription
-        let client = self.market_streamer_client.as_ref().ok_or_else(|| {
-            AppError::WebSocketError("market streamer client not initialized".to_string())
-        })?;
-
-        {
-            let mut client = client.lock().await;
-            client
-                .connection_options
-                .set_forced_transport(Some(Transport::WsStreaming));
-            LightstreamerClient::subscribe(client.subscription_sender.clone(), subscription)
-                .await?;
-        }
-
-        // Create a channel for PriceData and spawn a task to convert ItemUpdate to PriceData
-        let (price_tx, price_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async move {
-            let mut receiver = item_receiver;
-            while let Some(item_update) = receiver.recv().await {
-                let price_data = PriceData::from(&item_update);
-                if price_tx.send(price_data).is_err() {
-                    tracing::debug!("Price channel receiver dropped");
-                    break;
-                }
-            }
-        });
-        // Track the converter task so `disconnect` can tear it down.
-        self.converter_tasks.push(handle);
-
-        info!(
-            "Market subscription created for {} instruments",
-            epics.len()
-        );
-        Ok(price_rx)
+        info!("Market subscription created for {epic_count} instruments");
+        Ok(receiver)
     }
 
     /// Subscribes to trade updates for the account.
@@ -1536,6 +1566,11 @@ impl StreamerClient {
     ///
     /// Returns a receiver channel for `TradeFields` updates, or an error if
     /// the subscription setup failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::WebSocketError`] if the session cannot be opened or
+    /// the subscription cannot be sent.
     ///
     /// # Examples
     ///
@@ -1551,58 +1586,23 @@ impl StreamerClient {
     pub async fn trade_subscribe(
         &mut self,
     ) -> Result<mpsc::UnboundedReceiver<TradeFields>, AppError> {
-        // Mark that we have at least one subscription on the market streamer
+        let account_id = self.account_id.clone();
+        let subscription = Subscription::new(
+            SubscriptionMode::Distinct,
+            ItemGroup::from_items([format!("TRADE:{account_id}")])?,
+            FieldSchema::from_fields(["CONFIRMS", "OPU", "WOU"])?,
+        )
+        .with_snapshot(Snapshot::On);
+
+        let receiver = self
+            .subscribe_and_convert(subscription, "trade", |update| {
+                crate::presentation::trade::TradeData::from(update).fields
+            })
+            .await?;
         self.has_market_stream_subs = true;
 
-        let account_id = self.account_id.clone();
-        let fields = Some(vec![
-            "CONFIRMS".to_string(),
-            "OPU".to_string(),
-            "WOU".to_string(),
-        ]);
-        let trade_items = vec![format!("TRADE:{account_id}")];
-
-        let mut subscription =
-            Subscription::new(SubscriptionMode::Distinct, Some(trade_items), fields)?;
-
-        subscription.set_data_adapter(None)?;
-        subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
-
-        // Create channel listener
-        let (listener, item_receiver) = ChannelSubscriptionListener::create_channel();
-        subscription.add_listener(Box::new(listener));
-
-        // Configure client and add subscription (reusing market_streamer_client)
-        let client = self.market_streamer_client.as_ref().ok_or_else(|| {
-            AppError::WebSocketError("market streamer client not initialized".to_string())
-        })?;
-
-        {
-            let mut client = client.lock().await;
-            client
-                .connection_options
-                .set_forced_transport(Some(Transport::WsStreaming));
-            LightstreamerClient::subscribe(client.subscription_sender.clone(), subscription)
-                .await?;
-        }
-
-        // Create a channel for TradeFields and spawn a task to convert ItemUpdate to TradeFields
-        let (trade_tx, trade_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async move {
-            let mut receiver = item_receiver;
-            while let Some(item_update) = receiver.recv().await {
-                let trade_data = crate::presentation::trade::TradeData::from(&item_update);
-                if trade_tx.send(trade_data.fields).is_err() {
-                    tracing::debug!("Trade channel receiver dropped");
-                    break;
-                }
-            }
-        });
-        // Track the converter task so `disconnect` can tear it down.
-        self.converter_tasks.push(handle);
-
-        info!("Trade subscription created for account: {}", account_id);
-        Ok(trade_rx)
+        info!(account_id = %account_id, "Trade subscription created");
+        Ok(receiver)
     }
 
     /// Subscribes to account data updates.
@@ -1620,6 +1620,12 @@ impl StreamerClient {
     /// Returns a receiver channel for `AccountFields` updates, or an error if
     /// the subscription setup failed.
     ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::InvalidInput`] if `fields` is empty or contains a
+    /// name Lightstreamer rejects, and [`AppError::WebSocketError`] if the
+    /// session cannot be opened or the subscription cannot be sent.
+    ///
     /// # Examples
     ///
     /// ```ignore
@@ -1635,54 +1641,23 @@ impl StreamerClient {
         &mut self,
         fields: HashSet<StreamingAccountDataField>,
     ) -> Result<mpsc::UnboundedReceiver<AccountFields>, AppError> {
-        // Mark that we have at least one subscription on the market streamer
+        let account_id = self.account_id.clone();
+        let subscription = Subscription::new(
+            SubscriptionMode::Merge,
+            ItemGroup::from_items([format!("ACCOUNT:{account_id}")])?,
+            FieldSchema::from_fields(get_streaming_account_data_fields(&fields))?,
+        )
+        .with_snapshot(Snapshot::On);
+
+        let receiver = self
+            .subscribe_and_convert(subscription, "account", |update| {
+                crate::presentation::account::AccountData::from(update).fields
+            })
+            .await?;
         self.has_market_stream_subs = true;
 
-        let fields = get_streaming_account_data_fields(&fields);
-        let account_id = self.account_id.clone();
-        let account_items = vec![format!("ACCOUNT:{account_id}")];
-
-        let mut subscription =
-            Subscription::new(SubscriptionMode::Merge, Some(account_items), Some(fields))?;
-
-        subscription.set_data_adapter(None)?;
-        subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
-
-        // Create channel listener
-        let (listener, item_receiver) = ChannelSubscriptionListener::create_channel();
-        subscription.add_listener(Box::new(listener));
-
-        // Configure client and add subscription (reusing market_streamer_client)
-        let client = self.market_streamer_client.as_ref().ok_or_else(|| {
-            AppError::WebSocketError("market streamer client not initialized".to_string())
-        })?;
-
-        {
-            let mut client = client.lock().await;
-            client
-                .connection_options
-                .set_forced_transport(Some(Transport::WsStreaming));
-            LightstreamerClient::subscribe(client.subscription_sender.clone(), subscription)
-                .await?;
-        }
-
-        // Create a channel for AccountFields and spawn a task to convert ItemUpdate to AccountFields
-        let (account_tx, account_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async move {
-            let mut receiver = item_receiver;
-            while let Some(item_update) = receiver.recv().await {
-                let account_data = crate::presentation::account::AccountData::from(&item_update);
-                if account_tx.send(account_data.fields).is_err() {
-                    tracing::debug!("Account channel receiver dropped");
-                    break;
-                }
-            }
-        });
-        // Track the converter task so `disconnect` can tear it down.
-        self.converter_tasks.push(handle);
-
-        info!("Account subscription created for account: {}", account_id);
-        Ok(account_rx)
+        info!(account_id = %account_id, "Account subscription created");
+        Ok(receiver)
     }
 
     /// Subscribes to price data updates for the specified instruments.
@@ -1700,6 +1675,12 @@ impl StreamerClient {
     ///
     /// Returns a receiver channel for `PriceData` updates, or an error if
     /// the subscription setup failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::InvalidInput`] if `epics` or `fields` is empty or
+    /// contains a name Lightstreamer rejects, and [`AppError::WebSocketError`]
+    /// if the session cannot be opened or the subscription cannot be sent.
     ///
     /// # Examples
     ///
@@ -1720,69 +1701,38 @@ impl StreamerClient {
         epics: Vec<String>,
         fields: HashSet<StreamingPriceField>,
     ) -> Result<mpsc::UnboundedReceiver<PriceData>, AppError> {
-        // Mark that we have at least one subscription on the price streamer
-        self.has_price_stream_subs = true;
-
-        let fields = get_streaming_price_fields(&fields);
         let account_id = self.account_id.clone();
-        let price_epics: Vec<String> = epics
-            .iter()
+        let epic_count = epics.len();
+        let items: Vec<String> = epics
+            .into_iter()
             .map(|epic| format!("PRICE:{account_id}:{epic}"))
             .collect();
+        let field_names = get_streaming_price_fields(&fields);
 
-        // Debug what we are about to subscribe to (items and fields)
-        tracing::debug!("Pricing subscribe items: {:?}", price_epics);
-        tracing::debug!("Pricing subscribe fields: {:?}", fields);
+        debug!(?items, ?field_names, "Pricing subscription shape");
 
-        let mut subscription =
-            Subscription::new(SubscriptionMode::Merge, Some(price_epics), Some(fields))?;
-
-        // Allow overriding the Pricing adapter name via env var to match server config
+        // The `Pricing` data adapter name is a server-side configuration
+        // detail; it is overridable so a differently-configured IG environment
+        // does not need a code change.
         let pricing_adapter =
             std::env::var("IG_PRICING_ADAPTER").unwrap_or_else(|_| "Pricing".to_string());
-        tracing::debug!("Using Pricing data adapter: {}", pricing_adapter);
-        subscription.set_data_adapter(Some(pricing_adapter))?;
-        subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
+        debug!(adapter = %pricing_adapter, "Using Pricing data adapter");
 
-        // Create channel listener
-        let (listener, item_receiver) = ChannelSubscriptionListener::create_channel();
-        subscription.add_listener(Box::new(listener));
+        let subscription = Subscription::new(
+            SubscriptionMode::Merge,
+            ItemGroup::from_items(items)?,
+            FieldSchema::from_fields(field_names)?,
+        )
+        .with_data_adapter(pricing_adapter)
+        .with_snapshot(Snapshot::On);
 
-        // Configure client and add subscription
-        let client = self.price_streamer_client.as_ref().ok_or_else(|| {
-            AppError::WebSocketError("price streamer client not initialized".to_string())
-        })?;
+        let receiver = self
+            .subscribe_and_convert(subscription, "price", |update| PriceData::from(update))
+            .await?;
+        self.has_price_stream_subs = true;
 
-        {
-            let mut client = client.lock().await;
-            client
-                .connection_options
-                .set_forced_transport(Some(Transport::WsStreaming));
-            LightstreamerClient::subscribe(client.subscription_sender.clone(), subscription)
-                .await?;
-        }
-
-        // Create a channel for PriceData and spawn a task to convert ItemUpdate to PriceData
-        let (price_tx, price_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async move {
-            let mut receiver = item_receiver;
-            while let Some(item_update) = receiver.recv().await {
-                let price_data = PriceData::from(&item_update);
-                if price_tx.send(price_data).is_err() {
-                    tracing::debug!("Price channel receiver dropped");
-                    break;
-                }
-            }
-        });
-        // Track the converter task so `disconnect` can tear it down.
-        self.converter_tasks.push(handle);
-
-        info!(
-            "Price subscription created for {} instruments (account: {})",
-            epics.len(),
-            account_id
-        );
-        Ok(price_rx)
+        info!(account_id = %account_id, "Price subscription created for {epic_count} instruments");
+        Ok(receiver)
     }
 
     /// Subscribes to chart data updates for the specified instruments and scale.
@@ -1801,6 +1751,12 @@ impl StreamerClient {
     ///
     /// Returns a receiver channel for `ChartData` updates, or an error if
     /// the subscription setup failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::InvalidInput`] if `epics` or `fields` is empty or
+    /// contains a name Lightstreamer rejects, and [`AppError::WebSocketError`]
+    /// if the session cannot be opened or the subscription cannot be sent.
     ///
     /// # Examples
     ///
@@ -1823,302 +1779,272 @@ impl StreamerClient {
         scale: ChartScale,
         fields: HashSet<StreamingChartField>,
     ) -> Result<mpsc::UnboundedReceiver<ChartData>, AppError> {
-        // Mark that we have at least one subscription on the market streamer
-        self.has_market_stream_subs = true;
-
-        let fields = get_streaming_chart_fields(&fields);
-
-        let chart_items: Vec<String> = epics
-            .iter()
-            .map(|epic| format!("CHART:{epic}:{scale}",))
+        let epic_count = epics.len();
+        let items: Vec<String> = epics
+            .into_iter()
+            .map(|epic| format!("CHART:{epic}:{scale}"))
             .collect();
 
-        // Candle data uses MERGE mode, tick data uses DISTINCT
+        // Candle data is a running value (MERGE); tick data is a sequence of
+        // independent events (DISTINCT).
         let mode = if matches!(scale, ChartScale::Tick) {
             SubscriptionMode::Distinct
         } else {
             SubscriptionMode::Merge
         };
 
-        let mut subscription = Subscription::new(mode, Some(chart_items), Some(fields))?;
+        let subscription = Subscription::new(
+            mode,
+            ItemGroup::from_items(items)?,
+            FieldSchema::from_fields(get_streaming_chart_fields(&fields))?,
+        )
+        .with_snapshot(Snapshot::On);
 
-        subscription.set_data_adapter(None)?;
-        subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
+        let receiver = self
+            .subscribe_and_convert(subscription, "chart", |update| ChartData::from(update))
+            .await?;
+        self.has_market_stream_subs = true;
 
-        // Create channel listener
-        let (listener, item_receiver) = ChannelSubscriptionListener::create_channel();
-        subscription.add_listener(Box::new(listener));
-
-        // Configure client and add subscription (reusing market_streamer_client)
-        let client = self.market_streamer_client.as_ref().ok_or_else(|| {
-            AppError::WebSocketError("market streamer client not initialized".to_string())
-        })?;
-
-        {
-            let mut client = client.lock().await;
-            client
-                .connection_options
-                .set_forced_transport(Some(Transport::WsStreaming));
-            LightstreamerClient::subscribe(client.subscription_sender.clone(), subscription)
-                .await?;
-        }
-
-        // Create a channel for ChartData and spawn a task to convert ItemUpdate to ChartData
-        let (chart_tx, chart_rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async move {
-            let mut receiver = item_receiver;
-            while let Some(item_update) = receiver.recv().await {
-                let chart_data = ChartData::from(&item_update);
-                if chart_tx.send(chart_data).is_err() {
-                    tracing::debug!("Chart channel receiver dropped");
-                    break;
-                }
-            }
-        });
-        // Track the converter task so `disconnect` can tear it down.
-        self.converter_tasks.push(handle);
-
-        info!(
-            "Chart subscription created for {} instruments (scale: {})",
-            epics.len(),
-            scale
-        );
-
-        Ok(chart_rx)
+        info!("Chart subscription created for {epic_count} instruments (scale: {scale})");
+        Ok(receiver)
     }
 
-    /// Connects all active Lightstreamer clients and maintains the connections.
+    /// Consumes the session event stream and blocks until shutdown.
     ///
-    /// This method establishes connections for all streaming clients that have active
-    /// subscriptions (market and price). Each client runs in its own task and
-    /// all connections are maintained until a shutdown signal is received.
+    /// The Lightstreamer session is already open by the time this is called
+    /// (the first subscription opened it) and reconnection is handled by
+    /// `lightstreamer-rs` itself, with bounded jittered backoff. What this
+    /// method adds is observation: it reports what every reconnection *meant*
+    /// — in particular a session that was replaced rather than preserved, after
+    /// which every subscription has been re-executed and a fresh snapshot is on
+    /// its way — and it returns when the session ends for good.
     ///
     /// # Arguments
     ///
-    /// * `shutdown_signal` - Optional signal to gracefully shutdown all connections.
-    ///   If None, a default signal handler for SIGINT/SIGTERM will be created.
+    /// * `shutdown_signal` - Signalled by the caller to stop. When `None`, this
+    ///   waits for `SIGINT` / `SIGTERM` instead.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` when all connections are closed gracefully, or an error if
-    /// any connection fails after maximum retry attempts.
+    /// `Ok(())` when the shutdown signal fired or the session was closed by
+    /// this client.
     ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::WebSocketError`] when the session ended for a reason
+    /// this client did not ask for: refused by IG, reconnection budget
+    /// exhausted, or an internal failure in the streaming crate.
     pub async fn connect(&mut self, shutdown_signal: Option<Arc<Notify>>) -> Result<(), AppError> {
-        // Use provided signal or create a new one with signal hooks
-        let signal = if let Some(sig) = shutdown_signal {
-            sig
-        } else {
-            let sig = Arc::new(Notify::new());
-            setup_signal_hook(Arc::clone(&sig)).await;
-            sig
+        let Some(mut events) = self.session_events.take() else {
+            // Either nothing was subscribed (so no session was ever opened) or
+            // the events were already consumed by an earlier `connect`.
+            warn!("No streaming session to run: subscribe first, and call connect once");
+            return Ok(());
         };
 
-        let mut tasks = Vec::new();
-        // Each connection gets its own dedicated shutdown signal. A single shared
-        // `Notify` cannot stop both connections: `notify_one` wakes only one
-        // waiter, so the other connection would never observe the shutdown. The
-        // external `signal` is fanned out to these per-connection signals below.
-        let mut connection_signals: Vec<Arc<Notify>> = Vec::new();
+        info!(
+            market_subscriptions = self.has_market_stream_subs,
+            price_subscriptions = self.has_price_stream_subs,
+            "Streaming session running"
+        );
 
-        // Connect market streamer only if there are active subscriptions
-        if self.has_market_stream_subs {
-            if let Some(client) = self.market_streamer_client.as_ref() {
-                let client = Arc::clone(client);
-                let conn_signal = Arc::new(Notify::new());
-                connection_signals.push(Arc::clone(&conn_signal));
-                let task = tokio::spawn(async move {
-                    Self::connect_client(client, conn_signal, "Market").await
-                });
-                tasks.push(task);
-            }
-        } else {
-            info!("Skipping Market streamer connection: no active subscriptions");
-        }
+        // Built once and polled across every iteration. Re-creating it inside
+        // the loop would re-register the signal handlers on every event and
+        // could drop a signal that arrived between two of them.
+        let shutdown = wait_for_shutdown(shutdown_signal);
+        tokio::pin!(shutdown);
 
-        // Connect price streamer only if there are active subscriptions
-        if self.has_price_stream_subs {
-            if let Some(client) = self.price_streamer_client.as_ref() {
-                let client = Arc::clone(client);
-                let conn_signal = Arc::new(Notify::new());
-                connection_signals.push(Arc::clone(&conn_signal));
-                let task = tokio::spawn(async move {
-                    Self::connect_client(client, conn_signal, "Price").await
-                });
-                tasks.push(task);
-            }
-        } else {
-            info!("Skipping Price streamer connection: no active subscriptions");
-        }
-
-        if tasks.is_empty() {
-            warn!("No streaming clients selected for connection (no active subscriptions)");
-            return Ok(());
-        }
-
-        info!("Connecting {} streaming client(s)...", tasks.len());
-
-        // Fan the single external shutdown signal out to every per-connection
-        // signal so all connections stop together. Aborted once every connection
-        // has finished so the forwarder cannot outlive them.
-        let fanout = spawn_shutdown_fanout(Arc::clone(&signal), connection_signals);
-
-        // Wait for all tasks to complete
-        let results = futures::future::join_all(tasks).await;
-
-        // All connections finished (via shutdown or on their own): the fan-out
-        // forwarder is no longer needed.
-        fanout.abort();
-
-        // Check if any task failed
-        let mut has_error = false;
-        for (idx, result) in results.iter().enumerate() {
-            match result {
-                Ok(Ok(_)) => {
-                    debug!("Streaming client {} completed successfully", idx);
+        loop {
+            let event = tokio::select! {
+                () = &mut shutdown => {
+                    info!("Streaming session stopping: shutdown requested");
+                    return Ok(());
                 }
-                Ok(Err(e)) => {
-                    error!("Streaming client {} failed: {:?}", idx, e);
-                    has_error = true;
-                }
-                Err(e) => {
-                    error!("Streaming client {} task panicked: {:?}", idx, e);
-                    has_error = true;
-                }
-            }
-        }
-
-        if has_error {
-            return Err(AppError::WebSocketError(
-                "one or more streaming connections failed".to_string(),
-            ));
-        }
-
-        info!("All streaming connections closed gracefully");
-        Ok(())
-    }
-
-    /// Internal helper to connect a single Lightstreamer client with retry logic.
-    async fn connect_client(
-        client: Arc<Mutex<LightstreamerClient>>,
-        signal: Arc<Notify>,
-        client_type: &str,
-    ) -> Result<(), AppError> {
-        let mut retry_interval_millis: u64 = 0;
-        let mut retry_counter: u64 = 0;
-
-        while retry_counter < MAX_CONNECTION_ATTEMPTS {
-            let connect_result = {
-                let mut client = client.lock().await;
-                client.connect_direct(Arc::clone(&signal)).await
+                event = events.next() => event,
             };
 
-            match connect_result {
-                Ok(()) => {
-                    info!("{} streamer connected successfully", client_type);
-                    break;
-                }
-                Err(e) => {
-                    // Classify on the typed error BEFORE stringifying: IG closes
-                    // the session with the server reason "No more requests to
-                    // fulfill" once it has no active subscriptions. That is a
-                    // graceful close, not a failure.
-                    if is_graceful_close(&e) {
-                        info!(
-                            "{} streamer closed gracefully: no active subscriptions (server reason: {})",
-                            client_type, GRACEFUL_CLOSE_MARKER
-                        );
-                        return Ok(());
-                    }
+            let Some(event) = event else {
+                // The stream ended without a `Closed` event, which only happens
+                // if the client was dropped underneath us.
+                debug!("Session event stream ended");
+                return Ok(());
+            };
 
-                    // Not graceful: log the `Display` form (never `Debug`;
-                    // `LightstreamerError` carries no credentials) and schedule a
-                    // bounded retry.
-                    let error_msg = e.to_string();
-                    error!("{} streamer connection failed: {}", client_type, error_msg);
-
-                    if retry_counter < MAX_CONNECTION_ATTEMPTS - 1 {
-                        sleep(Duration::from_millis(retry_interval_millis)).await;
-                        retry_interval_millis =
-                            (retry_interval_millis + (200 * retry_counter)).min(5000);
-                        retry_counter += 1;
-                        warn!(
-                            "{} streamer retrying (attempt {}/{}) in {:.2} seconds...",
-                            client_type,
-                            retry_counter + 1,
-                            MAX_CONNECTION_ATTEMPTS,
-                            retry_interval_millis as f64 / 1000.0
-                        );
-                    } else {
-                        retry_counter += 1;
-                    }
+            match event {
+                SessionEvent::Connected(connected) => match connected.continuity {
+                    // Only a *replaced* session invalidates derived state: it
+                    // re-executes every subscription, so anything computed from
+                    // the previous one is stale. New / Preserved / Recovered all
+                    // keep it — a first connect is not a replacement to warn
+                    // about, which the old is_preserved() split got wrong.
+                    Continuity::Replaced { .. } => warn!(
+                        continuity = ?connected.continuity,
+                        "Streaming session replaced: subscriptions re-executed, expect fresh snapshots"
+                    ),
+                    _ => info!(
+                        continuity = ?connected.continuity,
+                        "Streaming session connected"
+                    ),
+                },
+                SessionEvent::Resubscribed(subscriptions) => {
+                    info!(
+                        count = subscriptions.len(),
+                        "Subscriptions re-created on a new session"
+                    );
                 }
+                SessionEvent::Disconnected { reason, retry_in } => match retry_in {
+                    Some(delay) => warn!(
+                        ?reason,
+                        retry_in_ms = delay.as_millis(),
+                        "Streaming session disconnected, reconnecting"
+                    ),
+                    None => warn!(?reason, "Streaming session disconnected, giving up"),
+                },
+                SessionEvent::Closed(reason) => return Self::report_close(&reason),
+                SessionEvent::RequestRejected(e) => {
+                    warn!(error = %e, "IG refused a streaming control request");
+                }
+                SessionEvent::RequestNotSent { reason } => {
+                    warn!(%reason, "A streaming control request never left the client");
+                }
+                // The raw line can carry market data, so it stays at TRACE.
+                SessionEvent::Unrecognized { line } => {
+                    trace!(%line, "Unrecognized streaming notification");
+                }
+                other => debug!(event = ?other, "Session event"),
             }
         }
-
-        if retry_counter >= MAX_CONNECTION_ATTEMPTS {
-            error!(
-                "{} streamer failed after {} attempts",
-                client_type, MAX_CONNECTION_ATTEMPTS
-            );
-            return Err(AppError::WebSocketError(format!(
-                "{} streamer: maximum connection attempts ({}) exceeded",
-                client_type, MAX_CONNECTION_ATTEMPTS
-            )));
-        }
-
-        info!("{} streamer connection closed gracefully", client_type);
-        Ok(())
     }
 
-    /// Disconnects all active Lightstreamer clients.
+    /// Turns a terminal [`ClosedReason`] into this crate's result.
     ///
-    /// This method gracefully closes all streaming connections (market and
-    /// price) and tears down the per-subscription converter tasks so they do
-    /// not idle for the process lifetime. Closing the Lightstreamer session
-    /// closes the item channels feeding the converters, so they would exit on
-    /// their own; aborting and awaiting them here guarantees a deterministic,
-    /// leak-free shutdown. Calling `disconnect` more than once is safe: the
-    /// converter list is drained and the client `disconnect` is idempotent.
+    /// A close this client asked for is success. Everything else is a failure
+    /// carrying IG's own reason — there is no message-sniffing here: 1.0 has a
+    /// discriminant for a clean shutdown and this is it.
+    fn report_close(reason: &ClosedReason) -> Result<(), AppError> {
+        match reason {
+            ClosedReason::ByClient => {
+                info!("Streaming session closed by this client");
+                Ok(())
+            }
+            ClosedReason::ByServer(e) => {
+                error!(error = %e, "IG closed the streaming session");
+                Err(AppError::WebSocketError(format!(
+                    "IG closed the streaming session: {e}"
+                )))
+            }
+            ClosedReason::ReconnectExhausted { attempts, last } => {
+                error!(attempts, last_reason = ?last, "Streaming reconnection budget exhausted");
+                Err(AppError::WebSocketError(format!(
+                    "streaming reconnection budget exhausted after {attempts} attempts"
+                )))
+            }
+            ClosedReason::Internal { reason } => {
+                error!(%reason, "Streaming client failed internally");
+                Err(AppError::WebSocketError(format!(
+                    "streaming client failed internally: {reason}"
+                )))
+            }
+            other => {
+                error!(reason = ?other, "Streaming session closed");
+                Err(AppError::WebSocketError(format!(
+                    "streaming session closed: {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// Disconnects the Lightstreamer session and tears down every converter
+    /// task.
     ///
-    /// # Returns
+    /// The order matters: the converters are signalled and joined first, which
+    /// drops their subscription streams and so unsubscribes, and only then is
+    /// the session closed. Calling this more than once is safe — the task list
+    /// is drained and the session handle is taken.
     ///
-    /// Returns `Ok(())` if all disconnections were successful.
+    /// # Errors
+    ///
+    /// Returns [`AppError::WebSocketError`] if closing the session failed. The
+    /// converter tasks are stopped either way.
     pub async fn disconnect(&mut self) -> Result<(), AppError> {
-        let mut disconnected = 0;
+        // Ignore the send error: it only means every converter has already
+        // exited, which is precisely the state we are asking for.
+        let _ = self.shutdown_tx.send(true);
 
-        if let Some(client) = self.market_streamer_client.as_ref() {
-            let mut client = client.lock().await;
-            client.disconnect().await;
-            info!("Market streamer disconnected");
-            disconnected += 1;
-        }
-
-        if let Some(client) = self.price_streamer_client.as_ref() {
-            let mut client = client.lock().await;
-            client.disconnect().await;
-            info!("Price streamer disconnected");
-            disconnected += 1;
-        }
-
-        // Tear down the converter tasks now that their upstream item channels
-        // are closed.
         let converter_count = self.converter_tasks.len();
-        abort_and_drain_tasks(&mut self.converter_tasks).await;
+        join_tasks(&mut self.converter_tasks).await;
         if converter_count > 0 {
-            debug!("Aborted {} converter task(s)", converter_count);
+            debug!("Stopped {converter_count} converter task(s)");
         }
 
-        info!("Disconnected {} streaming client(s)", disconnected);
+        self.session_events = None;
+
+        if let Some(client) = self.client.take() {
+            client.disconnect().await?;
+            info!("Streaming session closed");
+        }
+
         Ok(())
+    }
+}
+
+/// Waits for the caller's shutdown signal, or for `SIGINT` / `SIGTERM` when
+/// there is none.
+///
+/// `lightstreamer-rs` 1.0 deliberately does not install signal handlers — that
+/// is not a protocol client's job — so the wait lives here.
+#[cfg(feature = "streaming")]
+async fn wait_for_shutdown(signal: Option<Arc<Notify>>) {
+    if let Some(signal) = signal {
+        signal.notified().await;
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // A handler that cannot be installed must not silently disable
+        // shutdown, so fall back to waiting forever only after saying so.
+        match (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
+            (Ok(mut sigint), Ok(mut sigterm)) => {
+                tokio::select! {
+                    _ = sigint.recv() => info!("SIGINT received"),
+                    _ = sigterm.recv() => info!("SIGTERM received"),
+                }
+            }
+            (sigint, sigterm) => {
+                if let Err(e) = sigint {
+                    error!(error = %e, "cannot install the SIGINT handler");
+                }
+                if let Err(e) = sigterm {
+                    error!(error = %e, "cannot install the SIGTERM handler");
+                }
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!(error = %e, "cannot wait for Ctrl-C");
+            std::future::pending::<()>().await;
+        }
     }
 }
 
 #[cfg(feature = "streaming")]
 impl Drop for StreamerClient {
-    /// Aborts any converter tasks that were not already torn down by
-    /// [`StreamerClient::disconnect`], so dropping the client never orphans a
-    /// spawned task. Abort is synchronous, so no runtime is required here.
+    /// Signals and then abandons any converter task that
+    /// [`StreamerClient::disconnect`] did not already join, so dropping the
+    /// client never leaves one running. Dropping the session handle closes the
+    /// Lightstreamer session; neither step can await, which is why
+    /// `disconnect` is still the way to observe the close completing.
     fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
         for handle in self.converter_tasks.drain(..) {
             handle.abort();
         }
@@ -2184,117 +2110,101 @@ mod tests {
 // attributes.
 #[cfg(all(test, feature = "streaming"))]
 mod streaming_tests {
-    use super::{
-        GRACEFUL_CLOSE_MARKER, abort_and_drain_tasks, is_graceful_close, spawn_shutdown_fanout,
-    };
-    use lightstreamer_rs::utils::LightstreamerError;
-    use std::sync::Arc;
+    use super::{ClosedReason, StreamerClient, join_tasks};
+    use crate::error::AppError;
+    use lightstreamer_rs::ServerError;
     use std::time::Duration;
-    use tokio::sync::Notify;
+    use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
-    // --- Task 3: graceful-close classification -----------------------------
+    // --- Terminal close classification -------------------------------------
+    //
+    // These replace the previous `is_graceful_close` tests, which matched a
+    // marker string inside an error message because the 0.3 error type had no
+    // graceful-close discriminant. 1.0 has one.
 
     #[test]
-    fn test_is_graceful_close_connection_variant_with_marker_is_true() {
-        // "No more requests to fulfill" arrives wrapped in a server `conerr`
-        // message, which `lightstreamer-rs` surfaces as `Connection`.
-        let err = LightstreamerError::Connection(format!(
-            "connection error from server: conerr,-2,{GRACEFUL_CLOSE_MARKER}"
+    fn test_close_by_client_is_success() {
+        let result = StreamerClient::report_close(&ClosedReason::ByClient);
+        assert!(
+            result.is_ok(),
+            "a close this client asked for is not a failure: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_close_by_server_is_an_error() {
+        // IG's Metadata Adapter refuses with a code below the protocol's range.
+        let reason = ClosedReason::ByServer(ServerError::new(-1, "Insufficient permissions"));
+        let result = StreamerClient::report_close(&reason);
+        assert!(
+            matches!(result, Err(AppError::WebSocketError(_))),
+            "a server-initiated close must surface as an error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_close_after_exhausted_reconnection_is_an_error() {
+        let result = StreamerClient::report_close(&ClosedReason::ReconnectExhausted {
+            attempts: 8,
+            last: None,
+        });
+        match result {
+            Err(AppError::WebSocketError(message)) => {
+                assert!(
+                    message.contains('8'),
+                    "the attempt count belongs in the message: {message}"
+                );
+            }
+            other => panic!("expected a websocket error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_close_on_internal_failure_is_an_error() {
+        let reason = ClosedReason::Internal {
+            reason: "bug".to_string(),
+        };
+        assert!(matches!(
+            StreamerClient::report_close(&reason),
+            Err(AppError::WebSocketError(_))
         ));
-        assert!(is_graceful_close(&err));
     }
 
-    #[test]
-    fn test_is_graceful_close_protocol_and_invalid_state_with_marker_is_true() {
-        let protocol = LightstreamerError::Protocol(format!("closing: {GRACEFUL_CLOSE_MARKER}"));
-        let invalid_state =
-            LightstreamerError::InvalidState(format!("state: {GRACEFUL_CLOSE_MARKER}"));
-        assert!(is_graceful_close(&protocol));
-        assert!(is_graceful_close(&invalid_state));
-    }
-
-    #[test]
-    fn test_is_graceful_close_connection_variant_without_marker_is_false() {
-        let err = LightstreamerError::Connection("no message received within 5000 ms".to_string());
-        assert!(!is_graceful_close(&err));
-    }
-
-    #[test]
-    fn test_is_graceful_close_other_variant_with_marker_is_false() {
-        // Variants that never carry a server close reason must not match, even
-        // if the marker text somehow appears in them.
-        let err = LightstreamerError::Timeout(GRACEFUL_CLOSE_MARKER.to_string());
-        assert!(!is_graceful_close(&err));
-    }
-
-    // --- Task 5: one shutdown signal must wake both connections ------------
+    // --- Converter shutdown ------------------------------------------------
 
     #[tokio::test]
-    async fn test_shutdown_fanout_wakes_all_connection_waiters() {
-        // Two dedicated per-connection signals stand in for the market and
-        // price connections, both waiting to be shut down.
-        let source = Arc::new(Notify::new());
-        let market_signal = Arc::new(Notify::new());
-        let price_signal = Arc::new(Notify::new());
-
-        let fanout = spawn_shutdown_fanout(
-            Arc::clone(&source),
-            vec![Arc::clone(&market_signal), Arc::clone(&price_signal)],
-        );
-
-        let market_waiter = tokio::spawn(async move { market_signal.notified().await });
-        let price_waiter = tokio::spawn(async move { price_signal.notified().await });
-
-        // A single `notify_one` on the shared source (as `setup_signal_hook`
-        // and `DynamicMarketStreamer` do) must reach BOTH connections. Because
-        // each per-connection signal has a single waiter and `notify_one`
-        // stores a permit, the wake is race-free.
-        source.notify_one();
-
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), market_waiter)
-                .await
-                .is_ok(),
-            "market connection did not observe the shutdown signal"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), price_waiter)
-                .await
-                .is_ok(),
-            "price connection did not observe the shutdown signal"
-        );
-
-        fanout.abort();
-    }
-
-    // --- Task 2: converter-task teardown ----------------------------------
-
-    #[tokio::test]
-    async fn test_abort_and_drain_tasks_stops_and_clears() {
+    async fn test_watch_signal_stops_every_converter() {
+        // One `watch` sender stands in for `StreamerClient::shutdown_tx`, and
+        // three tasks for the converters. Unlike `Notify::notify_one`, a
+        // `watch` send reaches every one of them, and unlike
+        // `Notify::notify_waiters` it is level-triggered, so a task that is not
+        // parked yet still observes it.
+        let (tx, _) = watch::channel(false);
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         for _ in 0..3 {
-            // A task that never completes on its own; only an abort stops it.
-            tasks.push(tokio::spawn(async { std::future::pending::<()>().await }));
+            let mut shutdown = tx.subscribe();
+            tasks.push(tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown.changed() => {}
+                    () = std::future::pending::<()>() => {}
+                }
+            }));
         }
-        assert!(tasks.iter().all(|h| !h.is_finished()));
 
-        abort_and_drain_tasks(&mut tasks).await;
+        // Sent before any task is necessarily parked: the signal must not be
+        // missed.
+        assert!(tx.send(true).is_ok());
 
-        // The helper awaits each aborted task, so returning proves every task
-        // terminated; the list is drained.
-        assert!(tasks.is_empty());
+        let joined = tokio::time::timeout(Duration::from_secs(1), join_tasks(&mut tasks)).await;
+        assert!(joined.is_ok(), "converters did not observe the shutdown");
+        assert!(tasks.is_empty(), "join_tasks must drain the list");
     }
 
     #[tokio::test]
-    async fn test_abort_makes_pending_task_finish() {
-        let handle: JoinHandle<()> = tokio::spawn(async { std::future::pending::<()>().await });
-        assert!(!handle.is_finished());
-        handle.abort();
-        let join_result = handle.await;
-        assert!(
-            join_result.is_err(),
-            "aborted task should yield a cancellation JoinError"
-        );
+    async fn test_join_tasks_waits_for_completion() {
+        let mut tasks: Vec<JoinHandle<()>> = vec![tokio::spawn(async {})];
+        join_tasks(&mut tasks).await;
+        assert!(tasks.is_empty());
     }
 }
