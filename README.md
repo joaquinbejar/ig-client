@@ -74,7 +74,7 @@ and must not read a `.env` file or the `IG_*` namespace, use
 
 | Feature | Default | Pulls in | Gives you |
 |---|---|---|---|
-| `streaming` | on | `lightstreamer-rs` | `StreamerClient`, `DynamicMarketStreamer`, the `ItemUpdate` adapters, `application::interfaces::listener` |
+| `streaming` | on | `lightstreamer-rs` | `StreamerClient`, `DynamicMarketStreamer`, `StreamingUpdate` and its DTO adapters, `application::interfaces::listener` |
 | `persistence` | on | `sqlx` | the `storage` module: `MarketDatabaseService`, historical prices, connection pooling |
 
 Both are on by default, so the crate behaves exactly as before unless you
@@ -90,10 +90,10 @@ That leaves `Client`, `Client::with_config`, every REST service trait
 rate limiter fully available, with neither `lightstreamer-rs` nor `sqlx` in
 the dependency graph. Two reasons to care:
 
-- **License**: `lightstreamer-rs` is **GPL-3.0-only**. A permissively
-  licensed (MIT / Apache-2.0) consumer with a copyleft-rejecting
-  `cargo deny` policy cannot take it, and with `streaming` off it never
-  enters the graph.
+- **Dependency surface**: `lightstreamer-rs` brings a WebSocket stack that
+  a REST-only integration never opens. (It was GPL-3.0-only up to 0.3.x;
+  1.0 is a clean-room rewrite under MIT, so the licence reason for turning
+  `streaming` off has gone away.)
 - **Build weight**: `sqlx` brings a full PostgreSQL driver that a
   market-data-only integration never uses.
 
@@ -480,10 +480,12 @@ submitting a pull request.
     `lightstreamer-rs`.
   - `persistence` — the `storage` module, pulling in `sqlx`.
 - `ig-client = { version = "0.12.3", default-features = false }` gives a
-  REST/poll-only client with **neither** crate in the dependency graph. This
-  matters for licensing: `lightstreamer-rs` is GPL-3.0-only, so a permissively
-  licensed consumer with a copyleft-rejecting `cargo deny` policy previously
-  could not depend on `ig-client` at all.
+  REST/poll-only client with **neither** crate in the dependency graph. When
+  this feature landed it also mattered for licensing — `lightstreamer-rs` was
+  GPL-3.0-only up to 0.3.x, so a permissively licensed consumer with a
+  copyleft-rejecting `cargo deny` policy could not depend on `ig-client` with
+  `streaming` on. Since `lightstreamer-rs` 1.0 that reason is gone (it is MIT);
+  turning `streaming` off is now purely a build-weight choice.
 - Fixed two latent dependencies on features that only arrived transitively:
   - Two modules imported `tracing::log::debug`, which resolved only because
     `sqlx` enabled `tracing`'s `log` feature. These are now native `tracing`

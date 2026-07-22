@@ -35,8 +35,9 @@ default = ["persistence", "streaming"]
 # PostgreSQL persistence (`ig_client::storage`) via sqlx.
 persistence = ["dep:sqlx"]
 # Real-time Lightstreamer streaming (`StreamerClient`, `DynamicMarketStreamer`).
-# `lightstreamer-rs` is GPL-3.0-only, so a permissively-licensed consumer that
-# only needs the REST path can turn this off and keep it out of its graph.
+# A consumer that only needs the REST path can turn this off and keep the
+# WebSocket stack out of its graph. (`lightstreamer-rs` 1.0 is MIT, so this is
+# a build-weight choice, not a licence one.)
 streaming = ["dep:lightstreamer-rs"]
 
 [dependencies]
@@ -112,9 +113,7 @@ sqlx = { version = "0.9", features = [ "postgres","macros","chrono","runtime-tok
 async-trait = "0.1"
 regex = "1.13"
 dotenv = "0.15"
-# Pointed at the local v1 rewrite (MIT) while it is unpublished. Becomes a
-# plain version requirement once 1.0 is on crates.io.
-lightstreamer-rs = { path = "../lightstreamer-rs" }
+lightstreamer-rs = "1.0"
 lazy_static = "1.5"
 nanoid = "0.5"
 pretty-simple-display = "0.1"
