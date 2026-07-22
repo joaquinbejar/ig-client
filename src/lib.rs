@@ -62,7 +62,7 @@
 //!
 //! | Feature | Default | Pulls in | Gives you |
 //! |---|---|---|---|
-//! | `streaming` | on | `lightstreamer-rs` | `StreamerClient`, `DynamicMarketStreamer`, the `ItemUpdate` adapters, `application::interfaces::listener` |
+//! | `streaming` | on | `lightstreamer-rs` | `StreamerClient`, `DynamicMarketStreamer`, `StreamingUpdate` and its DTO adapters, `application::interfaces::listener` |
 //! | `persistence` | on | `sqlx` | the `storage` module: `MarketDatabaseService`, historical prices, connection pooling |
 //!
 //! Both are on by default, so the crate behaves exactly as before unless you
@@ -78,10 +78,10 @@
 //! rate limiter fully available, with neither `lightstreamer-rs` nor `sqlx` in
 //! the dependency graph. Two reasons to care:
 //!
-//! - **License**: `lightstreamer-rs` is **GPL-3.0-only**. A permissively
-//!   licensed (MIT / Apache-2.0) consumer with a copyleft-rejecting
-//!   `cargo deny` policy cannot take it, and with `streaming` off it never
-//!   enters the graph.
+//! - **Dependency surface**: `lightstreamer-rs` brings a WebSocket stack that
+//!   a REST-only integration never opens. (It was GPL-3.0-only up to 0.3.x;
+//!   1.0 is a clean-room rewrite under MIT, so the licence reason for turning
+//!   `streaming` off has gone away.)
 //! - **Build weight**: `sqlx` brings a full PostgreSQL driver that a
 //!   market-data-only integration never uses.
 //!

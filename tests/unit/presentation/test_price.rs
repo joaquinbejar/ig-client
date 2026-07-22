@@ -1,6 +1,6 @@
+use ig_client::application::streaming_convert::StreamingUpdate;
 use ig_client::application::streaming_convert::price_data_from_item_update;
 use ig_client::presentation::price::{DealingFlag, PriceData, PriceFields};
-use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
 
 #[test]
@@ -75,7 +75,7 @@ fn test_price_data_display() {
 
 #[test]
 fn test_price_data_from_item_update_empty() {
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -93,7 +93,7 @@ fn test_price_data_from_item_update_with_bid_offer() {
     fields.insert("BID".to_string(), Some("100.5".to_string()));
     fields.insert("OFFER".to_string(), Some("101.0".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -123,7 +123,7 @@ fn test_price_data_from_item_update_with_all_fields() {
     fields.insert("MARKET_DELAY".to_string(), Some("0".to_string()));
     fields.insert("MARKET_STATE".to_string(), Some("TRADEABLE".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:FULL".to_string()),
         item_pos: 2,
         is_snapshot: true,
@@ -140,7 +140,7 @@ fn test_price_data_from_item_update_invalid_float() {
     let mut fields = HashMap::new();
     fields.insert("BID".to_string(), Some("invalid".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -173,7 +173,7 @@ fn test_price_data_from_item_update_empty_strings() {
     fields.insert("BID".to_string(), Some("".to_string()));
     fields.insert("OFFER".to_string(), Some("".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -191,9 +191,9 @@ fn test_price_data_from_item_update_with_changed_fields() {
     fields.insert("BID".to_string(), Some("100.5".to_string()));
 
     let mut changed_fields = HashMap::new();
-    changed_fields.insert("BID".to_string(), "101.0".to_string());
+    changed_fields.insert("BID".to_string(), Some("101.0".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -223,11 +223,13 @@ fn test_price_data_clone() {
 #[test]
 fn test_price_data_from_item_update_empty_dlg_flag_is_none() {
     let mut fields = HashMap::new();
-    // Server sends '#' for DLG_FLAG (null) which lightstreamer-rs maps to Some("")
+    // An empty DLG_FLAG is a *value*, not an absence: the server sent `$`
+    // (empty text), which the seam maps to `Some("")`. A `#` (null) would map
+    // to `None` — see `test_price_data_from_item_update_null_dlg_flag_is_none`.
     fields.insert("DLG_FLAG".to_string(), Some("".to_string()));
     fields.insert("BID".to_string(), Some("100.5".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -245,11 +247,42 @@ fn test_price_data_from_item_update_empty_dlg_flag_is_none() {
 }
 
 #[test]
+fn test_price_data_from_item_update_null_dlg_flag_is_none() {
+    // The other half of the null-versus-empty distinction the streaming crate
+    // preserves: a null field arrives as `None` rather than `Some("")`, and the
+    // parser must treat it as absent just the same.
+    let mut fields = HashMap::new();
+    fields.insert("DLG_FLAG".to_string(), None);
+    fields.insert("BID".to_string(), Some("100.5".to_string()));
+
+    let item_update = StreamingUpdate {
+        item_name: Some("MARKET:TEST".to_string()),
+        item_pos: 1,
+        is_snapshot: false,
+        fields,
+        changed_fields: HashMap::new(),
+    };
+
+    let result = price_data_from_item_update(&item_update);
+    assert!(result.is_ok(), "null DLG_FLAG should not cause an error");
+    let price_data = result.expect("null DLG_FLAG parse checked ok above");
+    assert!(
+        price_data.fields.dealing_flag.is_none(),
+        "null DLG_FLAG should be parsed as None"
+    );
+    assert_eq!(
+        price_data.fields.bid,
+        Some(100.5),
+        "a null field must not disturb its neighbours"
+    );
+}
+
+#[test]
 fn test_price_data_from_item_update_closingsonly_flag() {
     let mut fields = HashMap::new();
     fields.insert("DLG_FLAG".to_string(), Some("CLOSINGSONLY".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -272,7 +305,7 @@ fn test_price_data_from_item_update_closingonly_backward_compat() {
     // Old spelling without 'S' should also work
     fields.insert("DLG_FLAG".to_string(), Some("CLOSINGONLY".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -297,7 +330,7 @@ fn test_price_data_from_item_update_with_net_chg_fields() {
     fields.insert("NET_CHG_PCT".to_string(), Some("-0.49".to_string()));
     fields.insert("DELAY".to_string(), Some("0".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -320,7 +353,7 @@ fn test_price_data_from_trait_does_not_panic_on_error() {
     // An unknown dealing flag that should cause from_item_update to return Err
     fields.insert("DLG_FLAG".to_string(), Some("UNKNOWN_FLAG".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -328,7 +361,7 @@ fn test_price_data_from_trait_does_not_panic_on_error() {
         changed_fields: HashMap::new(),
     };
 
-    // From<&ItemUpdate> should not panic; it returns a default PriceData
+    // From<&StreamingUpdate> should not panic; it returns a default PriceData
     let price_data = PriceData::from(&item_update);
     assert_eq!(price_data.item_name, "");
     assert_eq!(price_data.item_pos, 0);
@@ -374,7 +407,7 @@ fn test_price_data_from_item_update_market_delay_flag() {
     let mut fields = HashMap::new();
     fields.insert("MARKET_DELAY".to_string(), Some("1".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -393,7 +426,7 @@ fn test_price_data_from_item_update_market_delay_invalid_is_error() {
     let mut fields = HashMap::new();
     fields.insert("MARKET_DELAY".to_string(), Some("7".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -415,7 +448,7 @@ fn test_price_data_from_item_update_timestamp_is_epoch_millis_i64() {
     let mut fields = HashMap::new();
     fields.insert("TIMESTAMP".to_string(), Some("1700000000123".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -435,7 +468,7 @@ fn test_price_data_from_item_update_dlg_flag_with_trailing_spaces() {
     // Server sends DLG_FLAG with trailing whitespace padding
     fields.insert("DLG_FLAG".to_string(), Some("DEAL         ".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("MARKET:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,

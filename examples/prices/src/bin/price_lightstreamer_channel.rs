@@ -1,70 +1,44 @@
-//! Price streaming example using channel-based pattern for receiving updates.
+//! Price streaming example using a channel to hand updates to another task.
 //!
-//! This example demonstrates how to use channels to receive price updates
-//! from Lightstreamer, which is useful for multithreaded applications where
-//! different threads need to process the data.
+//! Useful when the thread that receives the data is not the thread that should
+//! process it: the listener callback does nothing but forward, and all the real
+//! work happens in a separate task that owns the receiver.
 
+use ig_client::application::interfaces::listener::Listener;
+use ig_client::error::AppError;
 use ig_client::prelude::Client;
 use ig_client::presentation::price::PriceData;
 use ig_client::utils::logger::setup_logger;
-use lightstreamer_rs::client::{LightstreamerClient, Transport};
-use lightstreamer_rs::subscription::{ItemUpdate, Snapshot, Subscription, SubscriptionMode};
-use lightstreamer_rs::utils::setup_signal_hook;
+use lightstreamer_rs::{
+    Client as LsClient, ClientConfig, Credentials, FieldSchema, ItemGroup, ServerAddress, Snapshot,
+    Subscription, SubscriptionMode,
+};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
-const MAX_CONNECTION_ATTEMPTS: u64 = 3;
+/// How many updates may queue before the forwarding callback starts dropping.
 const CHANNEL_BUFFER_SIZE: usize = 100;
 
-/// Channel-based listener that sends ItemUpdates through a channel
-/// instead of processing them directly in the callback.
-struct ChannelListener {
-    sender: mpsc::Sender<ItemUpdate>,
-}
+/// The price fields this example asks IG for.
+const PRICE_FIELDS: [&str; 9] = [
+    "HIGH",
+    "LOW",
+    "BIDSIZE1",
+    "ASKSIZE1",
+    "DLG_FLAG",
+    "C1BIDSIZE1",
+    "C1ASKSIZE1",
+    "TIMESTAMP",
+    "NET_CHG",
+];
 
-impl ChannelListener {
-    fn new(sender: mpsc::Sender<ItemUpdate>) -> Self {
-        Self { sender }
-    }
-}
-
-impl lightstreamer_rs::subscription::SubscriptionListener for ChannelListener {
-    fn on_item_update(&self, update: &ItemUpdate) {
-        // Clone the update and send it through the channel
-        let update_clone = update.clone();
-        let sender = self.sender.clone();
-
-        // Use try_send to avoid blocking - if the channel is full, we log a warning
-        match sender.try_send(update_clone) {
-            Ok(_) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("Channel buffer full, dropping update");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                error!("Channel closed, cannot send update");
-            }
-        }
-    }
-
-    fn on_subscription(&mut self) {
-        info!("Subscription confirmed by the server");
-    }
-}
-
-/// Process updates received through the channel
-async fn process_updates(mut receiver: mpsc::Receiver<ItemUpdate>) {
+/// Consumes the decoded updates. In a real application this is where they would
+/// be stored, forwarded or aggregated.
+async fn process_updates(mut receiver: mpsc::Receiver<PriceData>) {
     info!("Starting update processor task");
 
-    while let Some(update) = receiver.recv().await {
-        // Convert ItemUpdate to PriceData
-        let price_data = PriceData::from(&update);
-
-        // Process the price data (in a real application, you might:
-        // - Store it in a database
-        // - Send it to another service
-        // - Update a UI
-        // - Perform calculations
+    while let Some(price_data) = receiver.recv().await {
         match serde_json::to_string_pretty(&price_data) {
             Ok(json) => info!("Received PriceData:\n{}", json),
             Err(e) => error!("Failed to serialize PriceData: {}", e),
@@ -75,109 +49,75 @@ async fn process_updates(mut receiver: mpsc::Receiver<ItemUpdate>) {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), ig_client::error::AppError> {
+async fn main() -> Result<(), AppError> {
     setup_logger();
 
-    // Initialize the IG client and get WebSocket credentials
     let http_client = Client::try_new()?;
     let ws_info = http_client.ws_info().await?;
-    let password = ws_info.get_ws_password();
     debug!(
         server = %ws_info.server,
         account_id = %ws_info.account_id,
         "WebSocket info obtained"
     );
 
-    // Create a channel for receiving updates
-    let (sender, receiver) = mpsc::channel::<ItemUpdate>(CHANNEL_BUFFER_SIZE);
+    let (sender, receiver) = mpsc::channel::<PriceData>(CHANNEL_BUFFER_SIZE);
+    let processor = tokio::spawn(process_updates(receiver));
 
-    // Spawn a task to process updates from the channel
-    let processor_handle = tokio::spawn(process_updates(receiver));
+    let config = ClientConfig::builder(ServerAddress::try_new(ws_info.server.as_str())?)
+        .with_credentials(Credentials::new(
+            ws_info.account_id.as_str(),
+            ws_info.get_ws_password(),
+        ))
+        .build()?;
 
-    // Create a subscription for a market
-    let epic = format!("PRICE:{}:OP.D.OTCSPXWK.6720C.IP", ws_info.account_id);
-    info!("Subscribing to: {}", epic);
+    let (ls_client, _session_events) = LsClient::connect(config).await?;
+    info!("Connected to Lightstreamer");
 
-    let mut subscription = Subscription::new(
-        SubscriptionMode::Merge,
-        Some(vec![epic]),
-        Some(vec![
-            "HIGH".to_string(),
-            "LOW".to_string(),
-            "BIDSIZE1".to_string(),
-            "ASKSIZE1".to_string(),
-            "DLG_FLAG".to_string(),
-            "C1BIDSIZE1".to_string(),
-            "C1ASKSIZE1".to_string(),
-            "TIMESTAMP".to_string(),
-            "NET_CHG".to_string(),
-        ]),
-    )?;
+    let item = format!("PRICE:{}:OP.D.OTCSPXWK.6720C.IP", ws_info.account_id);
+    info!("Subscribing to: {}", item);
+    let updates = ls_client
+        .subscribe(
+            Subscription::new(
+                SubscriptionMode::Merge,
+                ItemGroup::from_items([item])?,
+                FieldSchema::from_fields(PRICE_FIELDS)?,
+            )
+            .with_data_adapter("Pricing")
+            .with_snapshot(Snapshot::On),
+        )
+        .await?;
 
-    // Create the channel-based listener
-    let listener = ChannelListener::new(sender);
-    subscription.set_data_adapter(Some("Pricing".to_string()))?;
-    subscription.set_requested_snapshot(Some(Snapshot::Yes))?;
-    subscription.add_listener(Box::new(listener));
-
-    // Create the Lightstreamer client
-    let client = Arc::new(Mutex::new(LightstreamerClient::new(
-        Some(ws_info.server.as_str()),
-        None, // Use default adapter set for IG Markets
-        Some(&ws_info.account_id),
-        Some(&password),
-    )?));
-
-    // Add the subscription to the client
-    {
-        let mut client = client.lock().await;
-        LightstreamerClient::subscribe(client.subscription_sender.clone(), subscription).await?;
-        client
-            .connection_options
-            .set_forced_transport(Some(Transport::WsStreaming));
-        info!("Subscription added");
-    }
-
-    // Setup signal handling for graceful shutdown
-    let shutdown_signal = Arc::new(Notify::new());
-    setup_signal_hook(Arc::clone(&shutdown_signal)).await;
-
-    // Connection loop with retry logic
-    let mut retry_interval_millis: u64 = 0;
-    let mut retry_counter: u64 = 0;
-
-    while retry_counter < MAX_CONNECTION_ATTEMPTS {
-        let mut client = client.lock().await;
-        match client.connect_direct(Arc::clone(&shutdown_signal)).await {
-            Ok(_) => {
-                client.disconnect().await;
-                break;
+    // The callback only forwards. `try_send` keeps the streaming task from
+    // blocking: a full buffer means the processor is behind, which is worth a
+    // warning rather than backpressure into the socket.
+    let listener = Listener::new(move |price_data: &PriceData| {
+        match sender.try_send(price_data.clone()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("Channel buffer full, dropping update")
             }
-            Err(e) => {
-                error!("Failed to connect: {:?}", e);
-                tokio::time::sleep(std::time::Duration::from_millis(retry_interval_millis)).await;
-                retry_interval_millis = (retry_interval_millis + (200 * retry_counter)).min(5000);
-                retry_counter += 1;
-                warn!(
-                    "Retrying connection in {:.2} seconds...",
-                    retry_interval_millis as f64 / 1000.0
-                );
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("Channel closed, cannot send update");
             }
         }
+        Ok(())
+    });
+
+    let shutdown = Arc::new(Notify::new());
+    let pump = listener.spawn(updates, Arc::clone(&shutdown), "price");
+
+    let interrupted = tokio::signal::ctrl_c().await;
+    shutdown.notify_one();
+    // Awaiting the pump drops the last sender, which ends the processor.
+    if let Err(e) = pump.await {
+        warn!(error = %e, "listener pump did not exit cleanly");
     }
-
-    if retry_counter == MAX_CONNECTION_ATTEMPTS {
-        error!(
-            "Failed to connect after {} retries. Exiting...",
-            retry_counter
-        );
-    } else {
-        info!("Exiting orderly from Lightstreamer client...");
+    if let Err(e) = processor.await {
+        warn!(error = %e, "update processor did not exit cleanly");
     }
+    ls_client.disconnect().await?;
+    info!("Exiting orderly from the Lightstreamer client");
 
-    // Wait for the processor task to finish (it will end when the channel is dropped)
-    drop(client); // Drop the client to close the channel
-    let _ = processor_handle.await;
-
-    std::process::exit(0);
+    interrupted
+        .map_err(|e| AppError::Generic(format!("could not wait for the interrupt signal: {e}")))
 }

@@ -1,6 +1,6 @@
+use ig_client::application::streaming_convert::StreamingUpdate;
 use ig_client::application::streaming_convert::trade_data_from_item_update;
 use ig_client::presentation::trade::{TradeData, TradeFields};
-use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
 
 #[test]
@@ -29,7 +29,7 @@ fn test_trade_data_display() {
 
 #[test]
 fn test_trade_data_from_item_update_empty() {
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("TRADE:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -46,7 +46,7 @@ fn test_trade_data_from_item_update_with_confirms() {
     let mut fields = HashMap::new();
     fields.insert("CONFIRMS".to_string(), Some("DEAL123".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("TRADE:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,

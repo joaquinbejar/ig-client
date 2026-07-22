@@ -4,17 +4,28 @@
    Date: 20/10/25
 ******************************************************************************/
 
-//! Adapters from Lightstreamer `ItemUpdate` to the presentation-layer DTOs.
+//! Adapters from a Lightstreamer update to the presentation-layer DTOs.
 //!
 //! The presentation DTOs stay transport-agnostic: they expose pure
 //! `from_fields(..)` constructors that take plain field maps. This module is the
-//! only place that depends on `lightstreamer_rs`; it reads an `ItemUpdate` and
+//! only place that depends on `lightstreamer_rs`; it reads an [`ItemUpdate`] and
 //! feeds the extracted metadata / field maps into those pure constructors.
 //!
+//! # The seam
+//!
+//! [`ItemUpdate`] is the streaming crate's own type: it borrows from the
+//! subscription schema, has no public constructor, and models a field value as
+//! [`FieldValue`] rather than a string. [`StreamingUpdate`] is this crate's
+//! owned, constructible mirror of it, and every conversion below goes through
+//! it. That keeps the DTO parsers testable without a live session, and keeps
+//! the null-versus-empty distinction explicit at exactly one place:
+//! `FieldValue::Null` becomes `None`, `FieldValue::Text(s)` becomes
+//! `Some(s)` — including `Some("")` for a field the server deliberately sent
+//! empty.
+//!
 //! Both a `Result`-returning function (for callers that want to observe parse
-//! failures) and the `From<&ItemUpdate>` conversions (which degrade to a default
-//! on failure, preserving the previous streaming behaviour) are provided per
-//! type.
+//! failures) and the `From` conversions (which degrade to a default on failure,
+//! preserving the previous streaming behaviour) are provided per type.
 
 use crate::error::AppError;
 use crate::presentation::account::AccountData;
@@ -22,71 +33,135 @@ use crate::presentation::chart::ChartData;
 use crate::presentation::market::{MarketFields, PresentationMarketData};
 use crate::presentation::price::PriceData;
 use crate::presentation::trade::TradeData;
-use lightstreamer_rs::subscription::ItemUpdate;
+use lightstreamer_rs::{FieldValue, ItemUpdate};
+use pretty_simple_display::{DebugPretty, DisplaySimple};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Converts Lightstreamer's `changed_fields` (`HashMap<String, String>`) into the
-/// `HashMap<String, Option<String>>` shape the pure field parsers consume, so a
-/// changed value is treated identically to a present full-snapshot value.
-#[must_use]
-fn changed_fields_as_options(changed: &HashMap<String, String>) -> HashMap<String, Option<String>> {
-    changed
-        .iter()
-        .map(|(key, value)| (key.clone(), Some(value.clone())))
-        .collect()
+/// One Lightstreamer item update, owned and free of borrowed schema state.
+///
+/// This is the boundary type between `lightstreamer-rs` and this crate's
+/// presentation DTOs. It is deliberately constructible by hand so that the
+/// field parsers can be exercised from captured IG payloads without a live
+/// session — the streaming crate's own [`ItemUpdate`] cannot be built outside
+/// that crate.
+///
+/// A `None` field value means the server said the field has *no* value
+/// (`FieldValue::Null`); `Some("")` means it sent an empty one. The two are
+/// different answers and are kept apart.
+#[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StreamingUpdate {
+    /// The item name the subscription declared for this position, when it
+    /// declared one. `None` for a server-resolved item group, where the
+    /// protocol never transmits names.
+    pub item_name: Option<String>,
+    /// The item's 1-based position within the subscription.
+    pub item_pos: usize,
+    /// Whether this update carries snapshot content rather than a live change.
+    pub is_snapshot: bool,
+    /// The complete state of the item after this update, keyed by field name.
+    pub fields: HashMap<String, Option<String>>,
+    /// Only the fields this update actually carried a value for.
+    pub changed_fields: HashMap<String, Option<String>>,
 }
 
-/// Converts a Lightstreamer `ItemUpdate` into a [`PriceData`].
+/// Converts a [`FieldValue`] into the `Option<String>` the pure field parsers
+/// consume: null becomes absent, text (empty or not) becomes present.
+#[must_use]
+#[inline]
+fn field_value_as_option(value: FieldValue<'_>) -> Option<String> {
+    match value {
+        FieldValue::Null => None,
+        FieldValue::Text(text) => Some(text.to_owned()),
+    }
+}
+
+impl From<&ItemUpdate> for StreamingUpdate {
+    fn from(update: &ItemUpdate) -> Self {
+        let fields = update
+            .fields()
+            .map(|field| {
+                (
+                    field.name().to_owned(),
+                    field_value_as_option(field.value()),
+                )
+            })
+            .collect();
+        let changed_fields = update
+            .changed_fields()
+            .map(|field| {
+                (
+                    field.name().to_owned(),
+                    field_value_as_option(field.value()),
+                )
+            })
+            .collect();
+
+        Self {
+            item_name: update.declared_item_name().map(str::to_owned),
+            item_pos: update.item_index(),
+            is_snapshot: update.is_snapshot(),
+            fields,
+            changed_fields,
+        }
+    }
+}
+
+/// Converts a streaming update into a [`PriceData`].
 ///
 /// # Errors
 /// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. a
 /// non-numeric price or an unknown dealing flag). The message names the
 /// offending field and value.
 #[must_use = "the parse result must be handled"]
-pub fn price_data_from_item_update(item_update: &ItemUpdate) -> Result<PriceData, AppError> {
-    let changed_fields = changed_fields_as_options(&item_update.changed_fields);
+pub fn price_data_from_item_update(update: &StreamingUpdate) -> Result<PriceData, AppError> {
     PriceData::from_fields(
-        item_update.item_name.as_deref(),
-        item_update.item_pos,
-        item_update.is_snapshot,
-        &item_update.fields,
-        &changed_fields,
+        update.item_name.as_deref(),
+        update.item_pos,
+        update.is_snapshot,
+        &update.fields,
+        &update.changed_fields,
     )
     .map_err(AppError::Deserialization)
 }
 
-impl From<&ItemUpdate> for PriceData {
-    fn from(item_update: &ItemUpdate) -> Self {
-        price_data_from_item_update(item_update).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to convert ItemUpdate to PriceData, returning default");
+impl From<&StreamingUpdate> for PriceData {
+    fn from(update: &StreamingUpdate) -> Self {
+        price_data_from_item_update(update).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to convert streaming update to PriceData, returning default");
             PriceData::default()
         })
     }
 }
 
-/// Converts a Lightstreamer `ItemUpdate` into a [`PresentationMarketData`].
+impl From<&ItemUpdate> for PriceData {
+    fn from(update: &ItemUpdate) -> Self {
+        Self::from(&StreamingUpdate::from(update))
+    }
+}
+
+/// Converts a streaming update into a [`PresentationMarketData`].
 ///
 /// # Errors
 /// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. an
 /// unknown market state or an invalid `MARKET_DELAY` value).
 #[must_use = "the parse result must be handled"]
 pub fn market_data_from_item_update(
-    item_update: &ItemUpdate,
+    update: &StreamingUpdate,
 ) -> Result<PresentationMarketData, AppError> {
-    let changed_fields = changed_fields_as_options(&item_update.changed_fields);
     PresentationMarketData::from_fields(
-        item_update.item_name.as_deref(),
-        item_update.item_pos,
-        item_update.is_snapshot,
-        &item_update.fields,
-        &changed_fields,
+        update.item_name.as_deref(),
+        update.item_pos,
+        update.is_snapshot,
+        &update.fields,
+        &update.changed_fields,
     )
     .map_err(AppError::Deserialization)
 }
 
-impl From<&ItemUpdate> for PresentationMarketData {
-    fn from(item_update: &ItemUpdate) -> Self {
-        market_data_from_item_update(item_update).unwrap_or_else(|_| PresentationMarketData {
+impl From<&StreamingUpdate> for PresentationMarketData {
+    fn from(update: &StreamingUpdate) -> Self {
+        market_data_from_item_update(update).unwrap_or_else(|_| PresentationMarketData {
             item_name: String::new(),
             item_pos: 0,
             fields: MarketFields::default(),
@@ -96,75 +171,96 @@ impl From<&ItemUpdate> for PresentationMarketData {
     }
 }
 
-/// Converts a Lightstreamer `ItemUpdate` into a [`ChartData`].
+impl From<&ItemUpdate> for PresentationMarketData {
+    fn from(update: &ItemUpdate) -> Self {
+        Self::from(&StreamingUpdate::from(update))
+    }
+}
+
+/// Converts a streaming update into a [`ChartData`].
 ///
 /// # Errors
 /// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. a
 /// non-numeric candle value).
 #[must_use = "the parse result must be handled"]
-pub fn chart_data_from_item_update(item_update: &ItemUpdate) -> Result<ChartData, AppError> {
-    let changed_fields = changed_fields_as_options(&item_update.changed_fields);
+pub fn chart_data_from_item_update(update: &StreamingUpdate) -> Result<ChartData, AppError> {
     ChartData::from_fields(
-        item_update.item_name.as_deref(),
-        item_update.item_pos,
-        item_update.is_snapshot,
-        &item_update.fields,
-        &changed_fields,
+        update.item_name.as_deref(),
+        update.item_pos,
+        update.is_snapshot,
+        &update.fields,
+        &update.changed_fields,
     )
     .map_err(AppError::Deserialization)
 }
 
-impl From<&ItemUpdate> for ChartData {
-    fn from(item_update: &ItemUpdate) -> Self {
-        chart_data_from_item_update(item_update).unwrap_or_default()
+impl From<&StreamingUpdate> for ChartData {
+    fn from(update: &StreamingUpdate) -> Self {
+        chart_data_from_item_update(update).unwrap_or_default()
     }
 }
 
-/// Converts a Lightstreamer `ItemUpdate` into a [`TradeData`].
+impl From<&ItemUpdate> for ChartData {
+    fn from(update: &ItemUpdate) -> Self {
+        Self::from(&StreamingUpdate::from(update))
+    }
+}
+
+/// Converts a streaming update into a [`TradeData`].
 ///
 /// # Errors
 /// Returns [`AppError::Deserialization`] when the embedded OPU / WOU JSON
 /// payload fails to parse.
 #[must_use = "the parse result must be handled"]
-pub fn trade_data_from_item_update(item_update: &ItemUpdate) -> Result<TradeData, AppError> {
-    let changed_fields = changed_fields_as_options(&item_update.changed_fields);
+pub fn trade_data_from_item_update(update: &StreamingUpdate) -> Result<TradeData, AppError> {
     TradeData::from_fields(
-        item_update.item_name.as_deref(),
-        item_update.item_pos,
-        item_update.is_snapshot,
-        &item_update.fields,
-        &changed_fields,
+        update.item_name.as_deref(),
+        update.item_pos,
+        update.is_snapshot,
+        &update.fields,
+        &update.changed_fields,
     )
     .map_err(AppError::Deserialization)
 }
 
-impl From<&ItemUpdate> for TradeData {
-    fn from(item_update: &ItemUpdate) -> Self {
-        trade_data_from_item_update(item_update).unwrap_or_default()
+impl From<&StreamingUpdate> for TradeData {
+    fn from(update: &StreamingUpdate) -> Self {
+        trade_data_from_item_update(update).unwrap_or_default()
     }
 }
 
-/// Converts a Lightstreamer `ItemUpdate` into an [`AccountData`].
+impl From<&ItemUpdate> for TradeData {
+    fn from(update: &ItemUpdate) -> Self {
+        Self::from(&StreamingUpdate::from(update))
+    }
+}
+
+/// Converts a streaming update into an [`AccountData`].
 ///
 /// # Errors
 /// Returns [`AppError::Deserialization`] when a field fails to parse (e.g. a
 /// non-numeric P&L or margin value).
 #[must_use = "the parse result must be handled"]
-pub fn account_data_from_item_update(item_update: &ItemUpdate) -> Result<AccountData, AppError> {
-    let changed_fields = changed_fields_as_options(&item_update.changed_fields);
+pub fn account_data_from_item_update(update: &StreamingUpdate) -> Result<AccountData, AppError> {
     AccountData::from_fields(
-        item_update.item_name.as_deref(),
-        item_update.item_pos,
-        item_update.is_snapshot,
-        &item_update.fields,
-        &changed_fields,
+        update.item_name.as_deref(),
+        update.item_pos,
+        update.is_snapshot,
+        &update.fields,
+        &update.changed_fields,
     )
     .map_err(AppError::Deserialization)
 }
 
+impl From<&StreamingUpdate> for AccountData {
+    fn from(update: &StreamingUpdate) -> Self {
+        account_data_from_item_update(update).unwrap_or_else(|_| AccountData::default())
+    }
+}
+
 impl From<&ItemUpdate> for AccountData {
-    fn from(item_update: &ItemUpdate) -> Self {
-        account_data_from_item_update(item_update).unwrap_or_else(|_| AccountData::default())
+    fn from(update: &ItemUpdate) -> Self {
+        Self::from(&StreamingUpdate::from(update))
     }
 }
 
@@ -173,17 +269,17 @@ mod tests {
     use super::*;
     use crate::presentation::order::{Direction, OrderType, Status, TimeInForce};
 
-    /// Builds an `ItemUpdate` carrying a single TRADE field, mirroring how the
+    /// Builds an update carrying a single TRADE field, mirroring how the
     /// Lightstreamer TRADE subscription delivers OPU / WOU / CONFIRMS payloads.
     ///
     /// `item_name`, `item_pos` and `is_snapshot` are set to distinctive,
     /// obviously-synthetic values so tests can assert whether they survive the
     /// parse (they are dropped on the silent-default path — see the malformed
     /// test).
-    fn trade_item_update(field_key: &str, field_value: &str) -> ItemUpdate {
+    fn trade_item_update(field_key: &str, field_value: &str) -> StreamingUpdate {
         let mut fields = HashMap::new();
         fields.insert(field_key.to_string(), Some(field_value.to_string()));
-        ItemUpdate {
+        StreamingUpdate {
             item_name: Some("TRADE:SYNTHETIC".to_string()),
             item_pos: 2,
             fields,
@@ -345,7 +441,7 @@ mod tests {
         // degrades to `PriceData::default()` while the direct fn surfaces the Err.
         let mut fields = HashMap::new();
         fields.insert("DLG_FLAG".to_string(), Some("NOT_A_FLAG".to_string()));
-        let item = ItemUpdate {
+        let item = StreamingUpdate {
             item_name: Some("PRICE:CS.D.EURUSD.MINI.IP".to_string()),
             item_pos: 1,
             fields,
@@ -361,5 +457,55 @@ mod tests {
         assert_eq!(data.item_pos, 0);
         assert!(!data.is_snapshot);
         assert!(data.fields.dealing_flag.is_none());
+    }
+
+    // --- The seam type itself ----------------------------------------------
+
+    #[test]
+    fn test_field_value_null_and_empty_text_are_distinct() {
+        // The whole reason `StreamingUpdate` stores `Option<String>` rather
+        // than `String`: TLCP distinguishes "no value" from "the empty string",
+        // and the seam must not flatten one into the other.
+        assert_eq!(field_value_as_option(FieldValue::Null), None);
+        assert_eq!(
+            field_value_as_option(FieldValue::Text("")),
+            Some(String::new())
+        );
+        assert_eq!(
+            field_value_as_option(FieldValue::Text("1.2345")),
+            Some("1.2345".to_string())
+        );
+    }
+
+    #[test]
+    fn test_streaming_update_serde_round_trip() {
+        let mut fields = HashMap::new();
+        fields.insert("BID".to_string(), Some("18000.5".to_string()));
+        // A null field and an empty-text field must both survive the round trip
+        // as themselves.
+        fields.insert("OFFER".to_string(), None);
+        fields.insert("MARKET_STATE".to_string(), Some(String::new()));
+
+        let mut changed_fields = HashMap::new();
+        changed_fields.insert("BID".to_string(), Some("18000.5".to_string()));
+
+        let update = StreamingUpdate {
+            item_name: Some("MARKET:IX.D.DAX.DAILY.IP".to_string()),
+            item_pos: 3,
+            is_snapshot: true,
+            fields,
+            changed_fields,
+        };
+
+        let json = serde_json::to_string(&update).expect("StreamingUpdate should serialize");
+        let decoded: StreamingUpdate =
+            serde_json::from_str(&json).expect("StreamingUpdate should deserialize");
+
+        assert_eq!(decoded, update);
+        assert_eq!(decoded.fields.get("OFFER"), Some(&None));
+        assert_eq!(
+            decoded.fields.get("MARKET_STATE"),
+            Some(&Some(String::new()))
+        );
     }
 }

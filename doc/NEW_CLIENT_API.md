@@ -16,7 +16,7 @@ Everything documented here — `Client`, `Client::with_config` and the REST
 service traits — is available with **no features enabled**. Two default-ON
 features gate the heavy legs:
 
-- `streaming` (pulls `lightstreamer-rs`, GPL-3.0-only) — `StreamerClient`,
+- `streaming` (pulls `lightstreamer-rs` 1.0, MIT) — `StreamerClient`,
   `DynamicMarketStreamer`, `Listener`.
 - `persistence` (pulls `sqlx`) — the `storage` module.
 

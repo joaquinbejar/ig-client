@@ -1,6 +1,6 @@
+use ig_client::application::streaming_convert::StreamingUpdate;
 use ig_client::application::streaming_convert::account_data_from_item_update;
 use ig_client::presentation::account::{AccountData, AccountFields};
-use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
 
 #[test]
@@ -17,7 +17,7 @@ fn test_account_data_default() {
 
 #[test]
 fn test_account_data_from_item_update_empty() {
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("ACCOUNT:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -37,7 +37,7 @@ fn test_account_data_from_item_update_with_fields() {
     fields.insert("USED_MARGIN".to_string(), Some("500.00".to_string()));
     fields.insert("AVAILABLE_CASH".to_string(), Some("9500.00".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("ACCOUNT:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,

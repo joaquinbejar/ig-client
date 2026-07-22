@@ -1,6 +1,6 @@
+use ig_client::application::streaming_convert::StreamingUpdate;
 use ig_client::application::streaming_convert::chart_data_from_item_update;
 use ig_client::presentation::chart::{ChartData, ChartFields};
-use lightstreamer_rs::subscription::ItemUpdate;
 use std::collections::HashMap;
 
 #[test]
@@ -17,7 +17,7 @@ fn test_chart_data_default() {
 
 #[test]
 fn test_chart_data_from_item_update_empty() {
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("CHART:TEST".to_string()),
         item_pos: 1,
         is_snapshot: false,
@@ -38,7 +38,7 @@ fn test_chart_data_from_item_update_with_fields() {
     fields.insert("LOW".to_string(), Some("95.0".to_string()));
     fields.insert("LTV".to_string(), Some("1000".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("CHART:TEST".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -71,7 +71,7 @@ fn test_chart_data_from_item_update_cons_end_is_flag() {
     fields.insert("CONS_END".to_string(), Some("1".to_string()));
     fields.insert("UTM".to_string(), Some("1700000000123".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("CHART:CS.D.EURUSD.MINI.IP:1MINUTE".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -90,7 +90,7 @@ fn test_chart_data_from_item_update_cons_end_zero_is_false() {
     let mut fields = HashMap::new();
     fields.insert("CONS_END".to_string(), Some("0".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("CHART:CS.D.EURUSD.MINI.IP:1MINUTE".to_string()),
         item_pos: 1,
         is_snapshot: true,
@@ -107,7 +107,7 @@ fn test_chart_data_from_item_update_cons_end_invalid_is_error() {
     let mut fields = HashMap::new();
     fields.insert("CONS_END".to_string(), Some("2".to_string()));
 
-    let item_update = ItemUpdate {
+    let item_update = StreamingUpdate {
         item_name: Some("CHART:CS.D.EURUSD.MINI.IP:1MINUTE".to_string()),
         item_pos: 1,
         is_snapshot: true,

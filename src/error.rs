@@ -204,9 +204,24 @@ impl From<String> for AppError {
 }
 
 #[cfg(feature = "streaming")]
-impl From<lightstreamer_rs::utils::LightstreamerError> for AppError {
+impl From<lightstreamer_rs::Error> for AppError {
+    /// Wraps a Lightstreamer protocol error.
+    ///
+    /// Only the `Display` form is kept: it carries the server's own error code
+    /// and message and never the session credentials, which the client holds
+    /// but never renders.
     #[cold]
-    fn from(e: lightstreamer_rs::utils::LightstreamerError) -> Self {
+    fn from(e: lightstreamer_rs::Error) -> Self {
         AppError::WebSocketError(e.to_string())
+    }
+}
+
+#[cfg(feature = "streaming")]
+impl From<lightstreamer_rs::config::ConfigError> for AppError {
+    /// Wraps a rejected Lightstreamer configuration value (server address,
+    /// item group, field schema). These are caller mistakes, not I/O failures.
+    #[cold]
+    fn from(e: lightstreamer_rs::config::ConfigError) -> Self {
+        AppError::InvalidInput(e.to_string())
     }
 }

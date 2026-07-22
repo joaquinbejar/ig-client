@@ -1,5 +1,5 @@
 use ig_client::application::interfaces::listener::Listener;
-use lightstreamer_rs::subscription::{ItemUpdate, SubscriptionListener};
+use ig_client::application::streaming_convert::StreamingUpdate;
 use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::sync::{Arc, Mutex};
@@ -16,11 +16,22 @@ impl Display for TestData {
     }
 }
 
-impl From<&ItemUpdate> for TestData {
-    fn from(update: &ItemUpdate) -> Self {
+impl From<&StreamingUpdate> for TestData {
+    fn from(update: &StreamingUpdate) -> Self {
         TestData {
             value: update.item_name.clone().unwrap_or_default(),
         }
+    }
+}
+
+/// Builds an update carrying only an item name, which is all `TestData` reads.
+fn update(item_name: &str, item_pos: usize) -> StreamingUpdate {
+    StreamingUpdate {
+        item_name: Some(item_name.to_string()),
+        item_pos,
+        is_snapshot: false,
+        fields: HashMap::new(),
+        changed_fields: HashMap::new(),
     }
 }
 
@@ -40,29 +51,20 @@ fn test_listener_on_item_update() {
     let called_clone = Arc::clone(&called);
 
     let listener = Listener::<TestData>::new(move |data| {
-        *called_clone.lock().unwrap() = true;
+        *called_clone
+            .lock()
+            .expect("the callback mutex is never poisoned in this test") = true;
         assert!(!data.value.is_empty());
         Ok(())
     });
 
-    let item_update = ItemUpdate {
-        item_name: Some("TEST_ITEM".to_string()),
-        item_pos: 1,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
+    listener.on_item_update(&update("TEST_ITEM", 1));
 
-    listener.on_item_update(&item_update);
-    assert!(*called.lock().unwrap());
-}
-
-#[test]
-fn test_listener_on_subscription() {
-    let mut listener = Listener::<TestData>::new(|_data| Ok(()));
-
-    // This should just log, not panic
-    listener.on_subscription();
+    assert!(
+        *called
+            .lock()
+            .expect("the callback mutex is never poisoned in this test")
+    );
 }
 
 #[test]
@@ -71,39 +73,22 @@ fn test_listener_multiple_updates() {
     let counter_clone = Arc::clone(&counter);
 
     let listener = Listener::<TestData>::new(move |_data| {
-        *counter_clone.lock().unwrap() += 1;
+        *counter_clone
+            .lock()
+            .expect("the callback mutex is never poisoned in this test") += 1;
         Ok(())
     });
 
-    let update1 = ItemUpdate {
-        item_name: Some("TEST1".to_string()),
-        item_pos: 1,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
+    listener.on_item_update(&update("TEST1", 1));
+    listener.on_item_update(&update("TEST2", 2));
+    listener.on_item_update(&update("TEST3", 3));
 
-    let update2 = ItemUpdate {
-        item_name: Some("TEST2".to_string()),
-        item_pos: 2,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
-
-    let update3 = ItemUpdate {
-        item_name: Some("TEST3".to_string()),
-        item_pos: 3,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
-
-    listener.on_item_update(&update1);
-    listener.on_item_update(&update2);
-    listener.on_item_update(&update3);
-
-    assert_eq!(*counter.lock().unwrap(), 3);
+    assert_eq!(
+        *counter
+            .lock()
+            .expect("the callback mutex is never poisoned in this test"),
+        3
+    );
 }
 
 #[test]
@@ -114,7 +99,9 @@ fn test_listener_thread_safety() {
     let counter_clone = Arc::clone(&counter);
 
     let listener = Arc::new(Listener::<TestData>::new(move |_data| {
-        *counter_clone.lock().unwrap() += 1;
+        *counter_clone
+            .lock()
+            .expect("the callback mutex is never poisoned in this test") += 1;
         Ok(())
     }));
 
@@ -123,23 +110,21 @@ fn test_listener_thread_safety() {
     for i in 0..5 {
         let listener_clone = Arc::clone(&listener);
         let handle = thread::spawn(move || {
-            let update = ItemUpdate {
-                item_name: Some(format!("THREAD_{}", i)),
-                item_pos: i,
-                is_snapshot: false,
-                fields: HashMap::new(),
-                changed_fields: HashMap::new(),
-            };
-            listener_clone.on_item_update(&update);
+            listener_clone.on_item_update(&update(&format!("THREAD_{i}"), i));
         });
         handles.push(handle);
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.join().expect("worker thread should not panic");
     }
 
-    assert_eq!(*counter.lock().unwrap(), 5);
+    assert_eq!(
+        *counter
+            .lock()
+            .expect("the callback mutex is never poisoned in this test"),
+        5
+    );
 }
 
 #[test]
@@ -148,39 +133,20 @@ fn test_listener_with_different_data() {
     let values_clone = Arc::clone(&values);
 
     let listener = Listener::<TestData>::new(move |data| {
-        values_clone.lock().unwrap().push(data.value.clone());
+        values_clone
+            .lock()
+            .expect("the callback mutex is never poisoned in this test")
+            .push(data.value.clone());
         Ok(())
     });
 
-    let update1 = ItemUpdate {
-        item_name: Some("first".to_string()),
-        item_pos: 1,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
+    listener.on_item_update(&update("first", 1));
+    listener.on_item_update(&update("second", 2));
+    listener.on_item_update(&update("third", 3));
 
-    let update2 = ItemUpdate {
-        item_name: Some("second".to_string()),
-        item_pos: 2,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
-
-    let update3 = ItemUpdate {
-        item_name: Some("third".to_string()),
-        item_pos: 3,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
-
-    listener.on_item_update(&update1);
-    listener.on_item_update(&update2);
-    listener.on_item_update(&update3);
-
-    let collected = values.lock().unwrap();
+    let collected = values
+        .lock()
+        .expect("the callback mutex is never poisoned in this test");
     assert_eq!(collected.len(), 3);
     assert_eq!(collected[0], "first");
     assert_eq!(collected[1], "second");
@@ -189,20 +155,27 @@ fn test_listener_with_different_data() {
 
 #[test]
 fn test_listener_error_handling() {
-    let listener = Listener::<TestData>::new(|_data| {
+    let after = Arc::new(Mutex::new(0));
+    let counter = Arc::clone(&after);
+
+    let listener = Listener::<TestData>::new(move |_data| {
+        *counter
+            .lock()
+            .expect("the callback mutex is never poisoned in this test") += 1;
         Err(ig_client::error::AppError::InvalidInput(
             "Test error".to_string(),
         ))
     });
 
-    let update = ItemUpdate {
-        item_name: Some("ERROR_TEST".to_string()),
-        item_pos: 1,
-        is_snapshot: false,
-        fields: HashMap::new(),
-        changed_fields: HashMap::new(),
-    };
+    // A failing callback must be contained: no panic, and the next update is
+    // still delivered.
+    listener.on_item_update(&update("ERROR_TEST", 1));
+    listener.on_item_update(&update("ERROR_TEST_2", 2));
 
-    // Should not panic even with error
-    listener.on_item_update(&update);
+    assert_eq!(
+        *after
+            .lock()
+            .expect("the callback mutex is never poisoned in this test"),
+        2
+    );
 }

@@ -16,8 +16,17 @@ use crate::presentation::price::PriceData;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{Notify, RwLock, mpsc};
 use tracing::{debug, info, warn};
+
+/// How long [`DynamicMarketStreamer::reconnect`] waits for the previous
+/// connection to confirm it has closed before starting the next one.
+///
+/// This is a safety bound on a handshake, not a guess at how long teardown
+/// takes: the normal path completes as soon as the old connection task signals,
+/// and exceeding this only produces a warning.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Dynamic market streamer with thread-safe subscription management.
 ///
@@ -79,6 +88,11 @@ pub struct DynamicMarketStreamer {
     is_connected: Arc<RwLock<bool>>,
     /// Shutdown signal for current connection
     shutdown_signal: Arc<RwLock<Option<Arc<Notify>>>>,
+    /// Completion handshake for the current connection task: notified once the
+    /// task has closed its Lightstreamer session and is about to exit. This is
+    /// what lets [`reconnect`](Self::reconnect) wait for the old connection
+    /// instead of sleeping for a guessed interval.
+    stopped_signal: Arc<RwLock<Option<Arc<Notify>>>>,
     /// Monotonic connection generation. Bumped on every `start_internal`; a
     /// connection task only clears `is_connected` on exit if its captured
     /// generation is still current, so a superseded task tearing down its old
@@ -121,6 +135,7 @@ impl DynamicMarketStreamer {
             price_rx: Arc::new(RwLock::new(Some(price_rx))),
             is_connected: Arc::new(RwLock::new(false)),
             shutdown_signal: Arc::new(RwLock::new(None)),
+            stopped_signal: Arc::new(RwLock::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -291,19 +306,36 @@ impl DynamicMarketStreamer {
     ///
     /// This method disconnects the current client and creates a new one with
     /// the updated EPIC list.
+    ///
+    /// The old connection is signalled and then *waited for*: its task reports
+    /// completion through the `stopped` handshake, so the new session is only
+    /// opened once the old one has closed. There is no timed sleep here — the
+    /// wait is bounded by [`SHUTDOWN_GRACE`] purely so a wedged teardown cannot
+    /// stall the caller forever.
     async fn reconnect(&self) -> Result<(), AppError> {
         info!("Reconnecting with updated EPIC list...");
 
-        // Signal shutdown to current client
-        {
+        // Signal shutdown to the current connection and take its completion
+        // handshake. Both guards are scoped: nothing is held across the await.
+        let stopped = {
             let shutdown_lock = self.shutdown_signal.read().await;
             if let Some(signal) = shutdown_lock.as_ref() {
                 signal.notify_one();
             }
-        }
+            let stopped_lock = self.stopped_signal.read().await;
+            stopped_lock.as_ref().map(Arc::clone)
+        };
 
-        // Wait a bit for graceful shutdown
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Some(stopped) = stopped
+            && tokio::time::timeout(SHUTDOWN_GRACE, stopped.notified())
+                .await
+                .is_err()
+        {
+            warn!(
+                grace_ms = SHUTDOWN_GRACE.as_millis(),
+                "previous streaming connection did not confirm shutdown in time; continuing"
+            );
+        }
 
         // Start new connection
         let epics = self.get_epics().await;
@@ -337,24 +369,30 @@ impl DynamicMarketStreamer {
         let fields = self.fields.clone();
         let mut receiver = new_client.market_subscribe(epics.clone(), fields).await?;
 
-        // Forward updates to the main channel
-        let price_tx = self.price_tx.read().await;
-        if let Some(tx) = price_tx.as_ref() {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                while let Some(price_data) = receiver.recv().await {
-                    if tx.send(price_data).is_err() {
-                        warn!("Failed to send price update: receiver dropped");
-                        break;
+        // Forward updates to the main channel. The task ends on its own when
+        // the connection closes (which closes `receiver`) or when the consumer
+        // drops the shared receiver, so it needs no separate shutdown path.
+        let forwarder = {
+            let price_tx = self.price_tx.read().await;
+            price_tx.as_ref().map(|tx| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(price_data) = receiver.recv().await {
+                        if tx.send(price_data).is_err() {
+                            warn!("Failed to send price update: receiver dropped");
+                            break;
+                        }
                     }
-                }
-                debug!("Subscription forwarding task ended");
-            });
-        }
+                    debug!("Subscription forwarding task ended");
+                })
+            })
+        };
 
-        // Create new shutdown signal
+        // Create new shutdown signal and its completion handshake
         let signal = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
         *self.shutdown_signal.write().await = Some(Arc::clone(&signal));
+        *self.stopped_signal.write().await = Some(Arc::clone(&stopped));
 
         // Mark as connected
         *self.is_connected.write().await = true;
@@ -393,9 +431,22 @@ impl DynamicMarketStreamer {
             }
 
             match result {
-                Ok(_) => info!("Connection task completed successfully"),
+                Ok(()) => info!("Connection task completed successfully"),
                 Err(e) => tracing::error!("Connection task failed: {:?}", e),
             }
+
+            // The forwarder's upstream channel is closed by the teardown above,
+            // so it is already finishing; awaiting it keeps the handshake
+            // honest, i.e. nothing from this connection is still in flight when
+            // `reconnect` proceeds.
+            if let Some(forwarder) = forwarder
+                && let Err(e) = forwarder.await
+            {
+                warn!(error = %e, "price forwarding task did not exit cleanly");
+            }
+
+            // Tell a waiting `reconnect` that this connection is fully closed.
+            stopped.notify_one();
         });
 
         info!("Connection task started in background");
@@ -426,12 +477,22 @@ impl DynamicMarketStreamer {
 
     /// Connects to the Lightstreamer server and blocks until shutdown.
     ///
-    /// This is a convenience method that calls `start()` and then waits for a shutdown signal.
-    /// Use `start()` if you need non-blocking behavior.
+    /// This is a convenience method that calls `start()` and then waits for a
+    /// shutdown signal. Use `start()` if you need non-blocking behavior.
+    ///
+    /// Signal handling lives here rather than in `lightstreamer-rs`, which
+    /// deliberately installs none: interpreting `SIGINT` is an application's
+    /// decision, not a protocol client's.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` when the connection is closed gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError`] if the connection could not be started, or if the
+    /// Ctrl-C handler could not be installed — a streamer that cannot be
+    /// stopped must not be reported as running.
     ///
     /// # Examples
     ///
@@ -442,16 +503,14 @@ impl DynamicMarketStreamer {
     pub async fn connect(&mut self) -> Result<(), AppError> {
         self.start().await?;
 
-        // Wait for SIGINT/SIGTERM
-        use lightstreamer_rs::utils::setup_signal_hook;
-        let signal = Arc::new(Notify::new());
-        setup_signal_hook(Arc::clone(&signal)).await;
-        signal.notified().await;
+        let interrupted = tokio::signal::ctrl_c().await;
 
-        // Disconnect
+        // Disconnect either way: the streamer must not be left running because
+        // the signal machinery failed.
         self.disconnect().await?;
 
-        Ok(())
+        interrupted
+            .map_err(|e| AppError::Generic(format!("could not wait for the interrupt signal: {e}")))
     }
 
     /// Disconnects from the Lightstreamer server.
@@ -495,6 +554,7 @@ impl Clone for DynamicMarketStreamer {
             price_rx: Arc::clone(&self.price_rx),
             is_connected: Arc::clone(&self.is_connected),
             shutdown_signal: Arc::clone(&self.shutdown_signal),
+            stopped_signal: Arc::clone(&self.stopped_signal),
             generation: Arc::clone(&self.generation),
         }
     }

@@ -71,6 +71,10 @@ pub use crate::application::interfaces::watchlist::WatchlistService;
 pub use crate::application::client::StreamerClient;
 #[cfg(feature = "streaming")]
 pub use crate::application::dynamic_streamer::DynamicMarketStreamer;
+// The seam between `lightstreamer-rs` and the presentation DTOs: implement
+// `From<&StreamingUpdate>` to plug your own type into `Listener<T>`.
+#[cfg(feature = "streaming")]
+pub use crate::application::streaming_convert::StreamingUpdate;
 
 // Error handling
 pub use crate::error::AppError;
