@@ -8,14 +8,16 @@
 //!
 //! The presentation DTOs stay transport-agnostic: they expose pure
 //! `from_fields(..)` constructors that take plain field maps. This module is the
-//! only place that depends on `lightstreamer_rs`; it reads an [`ItemUpdate`] and
+//! only place that depends on `lightstreamer_rs`; it reads an
+//! [`ItemUpdate`](lightstreamer_rs::ItemUpdate) and
 //! feeds the extracted metadata / field maps into those pure constructors.
 //!
 //! # The seam
 //!
-//! [`ItemUpdate`] is the streaming crate's own type: it borrows from the
-//! subscription schema, has no public constructor, and models a field value as
-//! [`FieldValue`] rather than a string. [`StreamingUpdate`] is this crate's
+//! [`ItemUpdate`](lightstreamer_rs::ItemUpdate) is the streaming crate's own
+//! type: it borrows from the subscription schema, has no public constructor, and
+//! models a field value as [`FieldValue`](lightstreamer_rs::FieldValue) rather
+//! than a string. [`StreamingUpdate`](crate::application::streaming_convert::StreamingUpdate) is this crate's
 //! owned, constructible mirror of it, and every conversion below goes through
 //! it. That keeps the DTO parsers testable without a live session, and keeps
 //! the null-versus-empty distinction explicit at exactly one place:
