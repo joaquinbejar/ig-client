@@ -8,10 +8,13 @@
 //!
 //! `lightstreamer-rs` 1.0 delivers updates as a [`Stream`] rather than through
 //! a listener trait, but this crate's own callback surface is unchanged:
-//! [`Listener::new`] still takes a `Fn(&T) -> ListenerResult`. What used to be
-//! an upstream trait implementation is now [`Listener::spawn`], which pumps the
-//! stream and invokes the callback for every update, and
-//! [`Listener::on_item_update`], which applies the callback to a single update.
+//! [`Listener::new`](crate::application::interfaces::listener::Listener::new)
+//! still takes a `Fn(&T) -> ListenerResult`. What used to be an upstream trait
+//! implementation is now
+//! [`Listener::spawn`](crate::application::interfaces::listener::Listener::spawn),
+//! which pumps the stream and invokes the callback for every update, and
+//! [`Listener::on_item_update`](crate::application::interfaces::listener::Listener::on_item_update),
+//! which applies the callback to a single update.
 //!
 //! [`Stream`]: futures::Stream
 
