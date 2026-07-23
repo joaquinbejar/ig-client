@@ -36,23 +36,31 @@ async fn main() -> Result<(), AppError> {
     match client.get_costs_history(from, to).await {
         Ok(history) => {
             println!(
-                "\n{:<15} {:<20} {:<25} {:>12} {:>8}",
-                "DATE", "DEAL REF", "EPIC", "COST", "CCY"
+                "\n{:<25} {:<8} {:<10} {:<30} {:<38}",
+                "CREATED", "TYPE", "DIRECTION", "INSTRUMENT", "QUOTE REFERENCE"
             );
-            println!("{}", "-".repeat(80));
+            println!("{}", "-".repeat(115));
 
-            for cost in &history.costs {
+            for entry in &history.costs_and_charges_history {
                 println!(
-                    "{:<15} {:<20} {:<25} {:>12.2} {:>8}",
-                    cost.date,
-                    cost.deal_reference.as_deref().unwrap_or("-"),
-                    cost.epic.as_deref().unwrap_or("-"),
-                    cost.total_cost.unwrap_or(0.0),
-                    cost.currency.as_deref().unwrap_or("-")
+                    "{:<25} {:<8} {:<10} {:<30} {:<38}",
+                    entry.created_timestamp.as_deref().unwrap_or("-"),
+                    entry.entry_type.as_deref().unwrap_or("-"),
+                    entry.direction.as_deref().unwrap_or("-"),
+                    entry.instrument_name.as_deref().unwrap_or("-"),
+                    entry.indicative_quote_reference.as_deref().unwrap_or("-")
                 );
             }
 
-            println!("\nTotal cost entries: {}", history.costs.len());
+            println!(
+                "\nTotal cost entries: {} ({} pages upstream)",
+                history.costs_and_charges_history.len(),
+                history.pagination.total_pages
+            );
+            println!(
+                "Amounts are not inline: fetch each disclosure document via \
+                 get_durable_medium(quote_reference)."
+            );
         }
         Err(e) => {
             println!("Error getting costs history: {}", e);
