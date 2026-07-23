@@ -1245,7 +1245,11 @@ impl CostsService for Client {
     ) -> Result<CostsHistoryResponse, AppError> {
         // IG requires pageSize (400 without it) and parses from/to as
         // ISO-8601 instants with a zone designator (500 without one).
-        const PAGE_SIZE: u32 = 500;
+        // pageSize is silently capped: above ~50 IG returns correct
+        // pagination metadata (totalElements/totalPages) but an EMPTY
+        // costsAndChargesHistory list (observed on demo with 100 and 500;
+        // 50 returns entries). Keep the page size at 50.
+        const PAGE_SIZE: u32 = 50;
         let from = ensure_zone_designator(from);
         let to = ensure_zone_designator(to);
         let mut all_entries = Vec::new();
