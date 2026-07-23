@@ -972,28 +972,58 @@ pub struct CostBreakdown {
     pub amount: Option<f64>,
 }
 
-/// Response containing historical costs
+/// Response containing paginated costs and charges history
+///
+/// Captured shape (demo, 2026-07-23): `{"pagination": {...},
+/// "costsAndChargesHistory": [...]}`. Entries carry **no amounts inline** —
+/// each references its disclosure document via `indicativeQuoteReference`,
+/// retrievable with `get_durable_medium`.
 #[derive(DebugPretty, Clone, Serialize, Deserialize, Default)]
 pub struct CostsHistoryResponse {
-    /// List of historical costs
-    pub costs: Vec<HistoricalCost>,
+    /// Pagination metadata
+    #[serde(default)]
+    pub pagination: CostsHistoryPagination,
+    /// Costs and charges entries for the requested window
+    #[serde(rename = "costsAndChargesHistory", default)]
+    pub costs_and_charges_history: Vec<CostsHistoryEntry>,
 }
 
-/// Historical cost entry
+/// Pagination metadata of the costs history response
 #[derive(DebugPretty, Clone, Serialize, Deserialize, Default)]
-pub struct HistoricalCost {
-    /// Date of the cost
-    pub date: String,
-    /// Deal reference
-    #[serde(rename = "dealReference")]
-    pub deal_reference: Option<String>,
-    /// Epic of the instrument
-    pub epic: Option<String>,
-    /// Total cost amount
-    #[serde(rename = "totalCost")]
-    pub total_cost: Option<f64>,
-    /// Currency
-    pub currency: Option<String>,
+pub struct CostsHistoryPagination {
+    /// Page size requested
+    #[serde(rename = "pageSize", default)]
+    pub page_size: i64,
+    /// Current page number (1-based)
+    #[serde(rename = "pageNumber", default)]
+    pub page_number: i64,
+    /// Total number of pages available
+    #[serde(rename = "totalPages", default)]
+    pub total_pages: i64,
+    /// Total number of entries across all pages
+    #[serde(rename = "totalElements", default)]
+    pub total_elements: i64,
+}
+
+/// One costs and charges history entry
+#[derive(DebugPretty, Clone, Serialize, Deserialize, Default)]
+pub struct CostsHistoryEntry {
+    /// Entry type (e.g. `TRADE`)
+    #[serde(rename = "type", default)]
+    pub entry_type: Option<String>,
+    /// Deal direction (`BUY` / `SELL`)
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Instrument name (may be empty)
+    #[serde(rename = "instrumentName", default)]
+    pub instrument_name: Option<String>,
+    /// Creation timestamp (ISO-8601, no zone designator)
+    #[serde(rename = "createdTimestamp", default)]
+    pub created_timestamp: Option<String>,
+    /// Reference of the disclosure document holding the actual amounts
+    /// (retrieve with `get_durable_medium`)
+    #[serde(rename = "indicativeQuoteReference", default)]
+    pub indicative_quote_reference: Option<String>,
 }
 
 /// Response containing a durable medium document
@@ -1424,27 +1454,66 @@ mod tests {
 
     #[test]
     fn test_costs_history_response_deserialize_and_roundtrip() {
+        // Captured from demo indicativecostsandcharges/history (2026-07-23),
+        // truncated to one entry; quote reference shape-preservingly redacted.
         let json = r#"{
-            "costs": [
+            "pagination": {"pageSize": 10, "pageNumber": 1, "totalPages": 23, "totalElements": 224},
+            "costsAndChargesHistory": [
                 {
-                    "date": "2025-07-01",
-                    "dealReference": "REFFAKEC1",
-                    "epic": "IX.D.FTSE.DAILY.IP",
-                    "totalCost": 5.5,
-                    "currency": "GBP"
+                    "type": "TRADE",
+                    "direction": "SELL",
+                    "instrumentName": "",
+                    "createdTimestamp": "2026-01-12T14:38:46.401",
+                    "indicativeQuoteReference": "00000000-2a79-4710-aa44-000000000000"
                 }
             ]
         }"#;
 
         let resp: CostsHistoryResponse = serde_json::from_str(json).expect("deserialize failed");
-        assert_eq!(resp.costs.len(), 1);
-        let cost = &resp.costs[0];
-        assert_eq!(cost.date, "2025-07-01");
-        assert_eq!(cost.deal_reference.as_deref(), Some("REFFAKEC1"));
-        assert_eq!(cost.total_cost, Some(5.5));
+        assert_eq!(resp.pagination.page_size, 10);
+        assert_eq!(resp.pagination.total_pages, 23);
+        assert_eq!(resp.pagination.total_elements, 224);
+        assert_eq!(resp.costs_and_charges_history.len(), 1);
+        let entry = &resp.costs_and_charges_history[0];
+        assert_eq!(entry.entry_type.as_deref(), Some("TRADE"));
+        assert_eq!(entry.direction.as_deref(), Some("SELL"));
+        assert_eq!(entry.instrument_name.as_deref(), Some(""));
+        assert_eq!(
+            entry.created_timestamp.as_deref(),
+            Some("2026-01-12T14:38:46.401")
+        );
+        assert_eq!(
+            entry.indicative_quote_reference.as_deref(),
+            Some("00000000-2a79-4710-aa44-000000000000")
+        );
 
         let re = roundtrip(&resp);
-        assert_eq!(re.costs[0].epic.as_deref(), Some("IX.D.FTSE.DAILY.IP"));
+        assert_eq!(re.pagination.total_elements, 224);
+        assert_eq!(
+            re.costs_and_charges_history[0].entry_type.as_deref(),
+            Some("TRADE")
+        );
+    }
+
+    #[test]
+    fn test_costs_history_response_minimal_payload_defaults() {
+        // An empty-window response and a fully minimal object must both parse.
+        let empty_window: CostsHistoryResponse = serde_json::from_str(
+            r#"{"pagination":{"pageSize":20,"pageNumber":1,"totalPages":0,"totalElements":0},"costsAndChargesHistory":[]}"#,
+        )
+        .expect("empty-window payload must deserialize");
+        assert!(empty_window.costs_and_charges_history.is_empty());
+        assert_eq!(empty_window.pagination.total_pages, 0);
+
+        let minimal: CostsHistoryResponse =
+            serde_json::from_str("{}").expect("minimal payload must deserialize");
+        assert!(minimal.costs_and_charges_history.is_empty());
+        assert_eq!(minimal.pagination.page_number, 0);
+
+        let minimal_entry: CostsHistoryEntry =
+            serde_json::from_str("{}").expect("minimal entry must deserialize");
+        assert_eq!(minimal_entry.entry_type, None);
+        assert_eq!(minimal_entry.indicative_quote_reference, None);
     }
 
     #[test]

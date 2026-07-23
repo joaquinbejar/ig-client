@@ -62,14 +62,24 @@ pub trait CostsService: Send + Sync {
         request: &EditCostsRequest,
     ) -> Result<IndicativeCostsResponse, AppError>;
 
-    /// Returns historical costs and charges for a date range
+    /// Returns historical costs and charges for a date range, handling
+    /// pagination automatically (the full window is returned).
+    ///
+    /// IG parses the bounds as ISO-8601 instants; a zone-less timestamp
+    /// (e.g. `"2023-01-01T00:00:00"`) is accepted and treated as UTC — the
+    /// implementation appends the required `Z` designator when missing —
+    /// and a date-only bound (e.g. `"2023-01-01"`) expands to midnight UTC.
+    ///
+    /// Entries carry no cost amounts inline: each references its disclosure
+    /// document via `indicative_quote_reference`, retrievable with
+    /// [`CostsService::get_durable_medium`].
     ///
     /// # Arguments
-    /// * `from` - Start date in ISO format (e.g., "2023-01-01")
-    /// * `to` - End date in ISO format (e.g., "2023-12-31")
+    /// * `from` - Window start, ISO-8601 (e.g., "2023-01-01T00:00:00" or "2023-01-01T00:00:00Z")
+    /// * `to` - Window end, same format
     ///
     /// # Returns
-    /// * `Ok(CostsHistoryResponse)` - Historical costs data
+    /// * `Ok(CostsHistoryResponse)` - Historical costs entries for the whole window
     /// * `Err(AppError)` - If the request fails
     async fn get_costs_history(
         &self,

@@ -125,6 +125,35 @@ fn is_transient_confirmation_error(err: &AppError) -> bool {
     }
 }
 
+/// Appends a `Z` zone designator to a zone-less ISO-8601 timestamp.
+///
+/// IG's costs-history endpoint parses `from`/`to` as ISO-8601 instants and
+/// rejects zone-less timestamps with a 500 (`could not be parsed at index
+/// 19`). Callers across this crate pass the same zone-less local ISO form
+/// the other history endpoints accept (`2026-01-01T00:00:00`), so this
+/// helper appends `Z` when no designator (`Z` or a `±hh:mm` offset after
+/// the time part) is present. Inputs that already carry a designator pass
+/// through unchanged.
+#[must_use]
+fn ensure_zone_designator(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.ends_with('Z') {
+        return trimmed.to_string();
+    }
+    let Some(time_index) = trimmed.find('T') else {
+        // Date-only input: expand to midnight UTC.
+        return format!("{trimmed}T00:00:00Z");
+    };
+    let has_offset = trimmed
+        .get(time_index..)
+        .is_some_and(|time_part| time_part.contains('+') || time_part.contains('-'));
+    if has_offset {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}Z")
+    }
+}
+
 /// Main client for interacting with IG Markets API
 ///
 /// This client provides a unified interface for all IG Markets API operations,
@@ -1214,11 +1243,43 @@ impl CostsService for Client {
         from: &str,
         to: &str,
     ) -> Result<CostsHistoryResponse, AppError> {
-        let path = format!("indicativecostsandcharges/history/from/{}/to/{}", from, to);
-        info!("Getting costs history from {} to {}", from, to);
-        let result: CostsHistoryResponse = self.http_client.get(&path, Some(1)).await?;
-        debug!("Costs history obtained: {} entries", result.costs.len());
-        Ok(result)
+        // IG requires pageSize (400 without it) and parses from/to as
+        // ISO-8601 instants with a zone designator (500 without one).
+        const PAGE_SIZE: u32 = 500;
+        let from = ensure_zone_designator(from);
+        let to = ensure_zone_designator(to);
+        let mut all_entries = Vec::new();
+        let mut current_page: u32 = 1;
+        #[allow(unused_assignments)]
+        let mut last_pagination = None;
+
+        loop {
+            let path = format!(
+                "indicativecostsandcharges/history/from/{}/to/{}?pageSize={}&pageNumber={}",
+                from, to, PAGE_SIZE, current_page
+            );
+            info!("Getting costs history page {}", current_page);
+
+            let result: CostsHistoryResponse = self.http_client.get(&path, Some(1)).await?;
+
+            let total_pages = result.pagination.total_pages;
+            last_pagination = Some(result.pagination);
+            all_entries.extend(result.costs_and_charges_history);
+
+            if i64::from(current_page) >= total_pages {
+                break;
+            }
+            current_page += 1;
+        }
+
+        debug!("Costs history obtained: {} entries", all_entries.len());
+
+        Ok(CostsHistoryResponse {
+            pagination: last_pagination.ok_or_else(|| {
+                AppError::InvalidInput("Could not retrieve pagination".to_string())
+            })?,
+            costs_and_charges_history: all_entries,
+        })
     }
 
     async fn get_durable_medium(
@@ -2053,9 +2114,42 @@ impl Drop for StreamerClient {
 
 #[cfg(test)]
 mod tests {
-    use super::is_transient_confirmation_error;
+    use super::{ensure_zone_designator, is_transient_confirmation_error};
     use crate::error::AppError;
     use reqwest::StatusCode;
+
+    #[test]
+    fn test_ensure_zone_designator_appends_z_when_missing() {
+        assert_eq!(
+            ensure_zone_designator("2026-01-01T00:00:00"),
+            "2026-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            ensure_zone_designator(" 2026-01-01T00:00:00 "),
+            "2026-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn test_ensure_zone_designator_expands_date_only_to_midnight_utc() {
+        assert_eq!(ensure_zone_designator("2026-01-01"), "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_ensure_zone_designator_keeps_existing_designator() {
+        assert_eq!(
+            ensure_zone_designator("2026-01-01T00:00:00Z"),
+            "2026-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            ensure_zone_designator("2026-01-01T00:00:00+01:00"),
+            "2026-01-01T00:00:00+01:00"
+        );
+        assert_eq!(
+            ensure_zone_designator("2026-01-01T00:00:00-05:00"),
+            "2026-01-01T00:00:00-05:00"
+        );
+    }
 
     #[test]
     fn test_confirmation_error_rate_limit_is_transient() {
