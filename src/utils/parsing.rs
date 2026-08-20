@@ -123,13 +123,13 @@ pub fn parse_instrument_name(instrument_name: &str) -> ParsedOptionInfo {
         // Pattern for standard options like "US Tech 100 19200 CALL ($1)".
         // The strike group accepts an optional decimal part, so this pattern
         // already covers decimal strikes like "Volatility Index 10.5 PUT ($1)".
-        static ref OPTION_PATTERN: Regex = Regex::new(r"^(.*?)\s+(\d+(?:\.\d+)?)\s+(CALL|PUT)(?:\s+\(.*?\))?$").expect("valid option regex");
+        static ref OPTION_PATTERN: Regex = Regex::new(r"^(.*?)\s+(\d+(?:\.\d+)?)\s+((?i:CALL|PUT))(?:\s+\(.*?\))?$").expect("valid option regex");
 
         // Pattern for options with no space between parenthesis and strike like "Weekly Germany 40 (Wed)27500 PUT"
-        static ref SPECIAL_OPTION_PATTERN: Regex = Regex::new(r"^(.*?)\s+\(([^)]+)\)(\d+)\s+(CALL|PUT)(?:\s+\(.*?\))?$").expect("valid special option regex");
+        static ref SPECIAL_OPTION_PATTERN: Regex = Regex::new(r"^(.*?)\s+\(([^)]+)\)(\d+)\s+((?i:CALL|PUT))(?:\s+\(.*?\))?$").expect("valid special option regex");
 
         // Pattern for options with incomplete parenthesis like "Weekly USDJPY 12950 CALL (Y100"
-        static ref INCOMPLETE_PAREN_PATTERN: Regex = Regex::new(r"^(.*?)\s+(\d+(?:\.\d+)?)\s+(CALL|PUT)\s+\([^)]*$").expect("valid incomplete paren regex");
+        static ref INCOMPLETE_PAREN_PATTERN: Regex = Regex::new(r"^(.*?)\s+(\d+(?:\.\d+)?)\s+((?i:CALL|PUT))\s+\([^)]*$").expect("valid incomplete paren regex");
 
         // Pattern for other instruments that don't follow the option pattern
         static ref GENERIC_PATTERN: Regex = Regex::new(r"^(.*?)(?:\s+\(.*?\))?$").expect("valid generic regex");
@@ -176,7 +176,7 @@ pub fn parse_instrument_name(instrument_name: &str) -> ParsedOptionInfo {
         ParsedOptionInfo {
             asset_name: clean_asset_name(asset_name),
             strike: captures.get(2).map(|m| m.as_str().to_string()),
-            option_type: captures.get(3).map(|m| m.as_str().to_string()),
+            option_type: captures.get(3).map(|m| m.as_str().to_uppercase()),
         }
     } else if let Some(captures) = SPECIAL_OPTION_PATTERN.captures(instrument_name) {
         // This is a special case like "Weekly Germany 40 (Wed)27500 PUT"
@@ -184,7 +184,7 @@ pub fn parse_instrument_name(instrument_name: &str) -> ParsedOptionInfo {
         ParsedOptionInfo {
             asset_name: clean_asset_name(base_name),
             strike: captures.get(3).map(|m| m.as_str().to_string()),
-            option_type: captures.get(4).map(|m| m.as_str().to_string()),
+            option_type: captures.get(4).map(|m| m.as_str().to_uppercase()),
         }
     } else if let Some(captures) = INCOMPLETE_PAREN_PATTERN.captures(instrument_name) {
         // This is a case with incomplete parenthesis like "Weekly USDJPY 12950 CALL (Y100"
@@ -192,7 +192,7 @@ pub fn parse_instrument_name(instrument_name: &str) -> ParsedOptionInfo {
         ParsedOptionInfo {
             asset_name: clean_asset_name(asset_name),
             strike: captures.get(2).map(|m| m.as_str().to_string()),
-            option_type: captures.get(3).map(|m| m.as_str().to_string()),
+            option_type: captures.get(3).map(|m| m.as_str().to_uppercase()),
         }
     } else if let Some(captures) = GENERIC_PATTERN.captures(instrument_name) {
         // This is a generic instrument without strike or type
@@ -243,6 +243,20 @@ mod tests {
         assert_eq!(info.asset_name, "US Tech 100");
         assert_eq!(info.strike, Some("19200".to_string()));
         assert_eq!(info.option_type, Some("CALL".to_string()));
+    }
+
+    #[test]
+    fn test_parse_instrument_name_mixed_case_option_type() {
+        // IG returns some option instrument names with the option type in
+        // title case (e.g. Wall Street monthly options); the parser must be
+        // case-insensitive and normalize the type to uppercase.
+        let info = parse_instrument_name("Wall Street 50000 Call ($1)");
+        assert_eq!(info.asset_name, "Wall Street");
+        assert_eq!(info.strike, Some("50000".to_string()));
+        assert_eq!(info.option_type, Some("CALL".to_string()));
+
+        let info = parse_instrument_name("Wall Street 50000 Put ($1)");
+        assert_eq!(info.option_type, Some("PUT".to_string()));
     }
 
     #[test]
