@@ -13,7 +13,7 @@
 //! layer must not perform I/O.
 
 use crate::application::auth::{Auth, Session, WebsocketInfo};
-use crate::application::config::Config;
+use crate::application::config::{Config, RateLimiterConfig};
 use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
 use crate::constants::USER_AGENT;
 use crate::error::AppError;
@@ -22,6 +22,9 @@ use reqwest::Client as HttpInternalClient;
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
@@ -42,6 +45,28 @@ pub struct HttpClient {
     /// [`RateLimiter`] as the fields above, so a single-key configuration keeps
     /// the historical behaviour exactly.
     pool: Vec<KeySlot>,
+    /// Budget shared by the whole pool.
+    ///
+    /// IG documents a per-account ceiling on top of the per-key one, and every
+    /// key here authenticates the same account. Without this, N keys would pace
+    /// N times the account's allowance and the account limit would be found the
+    /// hard way.
+    account_limiter: RateLimiter,
+    /// The slot whose session this client exposes, and the one trading is
+    /// pinned to.
+    ///
+    /// Starts at 0 and moves whenever that key turns out to be unusable — at
+    /// construction, or later, on the lazy path where the first login only
+    /// happens when a request arrives. Pointing `auth`, `ws_info` and order
+    /// traffic at a key that cannot log in would break exactly the paths that
+    /// have no second key to fall back on.
+    primary: AtomicUsize,
+    /// Round-robin starting point for slot selection.
+    ///
+    /// Without it every caller scans the pool from index 0, so concurrent
+    /// requests pile onto the first key while the rest sit idle. Advancing it
+    /// per selection spreads equally-available keys evenly.
+    cursor: AtomicUsize,
 }
 
 /// One API key of the pool, with the session and pacing budget that belong to it.
@@ -67,6 +92,60 @@ struct KeySlot {
 /// long that the pool shrinks under sustained load.
 const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// The two budgets every physical request has to pass.
+///
+/// IG meters an allowance per API key *and* one per account, and a pool draws
+/// on both at once: the key's own bucket and the account bucket its keys share.
+/// Both are charged per HTTP request actually sent — logins, token refreshes
+/// and retries included — because that is what IG counts.
+#[derive(Clone, Copy)]
+pub struct Pacing<'a> {
+    /// The budget of the API key serving this request.
+    pub key: &'a RateLimiter,
+    /// The budget shared by every key of the account, when one is configured.
+    pub account: Option<&'a RateLimiter>,
+}
+
+impl<'a> Pacing<'a> {
+    /// Pacing against one key only, with no account-wide budget.
+    #[must_use]
+    pub const fn key_only(key: &'a RateLimiter) -> Self {
+        Self { key, account: None }
+    }
+
+    /// Takes an account token, if an account budget is configured.
+    ///
+    /// Called immediately before the send and never earlier: taken at selection
+    /// time it would be held across a wait of up to a full period, letting
+    /// permits pile up and burst past the ceiling once the waits resolve.
+    ///
+    /// Non-trading and historical traffic charge the **same** bucket, because
+    /// IG's per-account non-trading allowance is one budget: giving each class
+    /// its own account bucket would let `/prices` and market data each run to
+    /// 30/min and together exceed it. Trading does not charge it at all — IG
+    /// meters order traffic against a separate trading allowance, and pacing it
+    /// against the non-trading ceiling would throttle orders behind bulk reads.
+    async fn charge_account(&self, class: RateLimitClass) {
+        if class == RateLimitClass::Trading {
+            return;
+        }
+        if let Some(account) = self.account {
+            // One flat bucket: the class is deliberately collapsed.
+            account.wait_for(RateLimitClass::NonTrading).await;
+        }
+    }
+}
+
+/// IG's documented non-trading ceiling for one account.
+///
+/// Measurement never reached it — four keys sustained 32/min with no rejection —
+/// but it is the published limit, so the pool paces below it rather than
+/// discovering it in production.
+const ACCOUNT_MAX_REQUESTS_PER_MINUTE: u32 = 30;
+
+/// The window [`ACCOUNT_MAX_REQUESTS_PER_MINUTE`] is measured over.
+const ACCOUNT_PERIOD_SECONDS: u64 = 60;
+
 /// Renders an API key for logs as its first eight characters.
 ///
 /// Enough to tell the pool's keys apart when reading a trace, never enough to
@@ -86,6 +165,15 @@ impl KeySlot {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// When this slot's cooldown ends, if it is in one.
+    fn cooldown_deadline(&self) -> Option<Instant> {
+        let guard = match self.cooldown_until.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.filter(|&until| Instant::now() < until)
     }
 
     /// Marks the key as exhausted for [`KEY_COOLDOWN`].
@@ -119,22 +207,29 @@ impl HttpClient {
         let http_client = HttpInternalClient::builder()
             .user_agent(USER_AGENT)
             .build()?;
-        let rate_limiter = RateLimiter::new(&config.rate_limiter);
+        // Build the pool first: every slot owns a single-key `Config`, so the
+        // client's own `Auth` is the primary slot's rather than one built from the raw
+        // config, whose `api_key` may be the whole comma-separated list.
+        let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
+        let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
-        // Create Auth instance via the fallible constructor so this path never
-        // panics on a broken TLS backend.
-        let auth = Arc::new(Auth::try_new(config.clone())?);
-
-        // Perform initial login
-        auth.login().await?;
-
-        let pool = Self::build_pool(&config, &auth, &rate_limiter)?;
+        // Log in on the first key that will have us: an allowance rejection on
+        // one key says nothing about the others, so construction rotates too
+        // rather than failing on slot 0. Whichever key answered becomes the
+        // primary, so the session this client exposes is one that exists.
+        let primary = Self::login_any(&pool).await?;
+        let auth = pool
+            .get(primary)
+            .map_or_else(|| auth.clone(), |slot| slot.auth.clone());
 
         Ok(Self {
             auth,
             http_client,
             config,
             pool,
+            account_limiter,
+            primary: AtomicUsize::new(primary),
+            cursor: AtomicUsize::new(0),
         })
     }
 
@@ -149,60 +244,74 @@ impl HttpClient {
         let http_client = HttpInternalClient::builder()
             .user_agent(USER_AGENT)
             .build()?;
-        let rate_limiter = RateLimiter::new(&config.rate_limiter);
-
-        // Create Auth instance via the fallible constructor so the whole
-        // `new_lazy` path (and `Client::try_new` built on it) never panics.
-        let auth = Arc::new(Auth::try_new(config.clone())?);
-
-        let pool = Self::build_pool(&config, &auth, &rate_limiter)?;
+        // Same as `new`: the client's `Auth` is the pool's first slot, never an
+        // `Auth` built from a config whose `api_key` is the whole pool list.
+        let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
+        let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
         Ok(Self {
             auth,
             http_client,
             config,
             pool,
+            account_limiter,
+            primary: AtomicUsize::new(0),
+            cursor: AtomicUsize::new(0),
         })
     }
 
     /// Builds one [`KeySlot`] per API key declared in the configuration.
     ///
-    /// The first slot reuses the caller's [`Auth`] and [`RateLimiter`] so a
-    /// single-key setup keeps its existing session and pacing untouched. Every
-    /// additional key gets a cloned `Config` carrying only that key, hence its
-    /// own session and its own budget.
+    /// Every slot — the first included — gets a `Config` carrying **only its own
+    /// key**. The first slot used to reuse the caller's `Auth`, which had been
+    /// built from the original config: with a pool configured, that `Auth`
+    /// carried the whole comma-separated list as its `api_key` and sent it as
+    /// one 3 KB `X-IG-API-KEY` header, which IG answers with 403. The list is a
+    /// pool specification, never a credential.
+    ///
+    /// Each key's session and its data requests share one limiter, because IG
+    /// meters the login against the same per-key allowance as everything else.
     ///
     /// # Errors
-    /// Returns [`AppError::Network`] if an extra key's [`Auth`] cannot be built.
+    /// Returns [`AppError::Network`] if a key's [`Auth`] cannot be built.
+    /// # Returns
+    ///
+    /// The pool and the first slot's [`Auth`], which the client adopts as its
+    /// own. Returning it here is what guarantees the client never holds an
+    /// `Auth` built from the raw multi-key config.
     fn build_pool(
         config: &Arc<Config>,
-        auth: &Arc<Auth>,
-        rate_limiter: &RateLimiter,
-    ) -> Result<Vec<KeySlot>, AppError> {
+        account_limiter: &RateLimiter,
+    ) -> Result<(Arc<Auth>, Vec<KeySlot>), AppError> {
         let keys = config.credentials.api_keys();
-
-        let first = KeySlot {
-            api_key: keys
-                .first()
-                .cloned()
-                .unwrap_or_else(|| config.credentials.api_key.clone()),
-            auth: auth.clone(),
-            rate_limiter: rate_limiter.clone(),
-            cooldown_until: Arc::new(StdMutex::new(None)),
+        // An empty list means the value held no usable key; keep the raw value
+        // so the failure surfaces as IG rejecting it, not as an empty pool.
+        let keys = if keys.is_empty() {
+            vec![config.credentials.api_key.clone()]
+        } else {
+            keys
         };
 
-        let mut pool = Vec::with_capacity(keys.len().max(1));
-        pool.push(first);
-
-        for key in keys.iter().skip(1) {
+        let mut first_auth: Option<Arc<Auth>> = None;
+        let mut pool = Vec::with_capacity(keys.len());
+        for key in &keys {
             let mut key_config = (**config).clone();
             key_config.credentials.api_key = key.clone();
             let key_config = Arc::new(key_config);
 
+            let key_limiter = RateLimiter::new(&key_config.rate_limiter);
+            let key_auth = Arc::new(Auth::with_limiters(
+                key_config,
+                key_limiter.clone(),
+                account_limiter.clone(),
+            )?);
+            if first_auth.is_none() {
+                first_auth = Some(key_auth.clone());
+            }
             pool.push(KeySlot {
                 api_key: key.clone(),
-                rate_limiter: RateLimiter::new(&key_config.rate_limiter),
-                auth: Arc::new(Auth::try_new(key_config)?),
+                rate_limiter: key_limiter,
+                auth: key_auth,
                 cooldown_until: Arc::new(StdMutex::new(None)),
             });
         }
@@ -210,31 +319,256 @@ impl HttpClient {
         if pool.len() > 1 {
             debug!(keys = pool.len(), "API key pool enabled");
         }
-        Ok(pool)
+
+        // `keys` is non-empty by construction above, so the loop ran at least
+        // once and `first_auth` is set; the fallback keeps this total without a
+        // panic.
+        let auth = match first_auth {
+            Some(auth) => auth,
+            None => Arc::new(Auth::with_limiters(
+                config.clone(),
+                RateLimiter::new(&config.rate_limiter),
+                account_limiter.clone(),
+            )?),
+        };
+        Ok((auth, pool))
     }
 
-    /// Picks the slot to serve the next request.
+    /// Builds the pool-wide budget that models IG's per-account ceiling.
     ///
-    /// Prefers a key that is neither cooling down nor out of local tokens, so
-    /// requests spread across the pool and the allowance error never happens in
-    /// the first place. Falls back to any key not yet tried for this request
-    /// (it will simply wait on its limiter), and finally to the first slot.
-    fn select_slot(&self, class: RateLimitClass, tried: &[usize]) -> usize {
-        let fresh = |i: &usize| !tried.contains(i);
+    /// Modelled directly as IG documents it — 30 requests per 60 seconds — not
+    /// derived from the per-key configuration: the account ceiling is a property
+    /// of the account, and scaling it by the configured period made a shorter
+    /// period silently raise it. The burst is one, so the allowance is spent
+    /// evenly instead of discharging thirty requests at once and then stalling.
+    ///
+    /// Shared per process **and per account**: every `HttpClient` built for the
+    /// same `account_id` gets the same bucket, so two clients in one service do
+    /// not each pace to the full ceiling.
+    ///
+    /// **It does not coordinate across processes.** Two services authenticating
+    /// the same IG account hold two buckets and together exceed the ceiling.
+    /// Enforcing it across services needs a distributed limiter, or an account
+    /// per service — which is the arrangement this codebase actually uses.
+    fn build_account_limiter(account_id: &str) -> RateLimiter {
+        static ACCOUNT_LIMITERS: OnceLock<StdMutex<HashMap<String, RateLimiter>>> = OnceLock::new();
 
-        if let Some(i) = (0..self.pool.len())
-            .filter(fresh)
-            .find(|&i| !self.pool[i].in_cooldown() && self.pool[i].rate_limiter.check_for(class))
-        {
-            return i;
+        let registry = ACCOUNT_LIMITERS.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut guard = match registry.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .entry(account_id.to_string())
+            .or_insert_with(|| {
+                RateLimiter::new(&RateLimiterConfig {
+                    max_requests: ACCOUNT_MAX_REQUESTS_PER_MINUTE,
+                    period_seconds: ACCOUNT_PERIOD_SECONDS,
+                    burst_size: 1,
+                })
+            })
+            .clone()
+    }
+
+    /// Logs in on the first key of the pool that accepts us.
+    ///
+    /// A key whose allowance is exhausted rejects the login, which says nothing
+    /// about the other keys; failing construction on slot 0 would throw the
+    /// whole pool away over one spent key.
+    ///
+    /// # Returns
+    ///
+    /// The index of the slot that authenticated. The caller adopts it as the
+    /// client's primary: leaving `auth` on a key that could not log in would
+    /// point streaming, `ws_info` and trading at the exhausted key.
+    ///
+    /// # Errors
+    /// Returns the last key's error when no key could authenticate.
+    async fn login_any(pool: &[KeySlot]) -> Result<usize, AppError> {
+        let mut last: Option<AppError> = None;
+        for (index, slot) in pool.iter().enumerate() {
+            match slot.auth.login().await {
+                Ok(_) => return Ok(index),
+                Err(e @ AppError::ApiKeyAllowanceExceeded) => {
+                    slot.mark_exhausted();
+                    warn!(
+                        key = %redact_key(&slot.api_key),
+                        "API key allowance exhausted at login, trying the next key"
+                    );
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
         }
-        if let Some(i) = (0..self.pool.len())
-            .filter(fresh)
-            .find(|&i| !self.pool[i].in_cooldown())
-        {
-            return i;
+        Err(last.unwrap_or(AppError::ApiKeyAllowanceExceeded))
+    }
+
+    /// Reserves a token from a usable key, waiting only if every key is empty.
+    ///
+    /// This is the proactive half of the pool: a key is left before it is
+    /// rejected, not after. It returns the index of a slot whose limiter has
+    /// already given up one token, so the caller owes exactly one request and
+    /// must not pace it again.
+    ///
+    /// Trading never spreads. Order traffic is metered against the account, so
+    /// rotating buys nothing, and keeping it on one key keeps a position's
+    /// requests inside one session — which is what makes a reconciliation
+    /// possible. Trading therefore always uses the primary slot and does not
+    /// touch the cursor.
+    ///
+    /// For everything else, selection starts at a shared round-robin cursor so
+    /// concurrent callers walk the pool from different points instead of piling
+    /// onto the first key. It runs in two passes so that serving one request
+    /// never authenticates the whole pool: first the keys that already hold a
+    /// session, then — only if none of those had a token — a single key that
+    /// still has to log in. When nothing can serve, the pool waits on every
+    /// candidate at once and takes whichever refills first.
+    ///
+    /// # Returns
+    ///
+    /// The reserved slot's index, or `None` when every candidate was already
+    /// tried for this request.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Auth::get_session`] reports when the chosen key
+    /// cannot authenticate, unless that is a per-key allowance rejection: that
+    /// one parks the key and moves on, because another key can still serve.
+    async fn reserve_slot(
+        &self,
+        class: RateLimitClass,
+        tried: &[usize],
+    ) -> Result<Option<usize>, AppError> {
+        // Trading stays pinned to one slot, so two consecutive orders always
+        // travel on the same key and the same session.
+        if class == RateLimitClass::Trading {
+            let primary = self.primary_index();
+            if tried.contains(&primary) {
+                return Ok(None);
+            }
+            self.pool[primary].rate_limiter.reserve(class).await;
+            self.pool[primary].auth.get_session().await?;
+            return Ok(Some(primary));
         }
-        (0..self.pool.len()).find(fresh).unwrap_or(0)
+
+        let len = self.pool.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+
+        let candidates: Vec<usize> = (0..len)
+            .map(|offset| start.wrapping_add(offset) % len)
+            .filter(|i| !tried.contains(i))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // Pass 1: keys that can send without logging in first.
+        for &i in &candidates {
+            let slot = &self.pool[i];
+            if slot.in_cooldown() || !slot.auth.has_ready_session().await {
+                continue;
+            }
+            if slot.rate_limiter.try_reserve(class) {
+                // An already-authenticated key is just as valid a primary as one
+                // that had to log in. Promoting only in pass 2 left trading and
+                // streaming pointing at a parked primary whenever the fallback
+                // happened to hold a session already.
+                self.promote_primary_if_needed(i);
+                return Ok(Some(i));
+            }
+        }
+
+        // Pass 2: at most one key is authenticated, and only when no ready key
+        // had a token. A login that hits this key's allowance parks it and the
+        // next candidate is tried, rather than burning three backoffs here.
+        for &i in &candidates {
+            let slot = &self.pool[i];
+            if slot.in_cooldown() || slot.auth.has_ready_session().await {
+                continue;
+            }
+            match slot.auth.get_session().await {
+                Ok(_) => {}
+                Err(AppError::ApiKeyAllowanceExceeded) if self.pool.len() > 1 => {
+                    slot.mark_exhausted();
+                    warn!(
+                        key = %redact_key(&slot.api_key),
+                        "API key allowance exhausted during login, trying another key"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            // This key just proved it can authenticate. If the incumbent primary
+            // cannot, hand it over: on the lazy path this is the only moment the
+            // client learns which key works, and trading and streaming follow
+            // the primary.
+            self.promote_primary_if_needed(i);
+            if slot.rate_limiter.try_reserve(class) {
+                return Ok(Some(i));
+            }
+            // Authenticated but out of tokens: fall through to the wait below
+            // rather than logging in yet another key.
+            break;
+        }
+
+        // Nothing can serve now. Wait on the keys that are not cooling down; if
+        // every one of them is, wait out the shortest cooldown first so the
+        // pool honours it instead of hammering a key IG has already refused.
+        let live: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| !self.pool[i].in_cooldown())
+            .collect();
+
+        let waiting = if live.is_empty() {
+            if let Some(until) = candidates
+                .iter()
+                .filter_map(|&i| self.pool[i].cooldown_deadline())
+                .min()
+            {
+                let now = Instant::now();
+                if until > now {
+                    debug!(
+                        wait_ms = (until - now).as_millis(),
+                        "every key is cooling down"
+                    );
+                    tokio::time::sleep(until - now).await;
+                }
+            }
+            candidates
+        } else {
+            live
+        };
+
+        // Prefer keys that already hold a session: if one of those refills
+        // first, serving this request costs no extra login.
+        let mut ready = Vec::with_capacity(waiting.len());
+        for &i in &waiting {
+            if self.pool[i].auth.has_ready_session().await {
+                ready.push(i);
+            }
+        }
+        let waiting = if ready.is_empty() { waiting } else { ready };
+
+        let waits: Vec<_> = waiting
+            .iter()
+            .map(|&i| {
+                let slot = &self.pool[i];
+                Box::pin(async move {
+                    slot.rate_limiter.reserve(class).await;
+                    i
+                })
+            })
+            .collect();
+
+        let (winner, _, _) = futures::future::select_all(waits).await;
+
+        // The winner's token is already spent, so a login failure here does cost
+        // it. Establishing the session earlier is not possible: which key wins
+        // is only known once one refills.
+        self.pool[winner].auth.get_session().await?;
+        self.promote_primary_if_needed(winner);
+        Ok(Some(winner))
     }
 
     /// Gets WebSocket connection information for Lightstreamer, reusing the
@@ -251,7 +585,7 @@ impl HttpClient {
     /// # Errors
     /// Returns [`AppError`] when the session cannot be retrieved.
     pub async fn ws_info(&self) -> Result<WebsocketInfo, AppError> {
-        self.auth.ws_info().await
+        self.primary_auth().ws_info().await
     }
 
     /// Gets WebSocket connection information for Lightstreamer
@@ -365,24 +699,14 @@ impl HttpClient {
         version: Option<u8>,
         extra_headers: &[(&str, &str)],
     ) -> Result<T, AppError> {
-        match self
-            .request_internal(method.clone(), path, &body, version, extra_headers)
-            .await
-        {
-            Ok(response) => self.parse_response(response).await,
-            Err(AppError::OAuthTokenExpired) => {
-                warn!("OAuth token expired, forcing refresh and retrying once");
-                // Force a fresh login so the single replay below never resends
-                // the same server-invalidated token. This match arm is not a
-                // loop: the replay happens exactly once.
-                self.auth.force_refresh().await?;
-                let response = self
-                    .request_internal(method, path, &body, version, extra_headers)
-                    .await?;
-                self.parse_response(response).await
-            }
-            Err(e) => Err(e),
-        }
+        // The refresh-and-replay lives in `request_internal`, which knows which
+        // slot's session IG rejected. Refreshing here would always refresh slot
+        // 0, so an expired token on any other key of the pool would be replayed
+        // unchanged and fail again.
+        let response = self
+            .request_internal(method, path, &body, version, extra_headers)
+            .await?;
+        self.parse_response(response).await
     }
 
     /// Builds and sends a single HTTP request against the IG API.
@@ -410,17 +734,31 @@ impl HttpClient {
         };
 
         let class = classify_endpoint(&method, path);
+
+        // Only non-trading REST rotates. Order placement, amendment and closure
+        // stay on one key: they are metered against the account, not the key, so
+        // moving them buys nothing and would spread order traffic over sessions
+        // that a reconciliation has to tell apart afterwards.
+        let may_rotate = class == RateLimitClass::NonTrading && self.pool.len() > 1;
+
         let mut tried: Vec<usize> = Vec::with_capacity(self.pool.len());
+        // One replay after a forced refresh, never a loop of them.
+        let mut replayed = false;
 
         loop {
-            let idx = self.select_slot(class, &tried);
+            let Some(idx) = self.reserve_slot(class, &tried).await? else {
+                // Every key has been tried for this request. The last attempt's
+                // error was returned below, so reaching here means the pool ran
+                // out of candidates without one; report the key-level rejection.
+                return Err(AppError::ApiKeyAllowanceExceeded);
+            };
             tried.push(idx);
             let slot = &self.pool[idx];
 
-            // With more than one key left to try, a rejected request is cheaper
-            // to move to another key than to wait out this one's backoff, so the
-            // per-request retry budget is dropped and rotation handles it.
-            let rotate = tried.len() < self.pool.len();
+            // With another key left to try, a rejected request is cheaper to
+            // move than to wait out this one's backoff, so the per-request retry
+            // budget is dropped and rotation handles it.
+            let rotate = may_rotate && tried.len() < self.pool.len();
             let retry = if rotate {
                 RetryConfig {
                     max_retry_count: Some(0),
@@ -435,14 +773,35 @@ impl HttpClient {
                 .await;
 
             match result {
-                Err(AppError::RateLimitExceeded) if rotate => {
+                // Per-key allowance: this key is spent. Mark it either way, so a
+                // key IG has just refused is not handed the next request even
+                // when there is nowhere left to rotate for this one.
+                Err(AppError::ApiKeyAllowanceExceeded) => {
                     slot.mark_exhausted();
+                    if !rotate {
+                        return Err(AppError::ApiKeyAllowanceExceeded);
+                    }
                     warn!(
                         key = %redact_key(&slot.api_key),
-                        next_of = self.pool.len(),
+                        of = self.pool.len(),
                         "API key allowance exhausted, rotating to another key"
                     );
                 }
+                // The token IG rejected belongs to this slot's session, so the
+                // refresh has to happen on that slot - not on the client's own
+                // `auth`, which is slot 0 and may be a different key entirely.
+                Err(AppError::OAuthTokenExpired) if !replayed => {
+                    warn!(
+                        key = %redact_key(&slot.api_key),
+                        "OAuth token expired, refreshing this key's session and replaying once"
+                    );
+                    slot.auth.force_refresh().await?;
+                    replayed = true;
+                    tried.pop();
+                }
+                // Account and trading allowances belong to the account every key
+                // authenticates, and a bare 429 does not say which budget ran
+                // out. None of them justify burning another key.
                 other => return other,
             }
         }
@@ -450,6 +809,11 @@ impl HttpClient {
 
     /// Issues one request through a specific key slot: its session, its API key
     /// and its own rate-limiter budget.
+    ///
+    /// The caller has already reserved this slot's token, so the send does not
+    /// pace itself again. The session is resolved *before* that token is put on
+    /// the wire, so a failed login costs only the login request it made — never
+    /// an extra token for a data request that is never sent.
     #[allow(clippy::too_many_arguments)]
     async fn request_on_slot<B: Serialize>(
         &self,
@@ -486,14 +850,18 @@ impl HttpClient {
             headers.push(("X-SECURITY-TOKEN", token_val.as_str()));
         }
 
-        make_http_request(
+        make_http_request_paced(
             &self.http_client,
-            &slot.rate_limiter,
+            Pacing {
+                key: &slot.rate_limiter,
+                account: Some(&self.account_limiter),
+            },
             method.clone(),
             url,
             headers,
             body,
             retry,
+            true,
         )
         .await
     }
@@ -536,13 +904,37 @@ impl HttpClient {
         })
     }
 
-    /// Switches to a different trading account
+    /// Switches to a different trading account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::InvalidInput`] when the client was built with more
+    /// than one API key, and whatever [`Auth::switch_account`] reports
+    /// otherwise.
+    ///
+    /// Switching is refused with a pool because it cannot be done coherently
+    /// here: each key holds its own session, so switching only the primary
+    /// leaves the other slots authenticated against the previous account and a
+    /// non-trading read could rotate onto one of them and answer for the wrong
+    /// account. Switching all of them instead would spend one request per key —
+    /// 74 of them in this codebase's demo setup — against the very allowance the
+    /// pool exists to protect. The account also keys the shared account-wide
+    /// budget, which would have to move with it. Build a client per account
+    /// instead.
     pub async fn switch_account(
         &self,
         account_id: &str,
         default_account: Option<bool>,
     ) -> Result<(), AppError> {
-        self.auth
+        if self.pool.len() > 1 {
+            return Err(AppError::InvalidInput(
+                "switch_account cannot be applied coherently to a multi-key pool: \
+                 each key holds its own session and the account keys the shared \
+                 account-wide budget; build one client per account"
+                    .to_string(),
+            ));
+        }
+        self.primary_auth()
             .switch_account(account_id, default_account)
             .await?;
         Ok(())
@@ -550,17 +942,60 @@ impl HttpClient {
 
     /// Gets the current session
     pub async fn get_session(&self) -> Result<Session, AppError> {
-        self.auth.get_session().await
+        self.primary_auth().get_session().await
     }
 
     /// Logs out
     pub async fn logout(&self) -> Result<(), AppError> {
-        self.auth.logout().await
+        self.primary_auth().logout().await
     }
 
     /// Gets Auth reference
+    ///
+    /// This is the primary slot's `Auth`, which moves with the primary: the
+    /// session this exposes is always one that authenticated.
     pub fn auth(&self) -> &Auth {
-        &self.auth
+        self.primary_auth()
+    }
+
+    /// The `Auth` of the slot currently acting as primary.
+    fn primary_auth(&self) -> &Arc<Auth> {
+        let index = self.primary_index();
+        self.pool.get(index).map_or(&self.auth, |slot| &slot.auth)
+    }
+
+    /// The primary slot's index, clamped to the pool.
+    fn primary_index(&self) -> usize {
+        self.primary
+            .load(Ordering::Relaxed)
+            .min(self.pool.len().saturating_sub(1))
+    }
+
+    /// Moves the primary onto `index` when the current one cannot serve.
+    ///
+    /// The lazy constructors cannot know which key will authenticate — the
+    /// first login happens when a request arrives — so the primary is settled
+    /// then: the first slot that proves usable takes over if the incumbent is
+    /// parked. Without this, `ws_info`, streaming and trading would keep
+    /// pointing at a key that failed to log in.
+    fn promote_primary_if_needed(&self, index: usize) {
+        let current = self.primary_index();
+        if current == index {
+            return;
+        }
+        let incumbent_usable = self
+            .pool
+            .get(current)
+            .is_some_and(|slot| !slot.in_cooldown());
+        if !incumbent_usable {
+            self.primary.store(index, Ordering::Relaxed);
+            if let Some(slot) = self.pool.get(index) {
+                debug!(
+                    key = %redact_key(&slot.api_key),
+                    "primary key moved to a key that can authenticate"
+                );
+            }
+        }
     }
 
     /// Returns the configuration this HTTP client was built with.
@@ -646,6 +1081,99 @@ pub async fn make_http_request<B: Serialize>(
     body: &Option<B>,
     retry_config: RetryConfig,
 ) -> Result<Response, AppError> {
+    make_http_request_paced(
+        client,
+        Pacing::key_only(rate_limiter),
+        method,
+        url,
+        headers,
+        body,
+        retry_config,
+        false,
+    )
+    .await
+}
+
+/// Same as [`make_http_request`], but paced against a key budget *and* the
+/// account budget its keys share.
+///
+/// # Errors
+/// Same as [`make_http_request`].
+#[allow(clippy::too_many_arguments)]
+pub async fn make_http_request_with_account<B: Serialize>(
+    client: &Client,
+    pacing: Pacing<'_>,
+    method: Method,
+    url: &str,
+    headers: Vec<(&str, &str)>,
+    body: &Option<B>,
+    retry_config: RetryConfig,
+) -> Result<Response, AppError> {
+    make_http_request_paced(
+        client,
+        pacing,
+        method,
+        url,
+        headers,
+        body,
+        retry_config,
+        false,
+    )
+    .await
+}
+
+/// Same as [`make_http_request`], but told whether the first send already owns
+/// a token.
+///
+/// `reserved = true` means the caller took a cell from `rate_limiter` for this
+/// request and the first attempt must not take another. Retries always pace
+/// themselves: each one is a fresh request as far as IG is concerned.
+#[allow(clippy::too_many_arguments)]
+pub async fn make_http_request_reserved<B: Serialize>(
+    client: &Client,
+    rate_limiter: &RateLimiter,
+    method: Method,
+    url: &str,
+    headers: Vec<(&str, &str)>,
+    body: &Option<B>,
+    retry_config: RetryConfig,
+    reserved: bool,
+) -> Result<Response, AppError> {
+    make_http_request_paced(
+        client,
+        Pacing::key_only(rate_limiter),
+        method,
+        url,
+        headers,
+        body,
+        retry_config,
+        reserved,
+    )
+    .await
+}
+
+/// The one place a request is actually sent, and so the one place both budgets
+/// are charged.
+///
+/// `reserved = true` means the caller already holds this key's token for the
+/// first send. The account budget is never pre-reserved: it is taken here,
+/// immediately before each send, so logins, refreshes and every retry pay it
+/// too.
+///
+/// # Errors
+/// Same as [`make_http_request`].
+#[allow(clippy::too_many_arguments)]
+pub async fn make_http_request_paced<B: Serialize>(
+    client: &Client,
+    pacing: Pacing<'_>,
+    method: Method,
+    url: &str,
+    headers: Vec<(&str, &str)>,
+    body: &Option<B>,
+    retry_config: RetryConfig,
+    reserved: bool,
+) -> Result<Response, AppError> {
+    let rate_limiter = pacing.key;
     let max_retries = retry_config.max_retries();
 
     // Pace this request against the bucket for its endpoint class (trading /
@@ -656,11 +1184,19 @@ pub async fn make_http_request<B: Serialize>(
     // Bounded loop: `attempt` ranges over [0, max_retries]. Attempt 0 is the
     // first try; each further attempt is a retry. This can never loop forever.
     for attempt in 0..=max_retries {
-        // Pace this request against its class bucket before sending. The limiter
-        // is shared by reference; each governor bucket is internally `Arc`-backed
-        // and parks the future until a slot is free, so there is no lock guard
-        // held across this await.
-        rate_limiter.wait_for(class).await;
+        // Pace this request against its class bucket before sending, unless the
+        // caller already reserved the token for this first send. Reserving and
+        // then waiting again would spend two cells on one request and halve the
+        // effective rate. Every retry is a *new* request to IG and pays its own
+        // token; the limiter is shared by reference and each governor bucket is
+        // internally `Arc`-backed, so no lock guard is held across this await.
+        if attempt > 0 || !reserved {
+            rate_limiter.wait_for(class).await;
+        }
+
+        // Last gate before the wire: the account budget is charged per physical
+        // request, so a retry costs another token just as a first send does.
+        pacing.charge_account(class).await;
 
         debug!(%method, %url, class = ?class, "http request");
 
@@ -702,12 +1238,26 @@ pub async fn make_http_request<B: Serialize>(
                     });
                 }
 
-                if body_text.contains("exceeded-api-key-allowance")
-                    || body_text.contains("exceeded-account-allowance")
-                    || body_text.contains("exceeded-account-trading-allowance")
-                {
-                    warn!(status = ?status, "allowance rate limit hit");
-                    AppError::RateLimitExceeded
+                // Which allowance ran out decides what the caller may do about
+                // it, so each one gets its own error instead of collapsing into
+                // a single "rate limited".
+                if body_text.contains("exceeded-api-key-allowance") {
+                    // Fail fast rather than spending ~76 s of backoff on a key
+                    // that has just said it is empty. With a pool the caller
+                    // rotates immediately - including on `/session`, where the
+                    // backoff used to be paid before any rotation could happen -
+                    // and with a single key the caller learns sooner.
+                    warn!("api key allowance exceeded");
+                    return Err(AppError::ApiKeyAllowanceExceeded);
+                } else if body_text.contains("exceeded-account-trading-allowance") {
+                    warn!("account trading allowance exceeded");
+                    return Err(AppError::TradingAllowanceExceeded);
+                } else if body_text.contains("exceeded-account-allowance") {
+                    // Every key of a pool authenticates this same account, so
+                    // retrying here only spends more of an allowance that is
+                    // already gone. Fail fast and let the caller back off.
+                    warn!("account allowance exceeded");
+                    return Err(AppError::AccountAllowanceExceeded);
                 } else {
                     error!(status = ?status, "forbidden");
                     return Err(AppError::Unexpected(status));
@@ -729,6 +1279,9 @@ pub async fn make_http_request<B: Serialize>(
                     // connection closed and amplifies load during retry storms.
                     let _ = response.bytes().await;
                     if other == StatusCode::TOO_MANY_REQUESTS {
+                        // No body to say which budget ran out, so this stays
+                        // generic: reading it as a per-key rejection would burn
+                        // keys for an account-wide limit.
                         warn!(status = ?other, "rate limit (429) hit");
                         AppError::RateLimitExceeded
                     } else {
@@ -1112,7 +1665,10 @@ mod tests {
         let key = "6cb0ae4d738dcf918fa47157858fc0ea11290a5b";
         let shown = redact_key(key);
         assert_eq!(shown, "6cb0ae4d…");
-        assert!(!shown.contains("738dcf91"), "the key body must never be logged");
+        assert!(
+            !shown.contains("738dcf91"),
+            "the key body must never be logged"
+        );
     }
 
     #[test]
@@ -1146,6 +1702,9 @@ mod tests {
 
         // Simulate the cooldown having elapsed.
         *s.cooldown_until.lock().expect("lock") = Some(Instant::now() - Duration::from_secs(1));
-        assert!(!s.in_cooldown(), "the key returns to the pool once it refills");
+        assert!(
+            !s.in_cooldown(),
+            "the key returns to the pool once it refills"
+        );
     }
 }

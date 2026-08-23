@@ -127,15 +127,61 @@ list and the client spreads requests across them:
 IG_API_KEY=key1,key2,key3
 ```
 
-Each key gets its own session and its own rate-limiter budget, and every request
-is served by the key with spare capacity. If IG still rejects one for exceeding
-its allowance, that key is parked for a minute and the request is retried
-immediately on another instead of waiting out a backoff.
+Each key gets its own session and its own rate-limiter budget — one limiter
+shared by that key's login and its data requests, because IG counts both against
+the same allowance.
 
-A single key (no comma) behaves exactly as before.
+Spreading is **proactive**: a request goes to a key that can serve it right now,
+picked round-robin among the equally available ones, and the token is reserved
+at selection and carried through to the send, so one request costs exactly one
+token. When no key has a token, the client waits on all of them at once and
+takes whichever refills first rather than queueing on an arbitrary one.
 
-Note that the trading allowance is metered per *account*, not per key, so the
-pool raises throughput for market data — not for order placement.
+Being rejected is the safety net, not the mechanism. The allowance errors are
+distinct because they call for different responses:
+
+| Error | Meaning | Response |
+|---|---|---|
+| `ApiKeyAllowanceExceeded` | this key's budget | park the key for a minute, retry on another immediately |
+| `AccountAllowanceExceeded` | the account's budget | every key shares it, so rotating cannot help |
+| `TradingAllowanceExceeded` | the account's trading budget | never rotates |
+| `HistoricalDataAllowanceExceeded` | weekly data-point quota | never rotates |
+| `RateLimitExceeded` | a bare 429 with no allowance body | not read as a per-key rejection |
+
+Rotation is enabled for non-trading REST only. Creating, amending and closing
+orders stay pinned to the primary slot — the key whose session the client
+exposes — so consecutive orders travel on one key and one session: that traffic is metered against the account, so moving it buys nothing
+and would scatter order history across sessions.
+
+On top of the per-key budgets the pool paces against an account-wide one, fixed
+at IG's documented 30 requests per 60 seconds. It is charged **per physical
+request**, immediately before each send: logins, token refreshes and every
+retry pay it, not just the data calls.
+
+Non-trading and historical traffic share that one bucket, because IG's
+per-account non-trading allowance is a single budget — giving each class its own
+would let market data and `/prices` each run to 30/min. Trading does not charge
+it: IG meters orders against a separate trading allowance.
+
+The bucket is shared **per process and per account**, so several `HttpClient`s
+in one service built for the same account share it. It does **not** coordinate
+across processes: two services authenticating the same IG account hold two
+buckets and together exceed the ceiling. Enforcing it there needs a distributed
+limiter, or an account per service.
+
+### Upgrading from 0.15
+
+A single key (no comma) keeps the same routing — one key, one session — but two
+behaviours changed for every configuration:
+
+- An `exceeded-api-key-allowance` 403 now **fails fast** instead of being retried
+  three times with backoff. Waiting ~76 s on a key that has just said it is empty
+  helps nobody; with a pool the caller rotates instead, and with one key it learns
+  sooner. Callers that relied on the retry need to handle
+  `AppError::ApiKeyAllowanceExceeded` themselves.
+- The account-wide bucket applies even to a single key, at 30 requests per 60
+  seconds with a burst of 1. A client configured for a faster per-key rate is now
+  capped by it.
 
 `Config::new()` reads configuration from the environment (and a local `.env`
 file, if present). Create a `.env` file in your project root with the

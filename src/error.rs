@@ -142,8 +142,31 @@ pub enum AppError {
     #[error("not found")]
     NotFound,
     /// API rate limit exceeded
+    ///
+    /// Kept for a 429 with no allowance body: the status alone does not say
+    /// which budget ran out, so it must not be read as a per-key rejection.
     #[error("rate limit exceeded")]
     RateLimitExceeded,
+    /// This API key's non-trading allowance is exhausted
+    /// (`error.public-api.exceeded-api-key-allowance`).
+    ///
+    /// IG meters that allowance per key, so another key of the pool can serve
+    /// the request immediately. This is the only allowance error that rotates.
+    #[error("api key allowance exceeded")]
+    ApiKeyAllowanceExceeded,
+    /// The account's non-trading allowance is exhausted
+    /// (`error.public-api.exceeded-account-allowance`).
+    ///
+    /// Every key of the pool authenticates the same account, so rotating cannot
+    /// help: the whole pool has to wait.
+    #[error("account allowance exceeded")]
+    AccountAllowanceExceeded,
+    /// The account's trading allowance is exhausted
+    /// (`error.public-api.exceeded-account-trading-allowance`).
+    ///
+    /// Trading traffic stays pinned to one key, so this never rotates.
+    #[error("account trading allowance exceeded")]
+    TradingAllowanceExceeded,
     /// Historical data allowance exhausted (weekly quota of data points)
     ///
     /// The `allowance_expiry` field indicates the number of seconds

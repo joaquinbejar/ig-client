@@ -256,6 +256,31 @@ impl RateLimiter {
         self.limiter_for(class).check().is_ok()
     }
 
+    /// Takes one token of `class` if the bucket has one right now.
+    ///
+    /// This is the reservation half of pacing: a `true` return means a cell has
+    /// already been consumed and the caller owes the network exactly one
+    /// request. It must therefore not call [`wait_for`](Self::wait_for) again
+    /// for that same request, or the request costs two tokens and the effective
+    /// rate halves.
+    ///
+    /// # Returns
+    ///
+    /// * `true` — a token was taken; send now.
+    /// * `false` — the bucket is empty; nothing was consumed.
+    #[must_use]
+    pub fn try_reserve(&self, class: RateLimitClass) -> bool {
+        self.limiter_for(class).check().is_ok()
+    }
+
+    /// Waits until this bucket can serve `class`, then takes the token.
+    ///
+    /// Same reservation contract as [`try_reserve`](Self::try_reserve): on
+    /// return, one cell is spent and the caller owes exactly one request.
+    pub async fn reserve(&self, class: RateLimitClass) {
+        self.limiter_for(class).until_ready().await;
+    }
+
     /// Waits until a non-trading request can be made according to the rate limit
     ///
     /// Convenience wrapper over [`wait_for`](Self::wait_for) with

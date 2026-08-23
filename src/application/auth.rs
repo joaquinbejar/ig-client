@@ -13,7 +13,7 @@
 //! - Automatic re-authentication when tokens expire
 
 use crate::application::config::Config;
-use crate::application::http::make_http_request;
+use crate::application::http::{Pacing, make_http_request_with_account};
 use crate::application::rate_limiter::RateLimiter;
 use crate::constants::USER_AGENT;
 use crate::error::{AppError, AuthError};
@@ -138,6 +138,9 @@ pub struct Auth {
     // `Arc`, so it is shared directly without an outer `RwLock`: the limiter is
     // configured once at construction and never write-swapped.
     rate_limiter: RateLimiter,
+    /// Budget shared with every other key of the account, charged on each
+    /// `/session` call just as it is on data requests: IG counts a login too.
+    account_limiter: Option<RateLimiter>,
 }
 
 impl Auth {
@@ -155,15 +158,52 @@ impl Auth {
     /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
     /// be built (e.g. the system TLS backend fails to initialize).
     pub fn try_new(config: Arc<Config>) -> Result<Self, AppError> {
-        let client = Client::builder().user_agent(USER_AGENT).build()?;
-
         let rate_limiter = RateLimiter::new(&config.rate_limiter);
+        Self::with_rate_limiter(config, rate_limiter)
+    }
+
+    /// Builds an `Auth` paced against both this key's limiter and the
+    /// account-wide one.
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the HTTP client cannot be built.
+    pub fn with_limiters(
+        config: Arc<Config>,
+        rate_limiter: RateLimiter,
+        account_limiter: RateLimiter,
+    ) -> Result<Self, AppError> {
+        let mut auth = Self::with_rate_limiter(config, rate_limiter)?;
+        auth.account_limiter = Some(account_limiter);
+        Ok(auth)
+    }
+
+    /// Builds an `Auth` that paces against a caller-supplied limiter.
+    ///
+    /// IG meters its allowance per API key, and a login is one of the requests
+    /// it counts. When a key's session and its data requests pace against
+    /// separate limiters, the key's real budget is the sum of the two and IG
+    /// rejects requests the client believed were within budget. Sharing one
+    /// limiter per key is what makes the local pacing match the remote one.
+    ///
+    /// # Arguments
+    /// * `config` - Configuration containing credentials and API settings
+    /// * `rate_limiter` - The limiter owned by this key
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
+    /// be built (e.g. the system TLS backend fails to initialize).
+    pub fn with_rate_limiter(
+        config: Arc<Config>,
+        rate_limiter: RateLimiter,
+    ) -> Result<Self, AppError> {
+        let client = Client::builder().user_agent(USER_AGENT).build()?;
 
         Ok(Self {
             config,
             client,
             session: Arc::new(RwLock::new(None)),
             rate_limiter,
+            account_limiter: None,
         })
     }
 
@@ -199,6 +239,28 @@ impl Auth {
         self.ws_info().await.unwrap_or_default()
     }
 
+    /// The budgets a `/session` request must pass: this key's, then the
+    /// account's.
+    fn pacing(&self) -> Pacing<'_> {
+        Pacing {
+            key: &self.rate_limiter,
+            account: self.account_limiter.as_ref(),
+        }
+    }
+
+    /// Whether a session is cached and not within its refresh margin.
+    ///
+    /// Lets a caller tell "this key can send right now" from "this key would
+    /// have to log in first" without triggering the login. The key pool needs
+    /// that distinction: probing every key with `get_session` would
+    /// authenticate the whole pool to serve one request.
+    pub async fn has_ready_session(&self) -> bool {
+        let session = self.session.read().await;
+        session.as_ref().is_some_and(|sess| {
+            !sess.needs_token_refresh(Some(proactive_refresh_margin_secs(sess)))
+        })
+    }
+
     /// Gets the current session, ensuring tokens are valid
     ///
     /// This method automatically refreshes expired OAuth tokens or re-authenticates if needed.
@@ -206,6 +268,9 @@ impl Auth {
     /// # Returns
     /// * `Ok(Session)` - Valid session with fresh tokens
     /// * `Err(AppError)` - If authentication fails
+    ///
+    /// # Errors
+    /// Returns [`AppError`] when login or token refresh fails.
     pub async fn get_session(&self) -> Result<Session, AppError> {
         let session = self.session.read().await;
 
@@ -298,9 +363,9 @@ impl Auth {
             ("Version", "2"),
         ];
 
-        let response = make_http_request(
+        let response = make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::POST,
             &url,
             headers,
@@ -391,9 +456,9 @@ impl Auth {
             ("Version", "3"),
         ];
 
-        let response = make_http_request(
+        let response = make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::POST,
             &url,
             headers,
@@ -472,7 +537,7 @@ impl Auth {
     ///
     /// It cannot loop back through the 401 handler: [`login`](Self::login) issues
     /// its HTTP requests through
-    /// [`make_http_request`] directly, not
+    /// [`make_http_request_with_account`] directly, not
     /// through the [`HttpClient`](crate::application::http::HttpClient) refresh-and-replay
     /// path, so a 401 encountered *during* login surfaces as a typed error rather
     /// than recursing into `force_refresh`.
@@ -550,9 +615,9 @@ impl Auth {
             headers.push(("X-SECURITY-TOKEN", x_security_token.as_str()));
         }
 
-        let response = make_http_request(
+        let response = make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::PUT,
             &url,
             headers,
@@ -694,9 +759,9 @@ impl Auth {
             }
         }
 
-        match make_http_request(
+        match make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::DELETE,
             &url,
             headers,

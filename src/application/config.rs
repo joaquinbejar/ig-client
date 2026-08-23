@@ -658,13 +658,19 @@ mod redaction_tests {
     #[test]
     fn test_api_keys_comma_separated_list_yields_pool() {
         let c = Credentials::new("u".into(), "p".into(), "ACC".into(), "a,b,c".into());
-        assert_eq!(c.api_keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            c.api_keys(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
     fn test_api_keys_trims_whitespace_and_drops_empty_entries() {
         let c = Credentials::new("u".into(), "p".into(), "ACC".into(), " a , b , ,c, ".into());
-        assert_eq!(c.api_keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            c.api_keys(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
