@@ -127,15 +127,32 @@ list and the client spreads requests across them:
 IG_API_KEY=key1,key2,key3
 ```
 
-Each key gets its own session and its own rate-limiter budget, and every request
-is served by the key with spare capacity. If IG still rejects one for exceeding
-its allowance, that key is parked for a minute and the request is retried
-immediately on another instead of waiting out a backoff.
+Each key gets its own session and its own rate-limiter budget — one limiter
+shared by that key's login and its data requests, because IG counts both against
+the same allowance.
+
+Spreading is **proactive**: a request goes to a key that can serve it right now,
+picked round-robin among the equally available ones, and the token is reserved
+at selection and carried through to the send, so one request costs exactly one
+token. When no key has a token, the client waits on all of them at once and
+takes whichever refills first rather than queueing on an arbitrary one.
+
+Being rejected is the safety net, not the mechanism. The allowance errors are
+distinct because they call for different responses:
+
+| Error | Meaning | Response |
+|---|---|---|
+| `ApiKeyAllowanceExceeded` | this key's budget | park the key for a minute, retry on another immediately |
+| `AccountAllowanceExceeded` | the account's budget | every key shares it, so rotating cannot help |
+| `TradingAllowanceExceeded` | the account's trading budget | never rotates |
+| `HistoricalDataAllowanceExceeded` | weekly data-point quota | never rotates |
+| `RateLimitExceeded` | a bare 429 with no allowance body | not read as a per-key rejection |
+
+Rotation is enabled for non-trading REST only. Creating, amending and closing
+orders stay pinned to one key: that traffic is metered against the account, so
+moving it buys nothing and would scatter order history across sessions.
 
 A single key (no comma) behaves exactly as before.
-
-Note that the trading allowance is metered per *account*, not per key, so the
-pool raises throughput for market data — not for order placement.
 
 `Config::new()` reads configuration from the environment (and a local `.env`
 file, if present). Create a `.env` file in your project root with the

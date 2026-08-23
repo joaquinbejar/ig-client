@@ -148,8 +148,10 @@ async fn test_make_http_request_403_historical_allowance_fails_fast() {
 #[tokio::test]
 async fn test_make_http_request_403_api_key_allowance_is_rate_limited_and_retried() {
     let server = MockServer::start().await;
-    // An API-key allowance breach is a rate limit: it maps to RateLimitExceeded
-    // and IS retried, so all RETRIES + 1 attempts are made before giving up.
+    // An API-key allowance breach maps to its own error, distinct from a bare
+    // 429: it is the one allowance a key pool can route around, so the caller
+    // has to be able to tell it apart. It IS retried, so all RETRIES + 1
+    // attempts are made before giving up.
     mount_get(
         &server,
         ResponseTemplate::new(403).set_body_raw(
@@ -161,8 +163,8 @@ async fn test_make_http_request_403_api_key_allowance_is_rate_limited_and_retrie
     .await;
 
     match get_test_endpoint(&server, fast_retry()).await {
-        Err(AppError::RateLimitExceeded) => {}
-        other => panic!("expected RateLimitExceeded, got {other:?}"),
+        Err(AppError::ApiKeyAllowanceExceeded) => {}
+        other => panic!("expected ApiKeyAllowanceExceeded, got {other:?}"),
     }
 }
 

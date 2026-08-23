@@ -1,0 +1,490 @@
+//! Acceptance tests for the API key pool.
+//!
+//! The pool exists because IG meters its non-trading allowance per API key. The
+//! properties asserted here are the ones that make that worth having: work is
+//! spread *before* a key is rejected, one sent request costs exactly one token,
+//! and the errors that do not belong to a key never burn another one.
+//!
+//! Driven against a `wiremock::MockServer`, which records the `X-IG-API-KEY` of
+//! every request and so shows which key served what.
+
+use ig_client::application::config::{
+    Config, Credentials, DatabaseConfig, RateLimiterConfig, RestApiConfig, WebSocketConfig,
+};
+use ig_client::application::http::HttpClient;
+use ig_client::application::rate_limiter::{RateLimitClass, RateLimiter};
+use ig_client::error::AppError;
+use ig_client::model::retry::RetryConfig;
+use serde::Deserialize;
+use std::time::{Duration, Instant};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Minimal DTO for the mock endpoint; the tests care about the traffic, not the
+/// payload.
+#[derive(Debug, Deserialize)]
+struct Dummy {
+    #[allow(dead_code)]
+    ok: bool,
+}
+
+/// Builds a config whose `api_key` is the comma-separated pool under test.
+///
+/// Budgets here count the login too: a key's session and its data requests
+/// share one limiter, because IG meters both against the same per-key
+/// allowance. So "one data request" on a fresh key costs two tokens — one for
+/// `/session`, one for the data — and the tests size `max_requests`
+/// accordingly.
+fn pool_config(base_url: &str, keys: &str, max_requests: u32, period_seconds: u64) -> Config {
+    pool_config_burst(base_url, keys, max_requests, period_seconds, max_requests)
+}
+
+/// Same as [`pool_config`] with an explicit burst size.
+///
+/// The burst is the bucket's capacity, so it decides how many tokens can be
+/// held at once: with a burst of 1 a key can never have a login and a data
+/// request ready together, no matter how large the per-period budget is.
+fn pool_config_burst(
+    base_url: &str,
+    keys: &str,
+    max_requests: u32,
+    period_seconds: u64,
+    burst_size: u32,
+) -> Config {
+    Config {
+        credentials: Credentials {
+            username: "fake-user".to_string(),
+            password: "fake-pass".to_string(),
+            account_id: "ABC12".to_string(),
+            api_key: keys.to_string(),
+            client_token: None,
+            account_token: None,
+        },
+        rest_api: RestApiConfig {
+            base_url: base_url.to_string(),
+            timeout: 30,
+        },
+        websocket: WebSocketConfig {
+            url: "wss://example.invalid".to_string(),
+            reconnect_interval: 5,
+        },
+        database: DatabaseConfig {
+            url: "postgres://localhost/none".to_string(),
+            max_connections: 1,
+        },
+        rate_limiter: RateLimiterConfig {
+            max_requests,
+            period_seconds,
+            burst_size,
+        },
+        sleep_hours: 1,
+        page_size: 20,
+        days_to_look_back: 7,
+        api_version: Some(3),
+    }
+}
+
+/// Mounts a `/session` endpoint that always authenticates.
+async fn mount_login_ok(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "clientId": "FAKE-CLIENT-1",
+            "accountId": "ABC12",
+            "timezoneOffset": 1,
+            "lightstreamerEndpoint": "https://example.invalid",
+            "oauthToken": {
+                "access_token": "FAKE-ACCESS",
+                "refresh_token": "FAKE-REFRESH",
+                "scope": "profile",
+                "token_type": "Bearer",
+                "expires_in": "600"
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Mounts the data endpoint used by every test, always succeeding.
+async fn mount_data_ok(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(server)
+        .await;
+}
+
+/// The `X-IG-API-KEY` of every `/data` request the server received, in order.
+async fn keys_used(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/data")
+        .map(|r| {
+            r.headers
+                .get("X-IG-API-KEY")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Two keys with one token each: both requests go out at once, on different
+/// keys. A pool that waited for the first key instead of moving to the second
+/// would serialise them.
+#[tokio::test]
+async fn test_pool_two_keys_first_two_requests_use_distinct_keys_immediately() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    // Capacity for exactly a login plus one data request per key, so a second
+    // data request on the same key would have to wait for a refill.
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 2, 60, 2))
+        .expect("client builds");
+
+    let started = Instant::now();
+    client.get::<Dummy>("/data", Some(1)).await.expect("first");
+    client.get::<Dummy>("/data", Some(1)).await.expect("second");
+    let elapsed = started.elapsed();
+
+    let used = keys_used(&server).await;
+    assert_eq!(used.len(), 2, "both requests were sent");
+    assert_ne!(used[0], used[1], "the two requests used different keys");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "neither request waited on a refill, took {elapsed:?}"
+    );
+}
+
+/// The third request has no token anywhere, so it must wait for a refill. With
+/// a 60 s period and one token per key, it cannot complete quickly.
+#[tokio::test]
+async fn test_pool_third_request_waits_for_the_first_refill() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    // Login plus exactly one data request per key; nothing left for a third.
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 2, 60, 2))
+        .expect("client builds");
+
+    client.get::<Dummy>("/data", Some(1)).await.expect("first");
+    client.get::<Dummy>("/data", Some(1)).await.expect("second");
+
+    // Both buckets are empty now; the third must block rather than be sent.
+    let third = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.get::<Dummy>("/data", Some(1)),
+    )
+    .await;
+
+    assert!(third.is_err(), "the third request waited for a refill");
+    assert_eq!(
+        keys_used(&server).await.len(),
+        2,
+        "no third request reached the server while waiting"
+    );
+}
+
+/// One sent request costs exactly one token.
+///
+/// This is the reserve-then-wait bug made visible: selection took a cell with
+/// `check()` and the send took another with `until_ready()`, so every request
+/// cost two and the effective rate was half the configured one. Counted
+/// directly on the bucket rather than by timing, so the assertion is exact.
+#[tokio::test]
+async fn test_send_with_reservation_consumes_exactly_one_token() {
+    let server = MockServer::start().await;
+    mount_data_ok(&server).await;
+
+    // Three tokens available at once, none refilling during the test.
+    let limiter = RateLimiter::new(&RateLimiterConfig {
+        max_requests: 3,
+        period_seconds: 600,
+        burst_size: 3,
+    });
+
+    // Reserve as the pool does, then send saying the token is already held.
+    assert!(limiter.try_reserve(RateLimitClass::NonTrading), "token 1");
+    let response = ig_client::application::http::make_http_request_reserved(
+        &reqwest::Client::new(),
+        &limiter,
+        reqwest::Method::GET,
+        &format!("{}/data", server.uri()),
+        vec![],
+        &None::<()>,
+        RetryConfig {
+            max_retry_count: Some(0),
+            retry_delay_secs: Some(0),
+        },
+        true,
+    )
+    .await;
+    assert!(response.is_ok(), "the request was sent");
+
+    // Two of the three tokens must remain: the send spent none of its own.
+    assert!(
+        limiter.try_reserve(RateLimitClass::NonTrading),
+        "second token still available"
+    );
+    assert!(
+        limiter.try_reserve(RateLimitClass::NonTrading),
+        "third token still available - the send did not take a second one"
+    );
+    assert!(
+        !limiter.try_reserve(RateLimitClass::NonTrading),
+        "and the budget is now genuinely spent"
+    );
+}
+
+/// A failed login must cost only the login request. If the data token were
+/// reserved first, it would be spent on a request that is never sent.
+#[tokio::test]
+async fn test_pool_failed_login_does_not_consume_a_data_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "errorCode": "error.security.invalid-details"
+        })))
+        .mount(&server)
+        .await;
+    mount_data_ok(&server).await;
+
+    // Capacity for the failed login, the retried login and one data request. If
+    // the failed attempt also took a data token, the budget would not cover the
+    // request that follows it.
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a", 3, 60, 3))
+        .expect("client builds");
+
+    let failed = client.get::<Dummy>("/data", Some(1)).await;
+    assert!(failed.is_err(), "the request fails because login fails");
+    assert!(
+        keys_used(&server).await.is_empty(),
+        "no data request was sent"
+    );
+
+    // The token survived the failed login, so a working login can spend it now
+    // without waiting for a refill.
+    server.reset().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let started = Instant::now();
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get::<Dummy>("/data", Some(1)),
+    )
+    .await;
+    assert!(
+        second.is_ok(),
+        "the data token was not spent by the failed login, waited {:?}",
+        started.elapsed()
+    );
+}
+
+/// Concurrent requests spread over the pool instead of stacking on the first
+/// key. Without the round-robin cursor every caller starts its scan at index 0.
+#[tokio::test]
+async fn test_pool_concurrent_requests_spread_across_keys() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let client = std::sync::Arc::new(
+        HttpClient::new_lazy(pool_config_burst(
+            &server.uri(),
+            "key-a,key-b,key-c,key-d",
+            2,
+            60,
+            2,
+        ))
+        .expect("client builds"),
+    );
+
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            client
+                .get::<Dummy>("/data", Some(1))
+                .await
+                .map(|_: Dummy| ())
+        }));
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    let mut used = keys_used(&server).await;
+    used.sort();
+    used.dedup();
+    assert_eq!(
+        used.len(),
+        4,
+        "four concurrent requests used four distinct keys, got {used:?}"
+    );
+}
+
+/// When every key is empty the pool waits on all of them and takes whichever
+/// refills first, rather than parking on an arbitrary one. Key B refills in 1 s
+/// while key A would need 60 s, so the wait must be the short one.
+#[tokio::test]
+async fn test_rate_limiter_waits_for_the_key_that_refills_first() {
+    let slow = RateLimiter::new(&RateLimiterConfig {
+        max_requests: 1,
+        period_seconds: 60,
+        burst_size: 1,
+    });
+    let fast = RateLimiter::new(&RateLimiterConfig {
+        max_requests: 1,
+        period_seconds: 1,
+        burst_size: 1,
+    });
+
+    // Drain both buckets.
+    assert!(slow.try_reserve(RateLimitClass::NonTrading));
+    assert!(fast.try_reserve(RateLimitClass::NonTrading));
+
+    let started = Instant::now();
+    let waits: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = vec![
+        Box::pin(async move { slow.reserve(RateLimitClass::NonTrading).await }),
+        Box::pin(async move { fast.reserve(RateLimitClass::NonTrading).await }),
+    ];
+    let (_, _, _) = futures::future::select_all(waits).await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the wait ended on the fast bucket, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A per-key allowance rejection moves to another key straight away, and the
+/// request succeeds there.
+#[tokio::test]
+async fn test_pool_api_key_allowance_rotates_immediately() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+
+    // First data call is rejected for the key's allowance; the retry on the
+    // other key succeeds.
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "errorCode": "error.public-api.exceeded-api-key-allowance"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_data_ok(&server).await;
+
+    let client = HttpClient::new_lazy(pool_config(&server.uri(), "key-a,key-b", 5, 1))
+        .expect("client builds");
+
+    let result = client.get::<Dummy>("/data", Some(1)).await;
+    assert!(result.is_ok(), "the request succeeded on another key");
+
+    let used = keys_used(&server).await;
+    assert_eq!(used.len(), 2, "one rejection plus one success");
+    assert_ne!(used[0], used[1], "the retry went to a different key");
+}
+
+/// The account-wide allowance belongs to the account every key authenticates,
+/// so it must surface as its own error without spending a second key.
+#[tokio::test]
+async fn test_pool_account_allowance_does_not_rotate() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "errorCode": "error.public-api.exceeded-account-allowance"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::new_lazy(pool_config(&server.uri(), "key-a,key-b", 5, 1))
+        .expect("client builds");
+
+    let err = client
+        .get::<Dummy>("/data", Some(1))
+        .await
+        .expect_err("account allowance is an error");
+    assert!(
+        matches!(err, AppError::AccountAllowanceExceeded),
+        "got {err:?}"
+    );
+
+    let used = keys_used(&server).await;
+    assert!(
+        used.iter().collect::<std::collections::HashSet<_>>().len() <= 1,
+        "the account allowance did not burn a second key, used {used:?}"
+    );
+}
+
+/// Trading traffic stays pinned to one key: the trading allowance is metered
+/// against the account, so rotating buys nothing and would scatter order
+/// traffic over sessions.
+#[tokio::test]
+async fn test_pool_trading_allowance_does_not_rotate() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/positions/otc"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "errorCode": "error.public-api.exceeded-account-trading-allowance"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::new_lazy(pool_config(&server.uri(), "key-a,key-b", 5, 1))
+        .expect("client builds");
+
+    let err = client
+        .post::<_, Dummy>("/positions/otc", serde_json::json!({}), Some(2))
+        .await
+        .expect_err("trading allowance is an error");
+    assert!(
+        matches!(err, AppError::TradingAllowanceExceeded),
+        "got {err:?}"
+    );
+
+    let orders: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/positions/otc")
+        .map(|r| {
+            r.headers
+                .get("X-IG-API-KEY")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(orders.len(), 1, "the order was sent once, got {orders:?}");
+}
+
+/// A single key behaves exactly as before the pool existed: requests go out on
+/// that key, paced by its budget.
+#[tokio::test]
+async fn test_pool_single_key_keeps_previous_behaviour() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let client =
+        HttpClient::new_lazy(pool_config(&server.uri(), "only-key", 5, 1)).expect("client builds");
+
+    client.get::<Dummy>("/data", Some(1)).await.expect("first");
+    client.get::<Dummy>("/data", Some(1)).await.expect("second");
+
+    let used = keys_used(&server).await;
+    assert_eq!(used, vec!["only-key".to_string(), "only-key".to_string()]);
+}

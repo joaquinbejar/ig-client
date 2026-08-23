@@ -155,9 +155,30 @@ impl Auth {
     /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
     /// be built (e.g. the system TLS backend fails to initialize).
     pub fn try_new(config: Arc<Config>) -> Result<Self, AppError> {
-        let client = Client::builder().user_agent(USER_AGENT).build()?;
-
         let rate_limiter = RateLimiter::new(&config.rate_limiter);
+        Self::with_rate_limiter(config, rate_limiter)
+    }
+
+    /// Builds an `Auth` that paces against a caller-supplied limiter.
+    ///
+    /// IG meters its allowance per API key, and a login is one of the requests
+    /// it counts. When a key's session and its data requests pace against
+    /// separate limiters, the key's real budget is the sum of the two and IG
+    /// rejects requests the client believed were within budget. Sharing one
+    /// limiter per key is what makes the local pacing match the remote one.
+    ///
+    /// # Arguments
+    /// * `config` - Configuration containing credentials and API settings
+    /// * `rate_limiter` - The limiter owned by this key
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the underlying `reqwest` client cannot
+    /// be built (e.g. the system TLS backend fails to initialize).
+    pub fn with_rate_limiter(
+        config: Arc<Config>,
+        rate_limiter: RateLimiter,
+    ) -> Result<Self, AppError> {
+        let client = Client::builder().user_agent(USER_AGENT).build()?;
 
         Ok(Self {
             config,

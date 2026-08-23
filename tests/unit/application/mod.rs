@@ -6,5 +6,6 @@ mod test_http_request;
 // user callback. The stream-pumping half (`Listener::spawn`) needs a
 // `lightstreamer_rs::Updates`, which has no public constructor, so it is only
 // reachable from the env-gated live tests.
+mod test_key_pool;
 #[cfg(feature = "streaming")]
 mod test_listener;
