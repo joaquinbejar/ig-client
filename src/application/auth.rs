@@ -248,6 +248,15 @@ impl Auth {
         }
     }
 
+    /// Whether the cached session authenticates with OAuth (v3).
+    ///
+    /// `false` when nothing is cached yet: with no session, the caller cannot
+    /// assume the per-request account model applies.
+    pub async fn is_oauth_session(&self) -> bool {
+        let session = self.session.read().await;
+        session.as_ref().is_some_and(|s| s.api_version == 3)
+    }
+
     /// Whether a session is cached and not within its refresh margin.
     ///
     /// Lets a caller tell "this key can send right now" from "this key would
@@ -339,7 +348,26 @@ impl Auth {
                 // (login -> switch_account -> get_session -> login). The cycle
                 // is runtime-bounded: the session was stored above, so
                 // `get_session` returns it without logging in again.
-                return Box::pin(self.switch_account(&configured, None)).await;
+                // The session stored above is the *login's* account, not the
+                // configured one. If the switch fails, leaving it cached would
+                // let the next request run silently against the wrong account -
+                // or spin on 401 - so the session is cleared and the caller sees
+                // the failure. Local state and the selected account move
+                // together or not at all.
+                return match Box::pin(self.switch_account(&configured, None)).await {
+                    Ok(session) => Ok(session),
+                    Err(e) => {
+                        {
+                            let mut sess = self.session.write().await;
+                            *sess = None;
+                        }
+                        warn!(
+                            "account selection failed after login; cleared the \
+                             session rather than keeping the login's default account"
+                        );
+                        Err(e)
+                    }
+                };
             }
         }
 
@@ -569,6 +597,7 @@ impl Auth {
         default_account: Option<bool>,
     ) -> Result<Session, AppError> {
         let current_session = self.get_session().await?;
+
         if matches!(current_session.api_version, 3) {
             return Err(AppError::InvalidInput(
                 "Cannot switch accounts with OAuth".to_string(),
