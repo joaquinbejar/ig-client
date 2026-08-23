@@ -146,19 +146,20 @@ async fn test_make_http_request_403_historical_allowance_fails_fast() {
 }
 
 #[tokio::test]
-async fn test_make_http_request_403_api_key_allowance_is_rate_limited_and_retried() {
+async fn test_make_http_request_403_api_key_allowance_fails_fast() {
     let server = MockServer::start().await;
     // An API-key allowance breach maps to its own error, distinct from a bare
     // 429: it is the one allowance a key pool can route around, so the caller
-    // has to be able to tell it apart. It IS retried, so all RETRIES + 1
-    // attempts are made before giving up.
+    // has to be able to tell it apart. It fails fast - one attempt - because
+    // retrying a key that just said it is empty costs ~76 s of backoff before
+    // the caller can rotate to a key that is not.
     mount_get(
         &server,
         ResponseTemplate::new(403).set_body_raw(
             r#"{"errorCode":"error.public-api.exceeded-api-key-allowance"}"#,
             "application/json",
         ),
-        RETRIES + 1,
+        1,
     )
     .await;
 

@@ -149,8 +149,14 @@ distinct because they call for different responses:
 | `RateLimitExceeded` | a bare 429 with no allowance body | not read as a per-key rejection |
 
 Rotation is enabled for non-trading REST only. Creating, amending and closing
-orders stay pinned to one key: that traffic is metered against the account, so
-moving it buys nothing and would scatter order history across sessions.
+orders stay pinned to slot 0, so consecutive orders travel on one key and one
+session: that traffic is metered against the account, so moving it buys nothing
+and would scatter order history across sessions.
+
+On top of the per-key budgets the pool paces against an account-wide one,
+derived as `keys x max_requests` capped at IG's documented 30 requests/minute
+per account. With a single key it never binds, so single-key behaviour is
+unchanged.
 
 A single key (no comma) behaves exactly as before.
 

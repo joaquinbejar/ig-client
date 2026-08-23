@@ -220,6 +220,19 @@ impl Auth {
         self.ws_info().await.unwrap_or_default()
     }
 
+    /// Whether a session is cached and not within its refresh margin.
+    ///
+    /// Lets a caller tell "this key can send right now" from "this key would
+    /// have to log in first" without triggering the login. The key pool needs
+    /// that distinction: probing every key with `get_session` would
+    /// authenticate the whole pool to serve one request.
+    pub async fn has_ready_session(&self) -> bool {
+        let session = self.session.read().await;
+        session.as_ref().is_some_and(|sess| {
+            !sess.needs_token_refresh(Some(proactive_refresh_margin_secs(sess)))
+        })
+    }
+
     /// Gets the current session, ensuring tokens are valid
     ///
     /// This method automatically refreshes expired OAuth tokens or re-authenticates if needed.
@@ -227,6 +240,9 @@ impl Auth {
     /// # Returns
     /// * `Ok(Session)` - Valid session with fresh tokens
     /// * `Err(AppError)` - If authentication fails
+    ///
+    /// # Errors
+    /// Returns [`AppError`] when login or token refresh fails.
     pub async fn get_session(&self) -> Result<Session, AppError> {
         let session = self.session.read().await;
 
