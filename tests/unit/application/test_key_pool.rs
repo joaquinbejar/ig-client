@@ -154,9 +154,12 @@ async fn test_pool_two_keys_first_two_requests_use_distinct_keys_immediately() {
     let used = keys_used(&server).await;
     assert_eq!(used.len(), 2, "both requests were sent");
     assert_ne!(used[0], used[1], "the two requests used different keys");
+    // Neither request waited on a *key* refill, which is 60 s here. Four
+    // physical requests (two logins, two data) still pass the account gate at
+    // one per two seconds, so the floor is around six seconds, not zero.
     assert!(
-        elapsed < Duration::from_secs(5),
-        "neither request waited on a refill, took {elapsed:?}"
+        elapsed < Duration::from_secs(20),
+        "neither request waited on a key refill, took {elapsed:?}"
     );
 }
 
@@ -732,16 +735,24 @@ async fn test_pool_oauth_refresh_targets_the_failing_slot() {
     );
 }
 
-/// The pool paces against an account-wide budget on top of the per-key ones.
-/// Without it, N keys would pace N times what the account allows.
+/// Every request the server received, whatever its path.
+///
+/// The account budget is charged per *physical* request, so counting only
+/// `/data` would miss the logins, refreshes and retries it also has to pay for.
+async fn all_requests(server: &MockServer) -> usize {
+    server.received_requests().await.unwrap_or_default().len()
+}
+
+/// The account ceiling caps everything the process sends, logins included.
+///
+/// Ten keys with a generous per-key budget would otherwise pace ten times what
+/// the account allows.
 #[tokio::test]
-async fn test_pool_respects_an_account_wide_budget() {
+async fn test_account_budget_caps_every_physical_request() {
     let server = MockServer::start().await;
     mount_login_ok(&server).await;
     mount_data_ok(&server).await;
 
-    // Ten keys with a generous per-key budget: the per-key limiters would let
-    // far more through than the account ceiling of 30/minute allows.
     let keys: Vec<String> = (0..10).map(|i| format!("key-{i}")).collect();
     let client = HttpClient::new_lazy(pool_config_burst(
         &server.uri(),
@@ -752,22 +763,171 @@ async fn test_pool_respects_an_account_wide_budget() {
     ))
     .expect("client builds");
 
-    let mut sent = 0;
     for _ in 0..40 {
-        match tokio::time::timeout(
+        if tokio::time::timeout(
             Duration::from_millis(50),
             client.get::<Dummy>("/data", Some(1)),
         )
         .await
+        .is_err()
         {
-            Ok(Ok(_)) => sent += 1,
-            _ => break,
+            break;
         }
     }
 
+    let total = all_requests(&server).await;
     assert!(
-        sent <= 30,
-        "the account ceiling capped the burst at 30/minute, sent {sent}"
+        total <= 30,
+        "the account ceiling capped every request, not just the data ones: {total} sent"
     );
-    assert!(sent > 0, "the pool still served requests");
+    assert!(total > 0, "the pool still served requests");
+}
+
+/// Logins draw on the account budget too. Ten keys logging in cannot exceed the
+/// ceiling just because each one has its own key budget.
+#[tokio::test]
+async fn test_account_budget_covers_logins() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let keys: Vec<String> = (0..10).map(|i| format!("key-{i}")).collect();
+    // Per-key burst of 1 forces a login on many keys, so most of the traffic
+    // here is `/session` rather than `/data`.
+    let client = HttpClient::new_lazy(pool_config_burst(
+        &server.uri(),
+        &keys.join(","),
+        100,
+        60,
+        1,
+    ))
+    .expect("client builds");
+
+    for _ in 0..40 {
+        if tokio::time::timeout(
+            Duration::from_millis(50),
+            client.get::<Dummy>("/data", Some(1)),
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+    }
+
+    let total = all_requests(&server).await;
+    let logins = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/session")
+        .count();
+
+    assert!(logins > 0, "the test exercised the login path");
+    assert!(
+        total <= 30,
+        "logins and data together stayed under the ceiling: {total} sent ({logins} logins)"
+    );
+}
+
+/// Retries pay the account budget as well: each attempt is a request IG counts.
+#[tokio::test]
+async fn test_account_budget_covers_retries() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    // A persistently failing endpoint, so the client exhausts its retry budget.
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a", 100, 60, 100))
+        .expect("client builds");
+
+    let before = all_requests(&server).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get::<Dummy>("/data", Some(1)),
+    )
+    .await;
+    let sent = all_requests(&server).await - before;
+
+    // Whatever the retry budget allows, the account limiter is a burst of one
+    // per two seconds, so a burst of attempts cannot slip through untimed.
+    assert!(
+        sent <= 2,
+        "each retry waited on the account budget, {sent} attempts went out at once"
+    );
+}
+
+/// `HttpClient::new` logs in on the first key that accepts it. One spent key
+/// must not throw away a pool whose other keys are fine.
+#[tokio::test]
+async fn test_new_rotates_when_the_first_key_is_exhausted() {
+    let server = MockServer::start().await;
+
+    // The first login is refused for that key's allowance; the next succeeds.
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "errorCode": "error.public-api.exceeded-api-key-allowance"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_login_ok(&server).await;
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        HttpClient::new(pool_config_burst(&server.uri(), "key-a,key-b", 20, 1, 20)),
+    )
+    .await;
+
+    assert!(
+        matches!(client, Ok(Ok(_))),
+        "construction rotated to the second key, got {:?}",
+        client.as_ref().map(std::result::Result::is_ok)
+    );
+
+    let logins = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/session")
+        .count();
+    assert_eq!(
+        logins, 2,
+        "the refused key was not retried, the next one was"
+    );
+}
+
+/// A single key keeps failing construction: rotation must not turn a real
+/// authentication failure into a silent success.
+#[tokio::test]
+async fn test_new_fails_when_no_key_can_authenticate() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "errorCode": "error.public-api.exceeded-api-key-allowance"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        HttpClient::new(pool_config_burst(&server.uri(), "key-a,key-b", 20, 1, 20)),
+    )
+    .await;
+
+    match client {
+        Ok(Err(AppError::ApiKeyAllowanceExceeded)) => {}
+        other => panic!(
+            "expected ApiKeyAllowanceExceeded, got {:?}",
+            other.map(|r| r.is_ok())
+        ),
+    }
 }

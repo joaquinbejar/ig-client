@@ -13,7 +13,7 @@
 //! - Automatic re-authentication when tokens expire
 
 use crate::application::config::Config;
-use crate::application::http::make_http_request;
+use crate::application::http::{Pacing, make_http_request_with_account};
 use crate::application::rate_limiter::RateLimiter;
 use crate::constants::USER_AGENT;
 use crate::error::{AppError, AuthError};
@@ -138,6 +138,9 @@ pub struct Auth {
     // `Arc`, so it is shared directly without an outer `RwLock`: the limiter is
     // configured once at construction and never write-swapped.
     rate_limiter: RateLimiter,
+    /// Budget shared with every other key of the account, charged on each
+    /// `/session` call just as it is on data requests: IG counts a login too.
+    account_limiter: Option<RateLimiter>,
 }
 
 impl Auth {
@@ -157,6 +160,21 @@ impl Auth {
     pub fn try_new(config: Arc<Config>) -> Result<Self, AppError> {
         let rate_limiter = RateLimiter::new(&config.rate_limiter);
         Self::with_rate_limiter(config, rate_limiter)
+    }
+
+    /// Builds an `Auth` paced against both this key's limiter and the
+    /// account-wide one.
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if the HTTP client cannot be built.
+    pub fn with_limiters(
+        config: Arc<Config>,
+        rate_limiter: RateLimiter,
+        account_limiter: RateLimiter,
+    ) -> Result<Self, AppError> {
+        let mut auth = Self::with_rate_limiter(config, rate_limiter)?;
+        auth.account_limiter = Some(account_limiter);
+        Ok(auth)
     }
 
     /// Builds an `Auth` that paces against a caller-supplied limiter.
@@ -185,6 +203,7 @@ impl Auth {
             client,
             session: Arc::new(RwLock::new(None)),
             rate_limiter,
+            account_limiter: None,
         })
     }
 
@@ -218,6 +237,15 @@ impl Auth {
     )]
     pub async fn get_ws_info(&self) -> WebsocketInfo {
         self.ws_info().await.unwrap_or_default()
+    }
+
+    /// The budgets a `/session` request must pass: this key's, then the
+    /// account's.
+    fn pacing(&self) -> Pacing<'_> {
+        Pacing {
+            key: &self.rate_limiter,
+            account: self.account_limiter.as_ref(),
+        }
     }
 
     /// Whether a session is cached and not within its refresh margin.
@@ -335,9 +363,9 @@ impl Auth {
             ("Version", "2"),
         ];
 
-        let response = make_http_request(
+        let response = make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::POST,
             &url,
             headers,
@@ -428,9 +456,9 @@ impl Auth {
             ("Version", "3"),
         ];
 
-        let response = make_http_request(
+        let response = make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::POST,
             &url,
             headers,
@@ -509,7 +537,7 @@ impl Auth {
     ///
     /// It cannot loop back through the 401 handler: [`login`](Self::login) issues
     /// its HTTP requests through
-    /// [`make_http_request`] directly, not
+    /// [`make_http_request_with_account`] directly, not
     /// through the [`HttpClient`](crate::application::http::HttpClient) refresh-and-replay
     /// path, so a 401 encountered *during* login surfaces as a typed error rather
     /// than recursing into `force_refresh`.
@@ -587,9 +615,9 @@ impl Auth {
             headers.push(("X-SECURITY-TOKEN", x_security_token.as_str()));
         }
 
-        let response = make_http_request(
+        let response = make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::PUT,
             &url,
             headers,
@@ -731,9 +759,9 @@ impl Auth {
             }
         }
 
-        match make_http_request(
+        match make_http_request_with_account(
             &self.client,
-            &self.rate_limiter,
+            self.pacing(),
             Method::DELETE,
             &url,
             headers,

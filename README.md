@@ -153,10 +153,15 @@ orders stay pinned to slot 0, so consecutive orders travel on one key and one
 session: that traffic is metered against the account, so moving it buys nothing
 and would scatter order history across sessions.
 
-On top of the per-key budgets the pool paces against an account-wide one,
-derived as `keys x max_requests` capped at IG's documented 30 requests/minute
-per account. With a single key it never binds, so single-key behaviour is
-unchanged.
+On top of the per-key budgets the pool paces against an account-wide one, fixed
+at IG's documented 30 requests per 60 seconds. It is charged **per physical
+request**, immediately before each send: logins, token refreshes and every
+retry pay it, not just the data calls.
+
+That budget coordinates **one process only**. It is an in-process token bucket,
+so two services authenticating the same IG account each pace themselves to the
+ceiling and together exceed it — keep an account inside one process, or give
+each service its own account.
 
 A single key (no comma) behaves exactly as before.
 

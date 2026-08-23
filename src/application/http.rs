@@ -81,12 +81,48 @@ struct KeySlot {
 /// long that the pool shrinks under sustained load.
 const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// IG's documented non-trading ceiling for one account, in requests per minute.
+/// The two budgets every physical request has to pass.
+///
+/// IG meters an allowance per API key *and* one per account, and a pool draws
+/// on both at once: the key's own bucket and the account bucket its keys share.
+/// Both are charged per HTTP request actually sent — logins, token refreshes
+/// and retries included — because that is what IG counts.
+#[derive(Clone, Copy)]
+pub struct Pacing<'a> {
+    /// The budget of the API key serving this request.
+    pub key: &'a RateLimiter,
+    /// The budget shared by every key of the account, when one is configured.
+    pub account: Option<&'a RateLimiter>,
+}
+
+impl<'a> Pacing<'a> {
+    /// Pacing against one key only, with no account-wide budget.
+    #[must_use]
+    pub const fn key_only(key: &'a RateLimiter) -> Self {
+        Self { key, account: None }
+    }
+
+    /// Takes an account token, if an account budget is configured.
+    ///
+    /// Called immediately before the send and never earlier: taken at selection
+    /// time it would be held across a wait of up to a full period, letting
+    /// permits pile up and burst past the ceiling once the waits resolve.
+    async fn charge_account(&self, class: RateLimitClass) {
+        if let Some(account) = self.account {
+            account.wait_for(class).await;
+        }
+    }
+}
+
+/// IG's documented non-trading ceiling for one account.
 ///
 /// Measurement never reached it — four keys sustained 32/min with no rejection —
 /// but it is the published limit, so the pool paces below it rather than
 /// discovering it in production.
 const ACCOUNT_MAX_REQUESTS_PER_MINUTE: u32 = 30;
+
+/// The window [`ACCOUNT_MAX_REQUESTS_PER_MINUTE`] is measured over.
+const ACCOUNT_PERIOD_SECONDS: u64 = 60;
 
 /// Renders an API key for logs as its first eight characters.
 ///
@@ -152,11 +188,13 @@ impl HttpClient {
         // Build the pool first: every slot owns a single-key `Config`, so the
         // client's own `Auth` is slot 0's rather than one built from the raw
         // config, whose `api_key` may be the whole comma-separated list.
-        let (auth, pool) = Self::build_pool(&config)?;
-        let account_limiter = Self::build_account_limiter(&config, pool.len());
+        let account_limiter = Self::build_account_limiter();
+        let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
-        // Perform initial login on the first key of the pool
-        auth.login().await?;
+        // Log in on the first key that will have us: an allowance rejection on
+        // one key says nothing about the others, so construction rotates too
+        // rather than failing on slot 0.
+        Self::login_any(&pool).await?;
 
         Ok(Self {
             auth,
@@ -181,8 +219,8 @@ impl HttpClient {
             .build()?;
         // Same as `new`: the client's `Auth` is the pool's first slot, never an
         // `Auth` built from a config whose `api_key` is the whole pool list.
-        let (auth, pool) = Self::build_pool(&config)?;
-        let account_limiter = Self::build_account_limiter(&config, pool.len());
+        let account_limiter = Self::build_account_limiter();
+        let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
         Ok(Self {
             auth,
@@ -213,7 +251,10 @@ impl HttpClient {
     /// The pool and the first slot's [`Auth`], which the client adopts as its
     /// own. Returning it here is what guarantees the client never holds an
     /// `Auth` built from the raw multi-key config.
-    fn build_pool(config: &Arc<Config>) -> Result<(Arc<Auth>, Vec<KeySlot>), AppError> {
+    fn build_pool(
+        config: &Arc<Config>,
+        account_limiter: &RateLimiter,
+    ) -> Result<(Arc<Auth>, Vec<KeySlot>), AppError> {
         let keys = config.credentials.api_keys();
         // An empty list means the value held no usable key; keep the raw value
         // so the failure surfaces as IG rejecting it, not as an empty pool.
@@ -231,7 +272,11 @@ impl HttpClient {
             let key_config = Arc::new(key_config);
 
             let key_limiter = RateLimiter::new(&key_config.rate_limiter);
-            let key_auth = Arc::new(Auth::with_rate_limiter(key_config, key_limiter.clone())?);
+            let key_auth = Arc::new(Auth::with_limiters(
+                key_config,
+                key_limiter.clone(),
+                account_limiter.clone(),
+            )?);
             if first_auth.is_none() {
                 first_auth = Some(key_auth.clone());
             }
@@ -252,43 +297,61 @@ impl HttpClient {
         // panic.
         let auth = match first_auth {
             Some(auth) => auth,
-            None => Arc::new(Auth::try_new(config.clone())?),
+            None => Arc::new(Auth::with_limiters(
+                config.clone(),
+                RateLimiter::new(&config.rate_limiter),
+                account_limiter.clone(),
+            )?),
         };
         Ok((auth, pool))
     }
 
     /// Builds the pool-wide budget that models IG's per-account ceiling.
     ///
-    /// The per-key budget is what the config expresses, so the account's is
-    /// derived from it: `keys x max_requests`, capped at
-    /// [`ACCOUNT_MAX_REQUESTS_PER_MINUTE`]. With one key it is never the binding
-    /// constraint, which keeps single-key behaviour unchanged; with many it
-    /// stops the pool from pacing past what the account allows.
-    fn build_account_limiter(config: &Arc<Config>, keys: usize) -> RateLimiter {
-        let per_key = config.rate_limiter.max_requests;
-        let keys = u32::try_from(keys).unwrap_or(u32::MAX);
-        let aggregate = per_key.saturating_mul(keys);
-
-        let period = config.rate_limiter.period_seconds.max(1);
-        // Scale the documented per-minute ceiling to the configured period so
-        // the comparison is like for like.
-        let ceiling = u32::try_from(
-            u64::from(ACCOUNT_MAX_REQUESTS_PER_MINUTE)
-                .saturating_mul(period)
-                .div_ceil(60),
-        )
-        .unwrap_or(u32::MAX)
-        .max(1);
-
-        let max_requests = aggregate.min(ceiling);
+    /// Modelled directly as IG documents it — 30 requests per 60 seconds — not
+    /// derived from the per-key configuration: the account ceiling is a property
+    /// of the account, and scaling it by the configured period made a shorter
+    /// period silently raise it. The burst is one, so the allowance is spent
+    /// evenly instead of discharging thirty requests at once and then stalling.
+    ///
+    /// **This coordinates one process only.** It is an in-process token bucket,
+    /// so two services authenticating the same IG account each pace themselves
+    /// to the ceiling and together exceed it. Keeping an account inside one
+    /// process, or giving each service its own account, is what actually
+    /// enforces it.
+    fn build_account_limiter() -> RateLimiter {
         RateLimiter::new(&RateLimiterConfig {
-            max_requests,
-            period_seconds: config.rate_limiter.period_seconds,
-            // The burst is the bucket's capacity, so leaving the per-key burst
-            // here would let the pool discharge far more than the ceiling in one
-            // go and the cap would only bind on the average.
-            burst_size: config.rate_limiter.burst_size.min(max_requests),
+            max_requests: ACCOUNT_MAX_REQUESTS_PER_MINUTE,
+            period_seconds: ACCOUNT_PERIOD_SECONDS,
+            burst_size: 1,
         })
+    }
+
+    /// Logs in on the first key of the pool that accepts us.
+    ///
+    /// A key whose allowance is exhausted rejects the login, which says nothing
+    /// about the other keys; failing construction on slot 0 would throw the
+    /// whole pool away over one spent key.
+    ///
+    /// # Errors
+    /// Returns the last key's error when no key could authenticate.
+    async fn login_any(pool: &[KeySlot]) -> Result<(), AppError> {
+        let mut last: Option<AppError> = None;
+        for slot in pool {
+            match slot.auth.login().await {
+                Ok(_) => return Ok(()),
+                Err(e @ AppError::ApiKeyAllowanceExceeded) => {
+                    slot.mark_exhausted();
+                    warn!(
+                        key = %redact_key(&slot.api_key),
+                        "API key allowance exhausted at login, trying the next key"
+                    );
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(AppError::ApiKeyAllowanceExceeded))
     }
 
     /// Reserves a token from a usable key, waiting only if every key is empty.
@@ -333,7 +396,6 @@ impl HttpClient {
             if tried.contains(&0) {
                 return Ok(None);
             }
-            self.account_limiter.reserve(class).await;
             self.pool[0].rate_limiter.reserve(class).await;
             self.pool[0].auth.get_session().await?;
             return Ok(Some(0));
@@ -349,10 +411,6 @@ impl HttpClient {
         if candidates.is_empty() {
             return Ok(None);
         }
-
-        // The account-wide budget is shared by every key, so it is charged once
-        // per request regardless of which key ends up serving it.
-        self.account_limiter.reserve(class).await;
 
         // Pass 1: keys that can send without logging in first.
         for &i in &candidates {
@@ -731,9 +789,12 @@ impl HttpClient {
             headers.push(("X-SECURITY-TOKEN", token_val.as_str()));
         }
 
-        make_http_request_reserved(
+        make_http_request_paced(
             &self.http_client,
-            &slot.rate_limiter,
+            Pacing {
+                key: &slot.rate_limiter,
+                account: Some(&self.account_limiter),
+            },
             method.clone(),
             url,
             headers,
@@ -892,9 +953,37 @@ pub async fn make_http_request<B: Serialize>(
     body: &Option<B>,
     retry_config: RetryConfig,
 ) -> Result<Response, AppError> {
-    make_http_request_reserved(
+    make_http_request_paced(
         client,
-        rate_limiter,
+        Pacing::key_only(rate_limiter),
+        method,
+        url,
+        headers,
+        body,
+        retry_config,
+        false,
+    )
+    .await
+}
+
+/// Same as [`make_http_request`], but paced against a key budget *and* the
+/// account budget its keys share.
+///
+/// # Errors
+/// Same as [`make_http_request`].
+#[allow(clippy::too_many_arguments)]
+pub async fn make_http_request_with_account<B: Serialize>(
+    client: &Client,
+    pacing: Pacing<'_>,
+    method: Method,
+    url: &str,
+    headers: Vec<(&str, &str)>,
+    body: &Option<B>,
+    retry_config: RetryConfig,
+) -> Result<Response, AppError> {
+    make_http_request_paced(
+        client,
+        pacing,
         method,
         url,
         headers,
@@ -922,6 +1011,41 @@ pub async fn make_http_request_reserved<B: Serialize>(
     retry_config: RetryConfig,
     reserved: bool,
 ) -> Result<Response, AppError> {
+    make_http_request_paced(
+        client,
+        Pacing::key_only(rate_limiter),
+        method,
+        url,
+        headers,
+        body,
+        retry_config,
+        reserved,
+    )
+    .await
+}
+
+/// The one place a request is actually sent, and so the one place both budgets
+/// are charged.
+///
+/// `reserved = true` means the caller already holds this key's token for the
+/// first send. The account budget is never pre-reserved: it is taken here,
+/// immediately before each send, so logins, refreshes and every retry pay it
+/// too.
+///
+/// # Errors
+/// Same as [`make_http_request`].
+#[allow(clippy::too_many_arguments)]
+pub async fn make_http_request_paced<B: Serialize>(
+    client: &Client,
+    pacing: Pacing<'_>,
+    method: Method,
+    url: &str,
+    headers: Vec<(&str, &str)>,
+    body: &Option<B>,
+    retry_config: RetryConfig,
+    reserved: bool,
+) -> Result<Response, AppError> {
+    let rate_limiter = pacing.key;
     let max_retries = retry_config.max_retries();
 
     // Pace this request against the bucket for its endpoint class (trading /
@@ -941,6 +1065,10 @@ pub async fn make_http_request_reserved<B: Serialize>(
         if attempt > 0 || !reserved {
             rate_limiter.wait_for(class).await;
         }
+
+        // Last gate before the wire: the account budget is charged per physical
+        // request, so a retry costs another token just as a first send does.
+        pacing.charge_account(class).await;
 
         debug!(%method, %url, class = ?class, "http request");
 
