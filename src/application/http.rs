@@ -787,13 +787,24 @@ impl HttpClient {
                         "API key allowance exhausted, rotating to another key"
                     );
                 }
-                // The token IG rejected belongs to this slot's session, so the
-                // refresh has to happen on that slot - not on the client's own
-                // `auth`, which is slot 0 and may be a different key entirely.
-                Err(AppError::OAuthTokenExpired) if !replayed => {
+                // The session IG rejected belongs to this slot, so the refresh
+                // has to happen on that slot - not on the client's own `auth`,
+                // which is the primary and may be a different key entirely.
+                //
+                // Both 401 shapes are recoverable the same way. OAuth says
+                // `oauth-token-invalid` and is obvious; a v2 session instead
+                // just stops being accepted - IG invalidates CST /
+                // X-SECURITY-TOKEN when the account is switched or the same
+                // account authenticates elsewhere - and says nothing the client
+                // can pattern-match. Until now only the OAuth case re-logged in,
+                // so a v2 session that IG had killed was reused forever: the
+                // local clock still considered it valid (v2 lasts six hours), so
+                // nothing refreshed it, and every request returned 401 without
+                // ever attempting to authenticate again.
+                Err(AppError::OAuthTokenExpired | AppError::Unauthorized) if !replayed => {
                     warn!(
                         key = %redact_key(&slot.api_key),
-                        "OAuth token expired, refreshing this key's session and replaying once"
+                        "session rejected by IG, re-authenticating this key and replaying once"
                     );
                     slot.auth.force_refresh().await?;
                     replayed = true;
@@ -926,11 +937,30 @@ impl HttpClient {
         account_id: &str,
         default_account: Option<bool>,
     ) -> Result<(), AppError> {
+        // v3 selects the account per request through the `IG-ACCOUNT-ID`
+        // header, so switching is a local field update costing no request. That
+        // makes it safe to apply to every slot, which is exactly what a pool
+        // needs: leaving the others behind would let a rotated read answer for
+        // the previous account.
+        if self.primary_auth().is_oauth_session().await {
+            for slot in &self.pool {
+                slot.auth
+                    .switch_account(account_id, default_account)
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        // v2 keeps the account in the session itself, re-issued by IG on a
+        // `PUT /session`. Applying that across a pool would spend one request
+        // per key against the allowance the pool exists to protect, and doing
+        // it on one slot only would leave the rest answering for the previous
+        // account.
         if self.pool.len() > 1 {
             return Err(AppError::InvalidInput(
-                "switch_account cannot be applied coherently to a multi-key pool: \
-                 each key holds its own session and the account keys the shared \
-                 account-wide budget; build one client per account"
+                "switch_account cannot be applied coherently to a multi-key v2 pool: \
+                 each key holds its own session; use api_version 3, which selects \
+                 the account per request, or build one client per account"
                     .to_string(),
             ));
         }

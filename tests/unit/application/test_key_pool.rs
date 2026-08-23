@@ -1237,3 +1237,146 @@ async fn test_switch_account_still_works_with_one_key() {
         "the pool guard did not fire for a single key, got {result:?}"
     );
 }
+
+/// A v2 session that IG has invalidated is re-authenticated, not reused.
+///
+/// This is what wedged `ig-categories` in production: IG kills CST /
+/// X-SECURITY-TOKEN when the account is switched or the same account logs in
+/// elsewhere, and answers 401 with nothing the client can pattern-match. The
+/// local clock still considered the session valid — v2 lasts six hours — so
+/// nothing refreshed it, and every cycle replayed the dead token forever
+/// without ever trying to log in again.
+#[tokio::test]
+async fn test_invalidated_v2_session_is_reauthenticated_and_replayed() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+
+    // The first data call is rejected as unauthorized, with a body that carries
+    // no OAuth marker - exactly what a killed v2 session looks like.
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "errorCode": "error.security.client-token-invalid"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_data_ok(&server).await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a", 20, 1, 20))
+        .expect("client builds");
+
+    let result = client.get::<Dummy>("/data", Some(1)).await;
+    assert!(
+        result.is_ok(),
+        "the request succeeded after re-authenticating, got {result:?}"
+    );
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let logins = requests
+        .iter()
+        .filter(|r| r.url.path() == "/session")
+        .count();
+    let data = requests.iter().filter(|r| r.url.path() == "/data").count();
+    assert_eq!(data, 2, "the rejected call plus its replay");
+    assert!(
+        logins >= 2,
+        "the rejection triggered a fresh login, saw {logins}"
+    );
+}
+
+/// A 401 that keeps coming back fails after exactly one replay, rather than
+/// looping between re-authentication and rejection.
+#[tokio::test]
+async fn test_persistent_401_replays_once_and_then_fails() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "errorCode": "error.security.client-token-invalid"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a", 20, 1, 20))
+        .expect("client builds");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.get::<Dummy>("/data", Some(1)),
+    )
+    .await
+    .expect("no infinite loop")
+    .expect_err("a permanent 401 still fails");
+    assert!(matches!(err, AppError::Unauthorized), "got {err:?}");
+
+    let data = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/data")
+        .count();
+    assert_eq!(data, 2, "one replay only, got {data} attempts");
+}
+
+/// On v3, switching accounts costs no request and reaches every key.
+///
+/// An OAuth token identifies the client, not an account: the account travels in
+/// the `IG-ACCOUNT-ID` header of each request. So the switch is a local field
+/// update — and because it is free, it can be applied to the whole pool, which
+/// is what stops a rotated read from answering for the previous account.
+#[tokio::test]
+async fn test_v3_switch_account_is_local_and_reaches_every_key() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 4, 10, 2))
+        .expect("client builds");
+
+    // Warm both keys so each holds a session to switch.
+    for _ in 0..8 {
+        let _ = client.get::<Dummy>("/data", Some(1)).await;
+    }
+    let before = server.received_requests().await.unwrap_or_default().len();
+
+    client
+        .switch_account("BSI1I", Some(false))
+        .await
+        .expect("v3 switching is supported and free");
+
+    let after = server.received_requests().await.unwrap_or_default().len();
+    assert_eq!(after, before, "the switch sent no HTTP request at all");
+
+    // Every subsequent request must carry the new account, whichever key serves
+    // it.
+    server.reset().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+    for _ in 0..6 {
+        let _ = client.get::<Dummy>("/data", Some(1)).await;
+    }
+
+    let accounts: std::collections::HashSet<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/data")
+        .filter_map(|r| {
+            r.headers
+                .get("IG-ACCOUNT-ID")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect();
+
+    assert!(!accounts.is_empty(), "requests carried an account header");
+    assert_eq!(
+        accounts,
+        std::iter::once("BSI1I".to_string()).collect(),
+        "every key switched, got {accounts:?}"
+    );
+}

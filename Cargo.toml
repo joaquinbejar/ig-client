@@ -1,6 +1,6 @@
 [package]
 name = "ig-client"
-version = "0.16.2"
+version = "0.16.3"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "This crate provides a client for the IG Markets API"

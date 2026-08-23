@@ -248,6 +248,15 @@ impl Auth {
         }
     }
 
+    /// Whether the cached session authenticates with OAuth (v3).
+    ///
+    /// Returns `false` when there is no session yet: with nothing cached, the
+    /// caller cannot assume the request-header model applies.
+    pub async fn is_oauth_session(&self) -> bool {
+        let session = self.session.read().await;
+        session.as_ref().is_some_and(|s| s.api_version == 3)
+    }
+
     /// Whether a session is cached and not within its refresh margin.
     ///
     /// Lets a caller tell "this key can send right now" from "this key would
@@ -569,10 +578,23 @@ impl Auth {
         default_account: Option<bool>,
     ) -> Result<Session, AppError> {
         let current_session = self.get_session().await?;
+
+        // v3 needs no round trip. An OAuth access token identifies the *client*,
+        // not an account: the account is chosen per request by the
+        // `IG-ACCOUNT-ID` header, which is built from the session's account id.
+        // Updating that field locally is therefore the whole switch, and it
+        // costs no request against the allowance. Calling IG's `PUT /session`
+        // here would be worse than useless: it re-issues v2 tokens this session
+        // does not use, and IG rejects it for OAuth sessions anyway.
         if matches!(current_session.api_version, 3) {
-            return Err(AppError::InvalidInput(
-                "Cannot switch accounts with OAuth".to_string(),
-            ));
+            let mut switched = current_session.clone();
+            switched.account_id = account_id.to_string();
+            {
+                let mut session = self.session.write().await;
+                *session = Some(switched.clone());
+            }
+            info!("✓ Selected account {account_id} (v3 sends it per request)");
+            return Ok(switched);
         }
 
         if current_session.account_id == account_id {
