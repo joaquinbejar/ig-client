@@ -158,12 +158,30 @@ at IG's documented 30 requests per 60 seconds. It is charged **per physical
 request**, immediately before each send: logins, token refreshes and every
 retry pay it, not just the data calls.
 
-That budget coordinates **one process only**. It is an in-process token bucket,
-so two services authenticating the same IG account each pace themselves to the
-ceiling and together exceed it — keep an account inside one process, or give
-each service its own account.
+Non-trading and historical traffic share that one bucket, because IG's
+per-account non-trading allowance is a single budget — giving each class its own
+would let market data and `/prices` each run to 30/min. Trading does not charge
+it: IG meters orders against a separate trading allowance.
 
-A single key (no comma) behaves exactly as before.
+The bucket is shared **per process and per account**, so several `HttpClient`s
+in one service built for the same account share it. It does **not** coordinate
+across processes: two services authenticating the same IG account hold two
+buckets and together exceed the ceiling. Enforcing it there needs a distributed
+limiter, or an account per service.
+
+### Upgrading from 0.15
+
+A single key (no comma) keeps the same routing — one key, one session — but two
+behaviours changed for every configuration:
+
+- An `exceeded-api-key-allowance` 403 now **fails fast** instead of being retried
+  three times with backoff. Waiting ~76 s on a key that has just said it is empty
+  helps nobody; with a pool the caller rotates instead, and with one key it learns
+  sooner. Callers that relied on the retry need to handle
+  `AppError::ApiKeyAllowanceExceeded` themselves.
+- The account-wide bucket applies even to a single key, at 30 requests per 60
+  seconds with a burst of 1. A client configured for a faster per-key rate is now
+  capped by it.
 
 `Config::new()` reads configuration from the environment (and a local `.env`
 file, if present). Create a `.env` file in your project root with the

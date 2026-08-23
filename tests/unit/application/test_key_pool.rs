@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Hands each test its own account id, so the per-account budget does not leak
+/// between tests running in the same process.
+static ACCOUNT_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Minimal DTO for the mock endpoint; the tests care about the traffic, not the
 /// payload.
 #[derive(Debug, Deserialize)]
@@ -55,7 +59,14 @@ fn pool_config_burst(
         credentials: Credentials {
             username: "fake-user".to_string(),
             password: "fake-pass".to_string(),
-            account_id: "ABC12".to_string(),
+            // The account budget is shared per process *and per account*, which
+            // is the point of it — but it also means two tests sharing an
+            // account id would steal each other's tokens while running in
+            // parallel. Each config gets its own account unless a test pins one.
+            account_id: format!(
+                "TEST-{}",
+                ACCOUNT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
             api_key: keys.to_string(),
             client_token: None,
             account_token: None,
@@ -901,6 +912,89 @@ async fn test_new_rotates_when_the_first_key_is_exhausted() {
     assert_eq!(
         logins, 2,
         "the refused key was not retried, the next one was"
+    );
+
+    // Construction succeeding is not enough: the client must have *adopted* the
+    // key that authenticated. Trading is pinned to the primary slot, so an order
+    // shows which key that is - and it must not be the exhausted one.
+    let client = client.expect("timeout").expect("client built");
+    Mock::given(method("POST"))
+        .and(path("/positions/otc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+    client
+        .post::<_, Dummy>("/positions/otc", serde_json::json!({}), Some(2))
+        .await
+        .expect("order accepted");
+
+    let order_key = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/positions/otc")
+        .filter_map(|r| {
+            r.headers
+                .get("X-IG-API-KEY")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .next_back()
+        .expect("an order was sent");
+    assert_eq!(
+        order_key, "key-b",
+        "trading uses the key that authenticated, not the exhausted one"
+    );
+}
+
+/// The account bucket is one flat budget: market data and historical prices
+/// draw on the same 30/min, instead of getting 30 each.
+#[tokio::test]
+async fn test_account_budget_is_shared_between_data_and_history() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/prices/EPIC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    // Account id keys the shared bucket; a unique one keeps this test
+    // independent of the others running in the same process.
+    let mut config = pool_config_burst(&server.uri(), "key-hist", 100, 60, 100);
+    config.credentials.account_id = "SHARED-BUDGET-TEST".to_string();
+    let client = HttpClient::new_lazy(config).expect("client builds");
+
+    // Alternate the two classes over a fixed window. The account bucket refills
+    // one token every two seconds, so a shared bucket lets about three requests
+    // through in six seconds; two separate buckets would let through roughly
+    // twice that, since each class would refill on its own.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut i = 0;
+    while Instant::now() < deadline {
+        let endpoint = if i % 2 == 0 { "/data" } else { "/prices/EPIC" };
+        if tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get::<Dummy>(endpoint, Some(1)),
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+        i += 1;
+    }
+
+    let total = all_requests(&server).await;
+    assert!(
+        i >= 2,
+        "the window exercised both classes, only {i} calls made"
+    );
+    assert!(
+        total <= 5,
+        "history and market data shared one account budget: {total} requests in six seconds"
     );
 }
 

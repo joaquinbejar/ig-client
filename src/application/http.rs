@@ -22,6 +22,8 @@ use reqwest::Client as HttpInternalClient;
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -50,6 +52,14 @@ pub struct HttpClient {
     /// N times the account's allowance and the account limit would be found the
     /// hard way.
     account_limiter: RateLimiter,
+    /// The slot whose session this client exposes, and the one trading is
+    /// pinned to.
+    ///
+    /// Normally 0. It moves when construction had to rotate because the first
+    /// key could not authenticate: pointing `auth`, `ws_info` and order traffic
+    /// at a key that failed to log in would break exactly the paths that cannot
+    /// retry elsewhere.
+    primary: usize,
     /// Round-robin starting point for slot selection.
     ///
     /// Without it every caller scans the pool from index 0, so concurrent
@@ -107,9 +117,20 @@ impl<'a> Pacing<'a> {
     /// Called immediately before the send and never earlier: taken at selection
     /// time it would be held across a wait of up to a full period, letting
     /// permits pile up and burst past the ceiling once the waits resolve.
+    ///
+    /// Non-trading and historical traffic charge the **same** bucket, because
+    /// IG's per-account non-trading allowance is one budget: giving each class
+    /// its own account bucket would let `/prices` and market data each run to
+    /// 30/min and together exceed it. Trading does not charge it at all — IG
+    /// meters order traffic against a separate trading allowance, and pacing it
+    /// against the non-trading ceiling would throttle orders behind bulk reads.
     async fn charge_account(&self, class: RateLimitClass) {
+        if class == RateLimitClass::Trading {
+            return;
+        }
         if let Some(account) = self.account {
-            account.wait_for(class).await;
+            // One flat bucket: the class is deliberately collapsed.
+            account.wait_for(RateLimitClass::NonTrading).await;
         }
     }
 }
@@ -188,13 +209,17 @@ impl HttpClient {
         // Build the pool first: every slot owns a single-key `Config`, so the
         // client's own `Auth` is slot 0's rather than one built from the raw
         // config, whose `api_key` may be the whole comma-separated list.
-        let account_limiter = Self::build_account_limiter();
+        let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
         let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
         // Log in on the first key that will have us: an allowance rejection on
         // one key says nothing about the others, so construction rotates too
-        // rather than failing on slot 0.
-        Self::login_any(&pool).await?;
+        // rather than failing on slot 0. Whichever key answered becomes the
+        // primary, so the session this client exposes is one that exists.
+        let primary = Self::login_any(&pool).await?;
+        let auth = pool
+            .get(primary)
+            .map_or_else(|| auth.clone(), |slot| slot.auth.clone());
 
         Ok(Self {
             auth,
@@ -202,6 +227,7 @@ impl HttpClient {
             config,
             pool,
             account_limiter,
+            primary,
             cursor: AtomicUsize::new(0),
         })
     }
@@ -219,7 +245,7 @@ impl HttpClient {
             .build()?;
         // Same as `new`: the client's `Auth` is the pool's first slot, never an
         // `Auth` built from a config whose `api_key` is the whole pool list.
-        let account_limiter = Self::build_account_limiter();
+        let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
         let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
         Ok(Self {
@@ -228,6 +254,7 @@ impl HttpClient {
             config,
             pool,
             account_limiter,
+            primary: 0,
             cursor: AtomicUsize::new(0),
         })
     }
@@ -314,17 +341,32 @@ impl HttpClient {
     /// period silently raise it. The burst is one, so the allowance is spent
     /// evenly instead of discharging thirty requests at once and then stalling.
     ///
-    /// **This coordinates one process only.** It is an in-process token bucket,
-    /// so two services authenticating the same IG account each pace themselves
-    /// to the ceiling and together exceed it. Keeping an account inside one
-    /// process, or giving each service its own account, is what actually
-    /// enforces it.
-    fn build_account_limiter() -> RateLimiter {
-        RateLimiter::new(&RateLimiterConfig {
-            max_requests: ACCOUNT_MAX_REQUESTS_PER_MINUTE,
-            period_seconds: ACCOUNT_PERIOD_SECONDS,
-            burst_size: 1,
-        })
+    /// Shared per process **and per account**: every `HttpClient` built for the
+    /// same `account_id` gets the same bucket, so two clients in one service do
+    /// not each pace to the full ceiling.
+    ///
+    /// **It does not coordinate across processes.** Two services authenticating
+    /// the same IG account hold two buckets and together exceed the ceiling.
+    /// Enforcing it across services needs a distributed limiter, or an account
+    /// per service — which is the arrangement this codebase actually uses.
+    fn build_account_limiter(account_id: &str) -> RateLimiter {
+        static ACCOUNT_LIMITERS: OnceLock<StdMutex<HashMap<String, RateLimiter>>> = OnceLock::new();
+
+        let registry = ACCOUNT_LIMITERS.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut guard = match registry.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .entry(account_id.to_string())
+            .or_insert_with(|| {
+                RateLimiter::new(&RateLimiterConfig {
+                    max_requests: ACCOUNT_MAX_REQUESTS_PER_MINUTE,
+                    period_seconds: ACCOUNT_PERIOD_SECONDS,
+                    burst_size: 1,
+                })
+            })
+            .clone()
     }
 
     /// Logs in on the first key of the pool that accepts us.
@@ -333,13 +375,19 @@ impl HttpClient {
     /// about the other keys; failing construction on slot 0 would throw the
     /// whole pool away over one spent key.
     ///
+    /// # Returns
+    ///
+    /// The index of the slot that authenticated. The caller adopts it as the
+    /// client's primary: leaving `auth` on a key that could not log in would
+    /// point streaming, `ws_info` and trading at the exhausted key.
+    ///
     /// # Errors
     /// Returns the last key's error when no key could authenticate.
-    async fn login_any(pool: &[KeySlot]) -> Result<(), AppError> {
+    async fn login_any(pool: &[KeySlot]) -> Result<usize, AppError> {
         let mut last: Option<AppError> = None;
-        for slot in pool {
+        for (index, slot) in pool.iter().enumerate() {
             match slot.auth.login().await {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(index),
                 Err(e @ AppError::ApiKeyAllowanceExceeded) => {
                     slot.mark_exhausted();
                     warn!(
@@ -393,12 +441,13 @@ impl HttpClient {
         // Trading stays pinned to one slot, so two consecutive orders always
         // travel on the same key and the same session.
         if class == RateLimitClass::Trading {
-            if tried.contains(&0) {
+            let primary = self.primary.min(self.pool.len().saturating_sub(1));
+            if tried.contains(&primary) {
                 return Ok(None);
             }
-            self.pool[0].rate_limiter.reserve(class).await;
-            self.pool[0].auth.get_session().await?;
-            return Ok(Some(0));
+            self.pool[primary].rate_limiter.reserve(class).await;
+            self.pool[primary].auth.get_session().await?;
+            return Ok(Some(primary));
         }
 
         let len = self.pool.len();
