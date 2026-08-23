@@ -250,8 +250,8 @@ impl Auth {
 
     /// Whether the cached session authenticates with OAuth (v3).
     ///
-    /// Returns `false` when there is no session yet: with nothing cached, the
-    /// caller cannot assume the request-header model applies.
+    /// `false` when nothing is cached yet: with no session, the caller cannot
+    /// assume the per-request account model applies.
     pub async fn is_oauth_session(&self) -> bool {
         let session = self.session.read().await;
         session.as_ref().is_some_and(|s| s.api_version == 3)
@@ -348,7 +348,26 @@ impl Auth {
                 // (login -> switch_account -> get_session -> login). The cycle
                 // is runtime-bounded: the session was stored above, so
                 // `get_session` returns it without logging in again.
-                return Box::pin(self.switch_account(&configured, None)).await;
+                // The session stored above is the *login's* account, not the
+                // configured one. If the switch fails, leaving it cached would
+                // let the next request run silently against the wrong account -
+                // or spin on 401 - so the session is cleared and the caller sees
+                // the failure. Local state and the selected account move
+                // together or not at all.
+                return match Box::pin(self.switch_account(&configured, None)).await {
+                    Ok(session) => Ok(session),
+                    Err(e) => {
+                        {
+                            let mut sess = self.session.write().await;
+                            *sess = None;
+                        }
+                        warn!(
+                            "account selection failed after login; cleared the \
+                             session rather than keeping the login's default account"
+                        );
+                        Err(e)
+                    }
+                };
             }
         }
 
@@ -579,22 +598,10 @@ impl Auth {
     ) -> Result<Session, AppError> {
         let current_session = self.get_session().await?;
 
-        // v3 needs no round trip. An OAuth access token identifies the *client*,
-        // not an account: the account is chosen per request by the
-        // `IG-ACCOUNT-ID` header, which is built from the session's account id.
-        // Updating that field locally is therefore the whole switch, and it
-        // costs no request against the allowance. Calling IG's `PUT /session`
-        // here would be worse than useless: it re-issues v2 tokens this session
-        // does not use, and IG rejects it for OAuth sessions anyway.
         if matches!(current_session.api_version, 3) {
-            let mut switched = current_session.clone();
-            switched.account_id = account_id.to_string();
-            {
-                let mut session = self.session.write().await;
-                *session = Some(switched.clone());
-            }
-            info!("✓ Selected account {account_id} (v3 sends it per request)");
-            return Ok(switched);
+            return Err(AppError::InvalidInput(
+                "Cannot switch accounts with OAuth".to_string(),
+            ));
         }
 
         if current_session.account_id == account_id {

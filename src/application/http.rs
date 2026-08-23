@@ -45,13 +45,16 @@ pub struct HttpClient {
     /// [`RateLimiter`] as the fields above, so a single-key configuration keeps
     /// the historical behaviour exactly.
     pool: Vec<KeySlot>,
-    /// Budget shared by the whole pool.
+    /// The account every request is issued against, with the budget that
+    /// belongs to it.
     ///
-    /// IG documents a per-account ceiling on top of the per-key one, and every
-    /// key here authenticates the same account. Without this, N keys would pace
-    /// N times the account's allowance and the account limit would be found the
-    /// hard way.
-    account_limiter: RateLimiter,
+    /// Kept outside the sessions on purpose. On v3 the account is not a property
+    /// of the session at all — an OAuth token identifies the client and the
+    /// account travels in `IG-ACCOUNT-ID` per request — so storing it per
+    /// session would scatter one value across N keys and lose it on every
+    /// re-login. One shared value also makes a switch atomic: a request either
+    /// sees the old account or the new one, never a half-switched pool.
+    selected: Arc<StdMutex<SelectedAccount>>,
     /// The slot whose session this client exposes, and the one trading is
     /// pinned to.
     ///
@@ -67,6 +70,16 @@ pub struct HttpClient {
     /// requests pile onto the first key while the rest sit idle. Advancing it
     /// per selection spreads equally-available keys evenly.
     cursor: AtomicUsize,
+}
+
+/// The account in force and the account-wide budget metered against it.
+///
+/// They travel together because they change together: pointing the client at a
+/// different account must also point it at that account's bucket, or the new
+/// account would be paced against the previous one's remaining allowance.
+struct SelectedAccount {
+    id: String,
+    limiter: RateLimiter,
 }
 
 /// One API key of the pool, with the session and pacing budget that belong to it.
@@ -211,6 +224,10 @@ impl HttpClient {
         // client's own `Auth` is the primary slot's rather than one built from the raw
         // config, whose `api_key` may be the whole comma-separated list.
         let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
+        let selected = Arc::new(StdMutex::new(SelectedAccount {
+            id: config.credentials.account_id.clone(),
+            limiter: account_limiter.clone(),
+        }));
         let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
         // Log in on the first key that will have us: an allowance rejection on
@@ -227,7 +244,7 @@ impl HttpClient {
             http_client,
             config,
             pool,
-            account_limiter,
+            selected,
             primary: AtomicUsize::new(primary),
             cursor: AtomicUsize::new(0),
         })
@@ -247,6 +264,10 @@ impl HttpClient {
         // Same as `new`: the client's `Auth` is the pool's first slot, never an
         // `Auth` built from a config whose `api_key` is the whole pool list.
         let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
+        let selected = Arc::new(StdMutex::new(SelectedAccount {
+            id: config.credentials.account_id.clone(),
+            limiter: account_limiter.clone(),
+        }));
         let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
 
         Ok(Self {
@@ -254,7 +275,7 @@ impl HttpClient {
             http_client,
             config,
             pool,
-            account_limiter,
+            selected,
             primary: AtomicUsize::new(0),
             cursor: AtomicUsize::new(0),
         })
@@ -744,15 +765,28 @@ impl HttpClient {
         let mut tried: Vec<usize> = Vec::with_capacity(self.pool.len());
         // One replay after a forced refresh, never a loop of them.
         let mut replayed = false;
+        // The slot a replay must go back to. Re-entering the selector instead
+        // would let the round-robin hand the replay to a *different* key, so
+        // the session that was just refreshed would go unused and a second
+        // invalidated key would burn the single replay.
+        let mut replay_on: Option<usize> = None;
 
         loop {
-            let Some(idx) = self.reserve_slot(class, &tried).await? else {
+            let idx = if let Some(pinned) = replay_on.take() {
+                // Same key, and it still has to pay for its token.
+                self.pool[pinned].rate_limiter.reserve(class).await;
+                pinned
+            } else if let Some(selected) = self.reserve_slot(class, &tried).await? {
+                selected
+            } else {
                 // Every key has been tried for this request. The last attempt's
                 // error was returned below, so reaching here means the pool ran
                 // out of candidates without one; report the key-level rejection.
                 return Err(AppError::ApiKeyAllowanceExceeded);
             };
-            tried.push(idx);
+            if !tried.contains(&idx) {
+                tried.push(idx);
+            }
             let slot = &self.pool[idx];
 
             // With another key left to try, a rejected request is cheaper to
@@ -808,7 +842,9 @@ impl HttpClient {
                     );
                     slot.auth.force_refresh().await?;
                     replayed = true;
-                    tried.pop();
+                    // Pin the replay to this slot: it is the one whose session
+                    // was just re-established.
+                    replay_on = Some(idx);
                 }
                 // Account and trading allowances belong to the account every key
                 // authenticates, and a bare 429 does not say which budget ran
@@ -838,6 +874,10 @@ impl HttpClient {
     ) -> Result<Response, AppError> {
         let session = slot.auth.get_session().await?;
 
+        // Account and its budget are read together, so a request never pairs one
+        // account's header with another account's bucket.
+        let (selected_account, account_limiter) = self.selected_account();
+
         let version_owned = version.unwrap_or(1).to_string();
         let auth_header_value;
 
@@ -855,7 +895,11 @@ impl HttpClient {
         if let Some(oauth) = &session.oauth_token {
             auth_header_value = format!("Bearer {}", oauth.access_token);
             headers.push(("Authorization", auth_header_value.as_str()));
-            headers.push(("IG-ACCOUNT-ID", session.account_id.as_str()));
+            // v3 selects the account per request, and the value comes from the
+            // client's shared state rather than the session: a re-login or a
+            // token refresh rebuilds the session from IG's default account and
+            // would otherwise silently undo a switch.
+            headers.push(("IG-ACCOUNT-ID", selected_account.as_str()));
         } else if let (Some(cst_val), Some(token_val)) = (&session.cst, &session.x_security_token) {
             headers.push(("CST", cst_val.as_str()));
             headers.push(("X-SECURITY-TOKEN", token_val.as_str()));
@@ -865,7 +909,7 @@ impl HttpClient {
             &self.http_client,
             Pacing {
                 key: &slot.rate_limiter,
-                account: Some(&self.account_limiter),
+                account: Some(&account_limiter),
             },
             method.clone(),
             url,
@@ -915,58 +959,83 @@ impl HttpClient {
         })
     }
 
-    /// Switches to a different trading account.
+    /// Switches every subsequent request to a different trading account.
+    ///
+    /// The two authentication models need different work, because they keep the
+    /// account in different places.
+    ///
+    /// On **v3** the account is not part of the session: an OAuth token
+    /// identifies the client and the account is chosen per request through
+    /// `IG-ACCOUNT-ID`. Switching is therefore a single update of the client's
+    /// shared state — no request, no session touched, and cold keys stay cold.
+    /// It survives re-login and refresh for the same reason: nothing rebuilt
+    /// from IG's response can overwrite it.
+    ///
+    /// On **v2** the account lives in the session, and IG re-issues its tokens
+    /// on `PUT /session`. That is per key, so a multi-key pool is refused rather
+    /// than spending one request per key against the allowance the pool exists
+    /// to protect.
+    ///
+    /// Either way the account and its account-wide budget move together and
+    /// atomically: a concurrent request sees the old pair or the new one, never
+    /// a mix.
     ///
     /// # Errors
     ///
-    /// Returns [`AppError::InvalidInput`] when the client was built with more
-    /// than one API key, and whatever [`Auth::switch_account`] reports
-    /// otherwise.
-    ///
-    /// Switching is refused with a pool because it cannot be done coherently
-    /// here: each key holds its own session, so switching only the primary
-    /// leaves the other slots authenticated against the previous account and a
-    /// non-trading read could rotate onto one of them and answer for the wrong
-    /// account. Switching all of them instead would spend one request per key —
-    /// 74 of them in this codebase's demo setup — against the very allowance the
-    /// pool exists to protect. The account also keys the shared account-wide
-    /// budget, which would have to move with it. Build a client per account
-    /// instead.
+    /// Returns [`AppError::InvalidInput`] when `default_account` is `Some(true)`
+    /// — making an account the login default is a v2 account-management
+    /// operation this client does not perform, and silently ignoring the flag
+    /// would leave the caller believing it happened — and when a v2 client holds
+    /// more than one API key. Otherwise returns whatever
+    /// [`Auth::switch_account`] reports.
     pub async fn switch_account(
         &self,
         account_id: &str,
         default_account: Option<bool>,
     ) -> Result<(), AppError> {
-        // v3 selects the account per request through the `IG-ACCOUNT-ID`
-        // header, so switching is a local field update costing no request. That
-        // makes it safe to apply to every slot, which is exactly what a pool
-        // needs: leaving the others behind would let a rotated read answer for
-        // the previous account.
-        if self.primary_auth().is_oauth_session().await {
-            for slot in &self.pool {
-                slot.auth
-                    .switch_account(account_id, default_account)
-                    .await?;
-            }
-            return Ok(());
-        }
-
-        // v2 keeps the account in the session itself, re-issued by IG on a
-        // `PUT /session`. Applying that across a pool would spend one request
-        // per key against the allowance the pool exists to protect, and doing
-        // it on one slot only would leave the rest answering for the previous
-        // account.
-        if self.pool.len() > 1 {
+        if default_account == Some(true) {
             return Err(AppError::InvalidInput(
-                "switch_account cannot be applied coherently to a multi-key v2 pool: \
-                 each key holds its own session; use api_version 3, which selects \
-                 the account per request, or build one client per account"
+                "default_account=true is not supported: making an account the \
+                 login default is not performed by this client; pass None or \
+                 Some(false) to switch for this client only"
                     .to_string(),
             ));
         }
-        self.primary_auth()
-            .switch_account(account_id, default_account)
-            .await?;
+
+        // Taken from the configuration, not from a cached session: on a lazy
+        // client nothing has authenticated yet, and asking the session would
+        // classify a v3 pool as v2 and refuse a switch that costs nothing.
+        let is_oauth = self.config.api_version.unwrap_or(2) == 3;
+
+        if !is_oauth {
+            if self.pool.len() > 1 {
+                return Err(AppError::InvalidInput(
+                    "switch_account cannot be applied coherently to a multi-key v2 \
+                     pool: each key holds the account in its own session, so this \
+                     would cost one request per key; use api_version 3, which \
+                     selects the account per request, or build one client per \
+                     account"
+                        .to_string(),
+                ));
+            }
+            // v2 carries the account in the session, so IG has to be told.
+            self.primary_auth()
+                .switch_account(account_id, default_account)
+                .await?;
+        }
+
+        // Both models end here: the account in force, and the bucket metered
+        // against it, are replaced under one lock.
+        let limiter = Self::build_account_limiter(account_id);
+        {
+            let mut guard = match self.selected.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.id = account_id.to_string();
+            guard.limiter = limiter;
+        }
+        debug!(account = %account_id, oauth = is_oauth, "account switched");
         Ok(())
     }
 
@@ -986,6 +1055,19 @@ impl HttpClient {
     /// session this exposes is always one that authenticated.
     pub fn auth(&self) -> &Auth {
         self.primary_auth()
+    }
+
+    /// The account currently in force for every request.
+    ///
+    /// Read under the lock and cloned, so a concurrent switch cannot be observed
+    /// half-applied: a request uses either the previous account with its budget
+    /// or the new one with its own, never one paired with the other's.
+    fn selected_account(&self) -> (String, RateLimiter) {
+        let guard = match self.selected.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (guard.id.clone(), guard.limiter.clone())
     }
 
     /// The `Auth` of the slot currently acting as primary.

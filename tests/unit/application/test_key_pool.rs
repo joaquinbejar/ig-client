@@ -1178,20 +1178,21 @@ async fn test_ready_fallback_becomes_primary_after_the_primary_is_refused() {
     );
 }
 
-/// `switch_account` is refused with a pool rather than silently leaving the
-/// other slots on the previous account.
+/// A **v2** pool refuses the switch: each key keeps the account in its own
+/// session, so applying it would cost one request per key, and applying it to
+/// one slot would leave the rest answering for the previous account.
 #[tokio::test]
-async fn test_switch_account_is_refused_with_a_key_pool() {
+async fn test_v2_switch_account_is_refused_with_a_key_pool() {
     let server = MockServer::start().await;
-    mount_login_ok(&server).await;
+    mount_v2_login(&server, "BS0Y3").await;
 
-    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 20, 1, 20))
+    let client = HttpClient::new_lazy(v2_config(&server.uri(), "key-a,key-b", "BS0Y3"))
         .expect("client builds");
 
     let err = client
         .switch_account("OTHER", Some(false))
         .await
-        .expect_err("switching is refused with a pool");
+        .expect_err("switching is refused for a v2 pool");
     assert!(matches!(err, AppError::InvalidInput(_)), "got {err:?}");
 
     let switches = server
@@ -1199,45 +1200,47 @@ async fn test_switch_account_is_refused_with_a_key_pool() {
         .await
         .unwrap_or_default()
         .iter()
-        .filter(|r| r.url.path() == "/session")
-        .filter(|r| r.method == wiremock::http::Method::PUT)
+        .filter(|r| r.url.path() == "/session" && r.method == wiremock::http::Method::PUT)
         .count();
     assert_eq!(switches, 0, "no key was switched behind the others' backs");
 }
 
-/// A single key is not stopped by the pool guard.
-///
-/// It can still fail for its own reasons — switching is unsupported on OAuth
-/// sessions, which is a pre-existing limitation of `Auth` and unrelated to the
-/// pool — but the refusal must not be `UnsupportedWithKeyPool`.
+/// A **v3** pool switches freely: the account is per request, so there is
+/// nothing per-key to keep consistent and no request to spend.
 #[tokio::test]
-async fn test_switch_account_still_works_with_one_key() {
+async fn test_v3_switch_account_is_allowed_with_a_key_pool() {
     let server = MockServer::start().await;
     mount_login_ok(&server).await;
-    Mock::given(method("PUT"))
-        .and(path("/session"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "trailingStopsEnabled": false,
-            "dealingEnabled": true,
-            "hasActiveDemoAccounts": true,
-            "hasActiveLiveAccounts": false
-        })))
-        .mount(&server)
-        .await;
+    mount_data_ok(&server).await;
 
-    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "only-key", 20, 1, 20))
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 20, 1, 20))
         .expect("client builds");
 
-    let result = client.switch_account("OTHER", Some(false)).await;
-    // The guard reports InvalidInput naming the pool; a single key must fail
-    // for some other reason, or not at all.
-    let hit_pool_guard = matches!(&result, Err(AppError::InvalidInput(m)) if m.contains("pool"));
-    assert!(
-        !hit_pool_guard,
-        "the pool guard did not fire for a single key, got {result:?}"
-    );
+    let before = server.received_requests().await.unwrap_or_default().len();
+    client
+        .switch_account("BSI1I", None)
+        .await
+        .expect("v3 pools switch freely");
+    let after = server.received_requests().await.unwrap_or_default().len();
+
+    assert_eq!(after, before, "the switch cost no HTTP request");
 }
 
+/// A single v2 key is not stopped by the pool guard.
+#[tokio::test]
+async fn test_v2_switch_account_works_with_one_key() {
+    let server = MockServer::start().await;
+    mount_v2_login(&server, "BS0Y3").await;
+    mount_v2_switch(&server, 200).await;
+
+    let client =
+        HttpClient::new_lazy(v2_config(&server.uri(), "only-key", "BS0Y3")).expect("client builds");
+
+    client
+        .switch_account("BSI1I", Some(false))
+        .await
+        .expect("a single v2 key switches");
+}
 /// A v2 session that IG has invalidated is re-authenticated, not reused.
 ///
 /// This is what wedged `ig-categories` in production: IG kills CST /
@@ -1321,43 +1324,266 @@ async fn test_persistent_401_replays_once_and_then_fails() {
     assert_eq!(data, 2, "one replay only, got {data} attempts");
 }
 
-/// On v3, switching accounts costs no request and reaches every key.
+/// A v2 config: CST / X-SECURITY-TOKEN instead of OAuth.
+fn v2_config(base_url: &str, keys: &str, account: &str) -> Config {
+    let mut config = pool_config_burst(base_url, keys, 40, 1, 40);
+    config.api_version = Some(2);
+    config.credentials.account_id = account.to_string();
+    config
+}
+
+/// Mounts a v2 `/session` login that hands out CST / X-SECURITY-TOKEN and
+/// reports `default_account` as the logged-in account.
+async fn mount_v2_login(server: &MockServer, default_account: &str) {
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("CST", "cst-token")
+                .insert_header("X-SECURITY-TOKEN", "xst-original")
+                .set_body_json(serde_json::json!({
+                    "accountType": "CFD",
+                    "accountInfo": {
+                        "balance": 10000.0,
+                        "deposit": 2000.0,
+                        "profitLoss": 150.5,
+                        "available": 8000.0
+                    },
+                    "currencyIsoCode": "EUR",
+                    "currencySymbol": "E",
+                    "currentAccountId": default_account,
+                    "lightstreamerEndpoint": "https://example.invalid",
+                    "accounts": [{
+                        "accountId": default_account,
+                        "accountName": "Default",
+                        "preferred": true,
+                        "accountType": "CFD"
+                    }],
+                    "clientId": "CLIENT-1",
+                    "timezoneOffset": 1,
+                    "hasActiveDemoAccounts": true,
+                    "hasActiveLiveAccounts": false,
+                    "trailingStopsEnabled": false,
+                    "reroutingEnvironment": null,
+                    "dealingEnabled": true
+                })),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Mounts the `PUT /session` account switch, re-issuing X-SECURITY-TOKEN the way
+/// IG does.
+async fn mount_v2_switch(server: &MockServer, status: u16) {
+    let template = if status == 200 {
+        ResponseTemplate::new(200)
+            .insert_header("X-SECURITY-TOKEN", "xst-after-switch")
+            .set_body_json(serde_json::json!({
+                "trailingStopsEnabled": false,
+                "dealingEnabled": true,
+                "hasActiveDemoAccounts": true,
+                "hasActiveLiveAccounts": false
+            }))
+    } else {
+        ResponseTemplate::new(status).set_body_json(serde_json::json!({
+            "errorCode": "error.switch.accountId-must-be-different"
+        }))
+    };
+    Mock::given(method("PUT"))
+        .and(path("/session"))
+        .respond_with(template)
+        .mount(server)
+        .await;
+}
+
+/// The security tokens each `/data` request carried, in order.
+async fn security_tokens(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/data")
+        .map(|r| {
+            r.headers
+                .get("X-SECURITY-TOKEN")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A real v2 session — CST / X-SECURITY-TOKEN, with the configured account
+/// selected through `PUT /session` — recovers when IG invalidates it.
 ///
-/// An OAuth token identifies the client, not an account: the account travels in
-/// the `IG-ACCOUNT-ID` header of each request. So the switch is a local field
-/// update — and because it is free, it can be applied to the whole pool, which
-/// is what stops a rotated read from answering for the previous account.
+/// The replay must go out on the same key and with the *re-issued* tokens.
 #[tokio::test]
-async fn test_v3_switch_account_is_local_and_reaches_every_key() {
+async fn test_v2_invalidated_session_replays_on_same_key_with_new_tokens() {
     let server = MockServer::start().await;
-    mount_login_ok(&server).await;
+    mount_v2_login(&server, "BS0Y3").await;
+    mount_v2_switch(&server, 200).await;
+
+    // First data call is rejected; the replay after re-authentication succeeds.
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "errorCode": "error.security.client-token-invalid"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
     mount_data_ok(&server).await;
 
-    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 4, 10, 2))
-        .expect("client builds");
-
-    // Warm both keys so each holds a session to switch.
-    for _ in 0..8 {
-        let _ = client.get::<Dummy>("/data", Some(1)).await;
-    }
-    let before = server.received_requests().await.unwrap_or_default().len();
+    let client =
+        HttpClient::new_lazy(v2_config(&server.uri(), "key-a", "BSI1I")).expect("client builds");
 
     client
-        .switch_account("BSI1I", Some(false))
+        .get::<Dummy>("/data", Some(1))
         .await
-        .expect("v3 switching is supported and free");
+        .expect("recovered after re-authenticating");
 
-    let after = server.received_requests().await.unwrap_or_default().len();
-    assert_eq!(after, before, "the switch sent no HTTP request at all");
+    let keys = keys_used(&server).await;
+    assert_eq!(keys.len(), 2, "the rejected call plus one replay");
+    assert_eq!(keys[0], keys[1], "the replay stayed on the same key");
 
-    // Every subsequent request must carry the new account, whichever key serves
-    // it.
-    server.reset().await;
-    mount_login_ok(&server).await;
+    let tokens = security_tokens(&server).await;
+    assert_eq!(
+        tokens[1], "xst-after-switch",
+        "the replay used the token re-issued by the switch, got {tokens:?}"
+    );
+
+    let switches = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/session" && r.method == wiremock::http::Method::PUT)
+        .count();
+    assert!(
+        switches >= 2,
+        "the configured account was selected again after the re-login"
+    );
+}
+
+/// With two v2 keys and both sessions dead, the replay must not wander onto the
+/// other key: that key was not re-authenticated, so it would burn the single
+/// replay on a session that is equally invalid.
+#[tokio::test]
+async fn test_v2_replay_does_not_move_to_another_key() {
+    let server = MockServer::start().await;
+    mount_v2_login(&server, "BS0Y3").await;
+    mount_v2_switch(&server, 200).await;
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "errorCode": "error.security.client-token-invalid"
+        })))
+        .mount(&server)
+        .await;
+
+    // Two keys, so a pool switch is refused - but this client never switches:
+    // the account equals the login default, so no PUT is needed.
+    let mut config = v2_config(&server.uri(), "key-a,key-b", "BS0Y3");
+    config.credentials.account_id = "BS0Y3".to_string();
+    let client = HttpClient::new_lazy(config).expect("client builds");
+
+    let err = client
+        .get::<Dummy>("/data", Some(1))
+        .await
+        .expect_err("every attempt is rejected");
+    assert!(matches!(err, AppError::Unauthorized), "got {err:?}");
+
+    let keys = keys_used(&server).await;
+    assert_eq!(keys.len(), 2, "one attempt and one replay, got {keys:?}");
+    assert_eq!(
+        keys[0], keys[1],
+        "the replay stayed on the re-authenticated key, got {keys:?}"
+    );
+}
+
+/// A failed `PUT /session` must not leave the login's default account cached.
+///
+/// Otherwise the next request runs silently against the wrong account, or spins
+/// on 401 — the session and the selected account have to move together.
+#[tokio::test]
+async fn test_v2_failed_switch_leaves_no_usable_session() {
+    let server = MockServer::start().await;
+    mount_v2_login(&server, "BS0Y3").await;
+    mount_v2_switch(&server, 403).await;
     mount_data_ok(&server).await;
-    for _ in 0..6 {
-        let _ = client.get::<Dummy>("/data", Some(1)).await;
-    }
+
+    let client =
+        HttpClient::new_lazy(v2_config(&server.uri(), "key-a", "BSI1I")).expect("client builds");
+
+    let err = client
+        .get::<Dummy>("/data", Some(1))
+        .await
+        .expect_err("the account could not be selected");
+    assert!(
+        !matches!(err, AppError::Unauthorized),
+        "surfaced as {err:?}"
+    );
+
+    // Nothing may have gone out against the login's default account.
+    let data = keys_used(&server).await;
+    assert!(
+        data.is_empty(),
+        "no request ran against the wrong account, got {data:?}"
+    );
+}
+
+/// `default_account = true` is refused rather than silently ignored: making an
+/// account the login default is not something this client does.
+#[tokio::test]
+async fn test_switch_account_rejects_default_account_true() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a", 20, 1, 20))
+        .expect("client builds");
+
+    let err = client
+        .switch_account("BSI1I", Some(true))
+        .await
+        .expect_err("the flag is not silently dropped");
+    assert!(matches!(err, AppError::InvalidInput(_)), "got {err:?}");
+}
+
+/// On v3 the selected account survives a re-login.
+///
+/// The session is rebuilt from IG's response, which reports the login's default
+/// account, so an account kept inside the session would be silently undone by
+/// any refresh or 401 recovery.
+#[tokio::test]
+async fn test_v3_selected_account_survives_reauthentication() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+
+    // One rejection forces a re-login mid-flight.
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "errorCode": "error.security.client-token-invalid"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_data_ok(&server).await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 20, 1, 20))
+        .expect("client builds");
+
+    client
+        .switch_account("BSI1I", None)
+        .await
+        .expect("v3 switching is free");
+
+    // This request is rejected once, re-authenticates, and replays.
+    client
+        .get::<Dummy>("/data", Some(1))
+        .await
+        .expect("recovered");
 
     let accounts: std::collections::HashSet<String> = server
         .received_requests()
@@ -1373,10 +1599,50 @@ async fn test_v3_switch_account_is_local_and_reaches_every_key() {
         })
         .collect();
 
-    assert!(!accounts.is_empty(), "requests carried an account header");
     assert_eq!(
         accounts,
         std::iter::once("BSI1I".to_string()).collect(),
-        "every key switched, got {accounts:?}"
+        "every request kept the selected account across the re-login, got {accounts:?}"
+    );
+}
+
+/// Switching accounts also switches the account-wide budget: the new account
+/// must not inherit what the previous one had already spent.
+#[tokio::test]
+async fn test_switching_accounts_switches_the_account_budget() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let mut config = pool_config_burst(&server.uri(), "key-a", 100, 60, 100);
+    config.credentials.account_id = "BUDGET-A".to_string();
+    let client = HttpClient::new_lazy(config).expect("client builds");
+
+    // Drain a few tokens from account A's bucket.
+    for _ in 0..3 {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get::<Dummy>("/data", Some(1)),
+        )
+        .await;
+    }
+
+    client
+        .switch_account("BUDGET-B", None)
+        .await
+        .expect("switch succeeds");
+
+    // A fresh account starts with a full bucket, so this goes out promptly
+    // rather than waiting on the previous account's spent allowance.
+    let started = Instant::now();
+    let served = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.get::<Dummy>("/data", Some(1)),
+    )
+    .await;
+    assert!(
+        served.is_ok(),
+        "the new account had its own budget, waited {:?}",
+        started.elapsed()
     );
 }
