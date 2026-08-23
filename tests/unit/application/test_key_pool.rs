@@ -1646,3 +1646,30 @@ async fn test_switching_accounts_switches_the_account_budget() {
         started.elapsed()
     );
 }
+
+/// `Client` exposes the account switch, so a service holding one client per IG
+/// login can reach that login's other accounts without reaching for internals.
+#[tokio::test]
+async fn test_client_exposes_switch_account() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let client = ig_client::application::client::Client::with_config(pool_config_burst(
+        &server.uri(),
+        "key-a",
+        20,
+        1,
+        20,
+    ))
+    .expect("client builds");
+
+    let before = server.received_requests().await.unwrap_or_default().len();
+    client
+        .switch_account("BSI1I", None)
+        .await
+        .expect("v3 switching is supported through Client");
+    let after = server.received_requests().await.unwrap_or_default().len();
+
+    assert_eq!(after, before, "the switch cost no HTTP request");
+}

@@ -264,6 +264,31 @@ impl Client {
         self.http_client.config()
     }
 
+    /// Switches every subsequent request to a different trading account.
+    ///
+    /// Delegates to [`HttpClient::switch_account`]. A service holding one client
+    /// per IG login needs this to reach that login's other accounts: on v3 the
+    /// account is chosen per request through `IG-ACCOUNT-ID`, so switching costs
+    /// no request and does not disturb the session or the key pool. On v2 the
+    /// account lives in the session and IG is asked to change it.
+    ///
+    /// It mutates client-wide state, so a caller serving several accounts
+    /// concurrently must serialise the switch with the request that follows it.
+    ///
+    /// # Errors
+    /// Returns whatever [`HttpClient::switch_account`] reports: notably
+    /// [`AppError::InvalidInput`] for `default_account = true`, or for a
+    /// multi-key v2 pool where switching would cost one request per key.
+    pub async fn switch_account(
+        &self,
+        account_id: &str,
+        default_account: Option<bool>,
+    ) -> Result<(), AppError> {
+        self.http_client
+            .switch_account(account_id, default_account)
+            .await
+    }
+
     /// Gets WebSocket connection information for Lightstreamer, reusing the
     /// cached session.
     ///
