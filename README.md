@@ -117,6 +117,26 @@ collects logs through the `log` facade.
 
 ### Configuration
 
+### API key pool
+
+IG meters its non-trading allowance **per API key**, so several keys on the same
+account give you several independent budgets. Pass them as a comma-separated
+list and the client spreads requests across them:
+
+```
+IG_API_KEY=key1,key2,key3
+```
+
+Each key gets its own session and its own rate-limiter budget, and every request
+is served by the key with spare capacity. If IG still rejects one for exceeding
+its allowance, that key is parked for a minute and the request is retried
+immediately on another instead of waiting out a backoff.
+
+A single key (no comma) behaves exactly as before.
+
+Note that the trading allowance is metered per *account*, not per key, so the
+pool raises throughput for market data — not for order placement.
+
 `Config::new()` reads configuration from the environment (and a local `.env`
 file, if present). Create a `.env` file in your project root with the
 following variables:
@@ -124,14 +144,14 @@ following variables:
 ```
 IG_USERNAME=your_username
 IG_PASSWORD=your_password
-IG_API_KEY=your_api_key
+IG_API_KEY=your_api_key                            # or a comma-separated pool: key1,key2,key3
 IG_ACCOUNT_ID=your_account_id
 IG_API_VERSION=3                                   # 2 (CST/XST) or 3 (OAuth); defaults to 3
 IG_REST_BASE_URL=https://demo-api.ig.com/gateway/deal   # Use demo or live as needed
 IG_REST_TIMEOUT=30                                 # REST request timeout in seconds
 IG_WS_URL=wss://demo-apd.marketdatasystems.com     # Lightstreamer endpoint
 IG_WS_RECONNECT_INTERVAL=5                         # Reconnect interval in seconds
-IG_RATE_LIMIT_MAX_REQUESTS=4                       # Rate-limiter budget
+IG_RATE_LIMIT_MAX_REQUESTS=4                       # Rate-limiter budget, applied per API key
 IG_RATE_LIMIT_PERIOD_SECONDS=12                    # Rate-limiter period (seconds)
 IG_RATE_LIMIT_BURST_SIZE=3                         # Rate-limiter burst size
 DATABASE_URL=postgres://user:password@localhost/ig_db   # Optional persistence

@@ -264,6 +264,27 @@ impl Credentials {
             account_token: None,
         }
     }
+
+    /// Splits [`api_key`](Self::api_key) into the individual keys of a pool.
+    ///
+    /// IG enforces its non-trading allowance **per API key**, so a caller that
+    /// owns several keys on the same account can raise its aggregate throughput
+    /// by spreading requests across them. To express that, `api_key` accepts a
+    /// comma-separated list; a single key (no comma) yields a one-element pool,
+    /// which is the historical behaviour.
+    ///
+    /// Empty entries and surrounding whitespace are discarded, so
+    /// `"a, b, ,c,"` yields `["a", "b", "c"]`. When the field holds nothing
+    /// usable the result is empty and the caller decides how to fail.
+    #[must_use]
+    pub fn api_keys(&self) -> Vec<String> {
+        self.api_key
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(String::from)
+            .collect()
+    }
 }
 
 impl Default for Config {
@@ -626,5 +647,29 @@ mod redaction_tests {
             }
             assert!(rendered.contains("<redacted>"));
         }
+    }
+
+    #[test]
+    fn test_api_keys_single_key_yields_one_element_pool() {
+        let c = Credentials::new("u".into(), "p".into(), "ACC".into(), "abc123".into());
+        assert_eq!(c.api_keys(), vec!["abc123".to_string()]);
+    }
+
+    #[test]
+    fn test_api_keys_comma_separated_list_yields_pool() {
+        let c = Credentials::new("u".into(), "p".into(), "ACC".into(), "a,b,c".into());
+        assert_eq!(c.api_keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn test_api_keys_trims_whitespace_and_drops_empty_entries() {
+        let c = Credentials::new("u".into(), "p".into(), "ACC".into(), " a , b , ,c, ".into());
+        assert_eq!(c.api_keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn test_api_keys_blank_value_yields_empty_pool() {
+        let c = Credentials::new("u".into(), "p".into(), "ACC".into(), "  ,  ".into());
+        assert!(c.api_keys().is_empty());
     }
 }

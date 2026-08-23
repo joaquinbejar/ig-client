@@ -22,7 +22,8 @@ use reqwest::Client as HttpInternalClient;
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 /// Simplified client for IG Markets API with automatic authentication
@@ -37,11 +38,64 @@ pub struct HttpClient {
     auth: Arc<Auth>,
     http_client: HttpInternalClient,
     config: Arc<Config>,
-    // `RateLimiter` is `Clone` and already wraps each governor bucket in an
-    // `Arc`, so it is stored directly: the limiter is configured once and never
-    // write-swapped, so an outer `RwLock` would only add an allocation and an
-    // await point (a read guard held across the pacing sleep) for no benefit.
+    /// One entry per API key in the pool. `pool[0]` owns the same [`Auth`] and
+    /// [`RateLimiter`] as the fields above, so a single-key configuration keeps
+    /// the historical behaviour exactly.
+    pool: Vec<KeySlot>,
+}
+
+/// One API key of the pool, with the session and pacing budget that belong to it.
+///
+/// IG meters its non-trading allowance **per API key**, so each key needs both
+/// its own session (`CST` / `X-SECURITY-TOKEN` are issued per key) and its own
+/// rate limiter. Sharing either across keys would defeat the point: a single
+/// bucket would pace the whole pool at one key's rate.
+struct KeySlot {
+    api_key: String,
+    auth: Arc<Auth>,
     rate_limiter: RateLimiter,
+    /// Set when IG rejects this key with an allowance error; the slot is skipped
+    /// until the instant passes, so the pool stops handing work to a key that
+    /// has already told us it is empty.
+    cooldown_until: Arc<StdMutex<Option<Instant>>>,
+}
+
+/// How long a key is skipped after IG rejects it for exceeding its allowance.
+///
+/// The observed bucket refills at roughly its sustained rate, so a minute is
+/// enough for a saturated key to become useful again without parking it for so
+/// long that the pool shrinks under sustained load.
+const KEY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Renders an API key for logs as its first eight characters.
+///
+/// Enough to tell the pool's keys apart when reading a trace, never enough to
+/// use: an API key is a secret and must not reach the logs in full.
+fn redact_key(api_key: &str) -> String {
+    let head: String = api_key.chars().take(8).collect();
+    format!("{head}…")
+}
+
+impl KeySlot {
+    /// Whether this slot is currently skipped because IG rejected its key.
+    fn in_cooldown(&self) -> bool {
+        let guard = match self.cooldown_until.lock() {
+            Ok(g) => g,
+            // A poisoned mutex only ever held an `Option<Instant>`, so treating
+            // the slot as available is safe and keeps the pool usable.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Marks the key as exhausted for [`KEY_COOLDOWN`].
+    fn mark_exhausted(&self) {
+        let until = Instant::now() + KEY_COOLDOWN;
+        match self.cooldown_until.lock() {
+            Ok(mut g) => *g = Some(until),
+            Err(poisoned) => *poisoned.into_inner() = Some(until),
+        }
+    }
 }
 
 impl HttpClient {
@@ -74,11 +128,13 @@ impl HttpClient {
         // Perform initial login
         auth.login().await?;
 
+        let pool = Self::build_pool(&config, &auth, &rate_limiter)?;
+
         Ok(Self {
             auth,
             http_client,
             config,
-            rate_limiter,
+            pool,
         })
     }
 
@@ -99,12 +155,86 @@ impl HttpClient {
         // `new_lazy` path (and `Client::try_new` built on it) never panics.
         let auth = Arc::new(Auth::try_new(config.clone())?);
 
+        let pool = Self::build_pool(&config, &auth, &rate_limiter)?;
+
         Ok(Self {
             auth,
             http_client,
             config,
-            rate_limiter,
+            pool,
         })
+    }
+
+    /// Builds one [`KeySlot`] per API key declared in the configuration.
+    ///
+    /// The first slot reuses the caller's [`Auth`] and [`RateLimiter`] so a
+    /// single-key setup keeps its existing session and pacing untouched. Every
+    /// additional key gets a cloned `Config` carrying only that key, hence its
+    /// own session and its own budget.
+    ///
+    /// # Errors
+    /// Returns [`AppError::Network`] if an extra key's [`Auth`] cannot be built.
+    fn build_pool(
+        config: &Arc<Config>,
+        auth: &Arc<Auth>,
+        rate_limiter: &RateLimiter,
+    ) -> Result<Vec<KeySlot>, AppError> {
+        let keys = config.credentials.api_keys();
+
+        let first = KeySlot {
+            api_key: keys
+                .first()
+                .cloned()
+                .unwrap_or_else(|| config.credentials.api_key.clone()),
+            auth: auth.clone(),
+            rate_limiter: rate_limiter.clone(),
+            cooldown_until: Arc::new(StdMutex::new(None)),
+        };
+
+        let mut pool = Vec::with_capacity(keys.len().max(1));
+        pool.push(first);
+
+        for key in keys.iter().skip(1) {
+            let mut key_config = (**config).clone();
+            key_config.credentials.api_key = key.clone();
+            let key_config = Arc::new(key_config);
+
+            pool.push(KeySlot {
+                api_key: key.clone(),
+                rate_limiter: RateLimiter::new(&key_config.rate_limiter),
+                auth: Arc::new(Auth::try_new(key_config)?),
+                cooldown_until: Arc::new(StdMutex::new(None)),
+            });
+        }
+
+        if pool.len() > 1 {
+            debug!(keys = pool.len(), "API key pool enabled");
+        }
+        Ok(pool)
+    }
+
+    /// Picks the slot to serve the next request.
+    ///
+    /// Prefers a key that is neither cooling down nor out of local tokens, so
+    /// requests spread across the pool and the allowance error never happens in
+    /// the first place. Falls back to any key not yet tried for this request
+    /// (it will simply wait on its limiter), and finally to the first slot.
+    fn select_slot(&self, class: RateLimitClass, tried: &[usize]) -> usize {
+        let fresh = |i: &usize| !tried.contains(i);
+
+        if let Some(i) = (0..self.pool.len())
+            .filter(fresh)
+            .find(|&i| !self.pool[i].in_cooldown() && self.pool[i].rate_limiter.check_for(class))
+        {
+            return i;
+        }
+        if let Some(i) = (0..self.pool.len())
+            .filter(fresh)
+            .find(|&i| !self.pool[i].in_cooldown())
+        {
+            return i;
+        }
+        (0..self.pool.len()).find(fresh).unwrap_or(0)
     }
 
     /// Gets WebSocket connection information for Lightstreamer, reusing the
@@ -272,8 +402,6 @@ impl HttpClient {
         version: Option<u8>,
         extra_headers: &[(&str, &str)],
     ) -> Result<Response, AppError> {
-        let session = self.auth.get_session().await?;
-
         let url = if path.starts_with("http") {
             path.to_string()
         } else {
@@ -281,14 +409,68 @@ impl HttpClient {
             format!("{}/{}", self.config.rest_api.base_url, path)
         };
 
+        let class = classify_endpoint(&method, path);
+        let mut tried: Vec<usize> = Vec::with_capacity(self.pool.len());
+
+        loop {
+            let idx = self.select_slot(class, &tried);
+            tried.push(idx);
+            let slot = &self.pool[idx];
+
+            // With more than one key left to try, a rejected request is cheaper
+            // to move to another key than to wait out this one's backoff, so the
+            // per-request retry budget is dropped and rotation handles it.
+            let rotate = tried.len() < self.pool.len();
+            let retry = if rotate {
+                RetryConfig {
+                    max_retry_count: Some(0),
+                    retry_delay_secs: None,
+                }
+            } else {
+                RetryConfig::default()
+            };
+
+            let result = self
+                .request_on_slot(slot, &method, &url, body, version, extra_headers, retry)
+                .await;
+
+            match result {
+                Err(AppError::RateLimitExceeded) if rotate => {
+                    slot.mark_exhausted();
+                    warn!(
+                        key = %redact_key(&slot.api_key),
+                        next_of = self.pool.len(),
+                        "API key allowance exhausted, rotating to another key"
+                    );
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Issues one request through a specific key slot: its session, its API key
+    /// and its own rate-limiter budget.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_on_slot<B: Serialize>(
+        &self,
+        slot: &KeySlot,
+        method: &Method,
+        url: &str,
+        body: &Option<B>,
+        version: Option<u8>,
+        extra_headers: &[(&str, &str)],
+        retry: RetryConfig,
+    ) -> Result<Response, AppError> {
+        let session = slot.auth.get_session().await?;
+
         let version_owned = version.unwrap_or(1).to_string();
         let auth_header_value;
 
-        // Borrow directly from `self.config` and the owned `session`, both of
-        // which outlive this function, so no api_key / cst / token clone is
-        // needed to build the header tuples.
+        // Borrow from the slot and the owned `session`, both of which outlive
+        // this function, so no api_key / cst / token clone is needed to build
+        // the header tuples.
         let mut headers = vec![
-            ("X-IG-API-KEY", self.config.credentials.api_key.as_str()),
+            ("X-IG-API-KEY", slot.api_key.as_str()),
             ("Content-Type", "application/json; charset=UTF-8"),
             ("Accept", "application/json; charset=UTF-8"),
             ("Version", version_owned.as_str()),
@@ -306,12 +488,12 @@ impl HttpClient {
 
         make_http_request(
             &self.http_client,
-            &self.rate_limiter,
-            method,
-            &url,
+            &slot.rate_limiter,
+            method.clone(),
+            url,
             headers,
             body,
-            RetryConfig::default(),
+            retry,
         )
         .await
     }
@@ -681,7 +863,11 @@ pub(crate) fn classify_endpoint(method: &Method, path: &str) -> RateLimitClass {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatusClass, classify_endpoint, classify_status};
+    use super::{
+        Arc, Auth, Config, Duration, Instant, KeySlot, RateLimiter, StatusClass, StdMutex,
+        classify_endpoint, classify_status, redact_key,
+    };
+    use crate::application::config::Credentials;
     use crate::application::rate_limiter::RateLimitClass;
     use reqwest::{Method, StatusCode};
 
@@ -919,5 +1105,47 @@ mod tests {
             !msg.contains(SECRET),
             "session errors must never leak token material: {msg}"
         );
+    }
+
+    #[test]
+    fn test_redact_key_shows_only_a_prefix() {
+        let key = "6cb0ae4d738dcf918fa47157858fc0ea11290a5b";
+        let shown = redact_key(key);
+        assert_eq!(shown, "6cb0ae4d…");
+        assert!(!shown.contains("738dcf91"), "the key body must never be logged");
+    }
+
+    #[test]
+    fn test_redact_key_handles_short_and_empty_keys() {
+        assert_eq!(redact_key("abc"), "abc…");
+        assert_eq!(redact_key(""), "…");
+    }
+
+    fn slot(api_key: &str) -> KeySlot {
+        let config = Arc::new(Config::from_credentials(Credentials::new(
+            "user".into(),
+            "pass".into(),
+            "ACC".into(),
+            api_key.into(),
+        )));
+        KeySlot {
+            api_key: api_key.to_string(),
+            rate_limiter: RateLimiter::new(&config.rate_limiter),
+            auth: Arc::new(Auth::try_new(config).expect("auth builds in tests")),
+            cooldown_until: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn test_key_slot_cooldown_marks_and_expires() {
+        let s = slot("key-a");
+        assert!(!s.in_cooldown(), "a fresh slot is available");
+
+        s.mark_exhausted();
+        assert!(s.in_cooldown(), "a rejected key is skipped");
+
+        // Simulate the cooldown having elapsed.
+        *s.cooldown_until.lock().expect("lock") = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!s.in_cooldown(), "the key returns to the pool once it refills");
     }
 }
