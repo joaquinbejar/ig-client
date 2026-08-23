@@ -167,13 +167,6 @@ pub enum AppError {
     /// Trading traffic stays pinned to one key, so this never rotates.
     #[error("account trading allowance exceeded")]
     TradingAllowanceExceeded,
-    /// The operation cannot be applied coherently to a multi-key pool.
-    ///
-    /// Some operations are per-session, and a pool holds one session per key.
-    /// Applying them to a single slot would leave the rest inconsistent, and
-    /// applying them to all would cost one request per key.
-    #[error("unsupported with an API key pool: {0}")]
-    UnsupportedWithKeyPool(String),
     /// Historical data allowance exhausted (weekly quota of data points)
     ///
     /// The `allowance_expiry` field indicates the number of seconds

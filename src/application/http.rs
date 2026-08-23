@@ -469,6 +469,11 @@ impl HttpClient {
                 continue;
             }
             if slot.rate_limiter.try_reserve(class) {
+                // An already-authenticated key is just as valid a primary as one
+                // that had to log in. Promoting only in pass 2 left trading and
+                // streaming pointing at a parked primary whenever the fallback
+                // happened to hold a session already.
+                self.promote_primary_if_needed(i);
                 return Ok(Some(i));
             }
         }
@@ -903,9 +908,9 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AppError::UnsupportedWithKeyPool`] when the client was built
-    /// with more than one API key, and whatever [`Auth::switch_account`]
-    /// reports otherwise.
+    /// Returns [`AppError::InvalidInput`] when the client was built with more
+    /// than one API key, and whatever [`Auth::switch_account`] reports
+    /// otherwise.
     ///
     /// Switching is refused with a pool because it cannot be done coherently
     /// here: each key holds its own session, so switching only the primary
@@ -922,9 +927,10 @@ impl HttpClient {
         default_account: Option<bool>,
     ) -> Result<(), AppError> {
         if self.pool.len() > 1 {
-            return Err(AppError::UnsupportedWithKeyPool(
-                "switch_account cannot be applied coherently to a multi-key pool; \
-                 build one client per account"
+            return Err(AppError::InvalidInput(
+                "switch_account cannot be applied coherently to a multi-key pool: \
+                 each key holds its own session and the account keys the shared \
+                 account-wide budget; build one client per account"
                     .to_string(),
             ));
         }

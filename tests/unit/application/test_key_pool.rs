@@ -1088,6 +1088,96 @@ async fn test_lazy_client_moves_the_primary_to_the_key_that_authenticates() {
     );
 }
 
+/// A fallback that was *already authenticated* also takes over as primary.
+///
+/// The first selection pass returns a key that holds both a session and a
+/// token, which is the common case once the pool is warm. Promoting only in the
+/// second pass left trading and streaming pointing at a primary IG had just
+/// refused, because a warm fallback never needs to log in and so never reaches
+/// that pass.
+#[tokio::test]
+async fn test_ready_fallback_becomes_primary_after_the_primary_is_refused() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    // A tight per-key budget is what makes the second key get used at all: with
+    // spare capacity the pool keeps serving from the first, which is correct but
+    // leaves the fallback cold and the first pass untested.
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 4, 10, 2))
+        .expect("client builds");
+
+    // Warm both keys with no refusals at all, so each holds a session and the
+    // selection below resolves entirely in the first pass.
+    let mut logins = 0;
+    for _ in 0..8 {
+        let _ = client.get::<Dummy>("/data", Some(1)).await;
+        logins = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/session")
+            .count();
+        if logins >= 2 {
+            break;
+        }
+    }
+    assert_eq!(logins, 2, "both keys authenticated during the warm-up");
+
+    // Only now start refusing key-a, the initial primary. Resetting first keeps
+    // the 403 ahead of the catch-all data mock; the sessions live in the client
+    // and survive it.
+    server.reset().await;
+    mount_login_ok(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/data"))
+        .and(wiremock::matchers::header("X-IG-API-KEY", "key-a"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "errorCode": "error.public-api.exceeded-api-key-allowance"
+        })))
+        .mount(&server)
+        .await;
+    mount_data_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/positions/otc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    // Drive reads until key-a is refused and the pool falls back to key-b,
+    // which is already authenticated - so this resolves in the first pass.
+    for _ in 0..4 {
+        let _ = client.get::<Dummy>("/data", Some(1)).await;
+    }
+
+    // Trading pins to the primary, so the order shows where the primary is.
+    client
+        .post::<_, Dummy>("/positions/otc", serde_json::json!({}), Some(2))
+        .await
+        .expect("order accepted");
+
+    let order_key = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/positions/otc")
+        .filter_map(|r| {
+            r.headers
+                .get("X-IG-API-KEY")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .next_back()
+        .expect("an order was sent");
+
+    assert_eq!(
+        order_key, "key-b",
+        "trading followed the primary onto the key IG did not refuse"
+    );
+}
+
 /// `switch_account` is refused with a pool rather than silently leaving the
 /// other slots on the previous account.
 #[tokio::test]
@@ -1102,10 +1192,7 @@ async fn test_switch_account_is_refused_with_a_key_pool() {
         .switch_account("OTHER", Some(false))
         .await
         .expect_err("switching is refused with a pool");
-    assert!(
-        matches!(err, AppError::UnsupportedWithKeyPool(_)),
-        "got {err:?}"
-    );
+    assert!(matches!(err, AppError::InvalidInput(_)), "got {err:?}");
 
     let switches = server
         .received_requests()
@@ -1142,8 +1229,11 @@ async fn test_switch_account_still_works_with_one_key() {
         .expect("client builds");
 
     let result = client.switch_account("OTHER", Some(false)).await;
+    // The guard reports InvalidInput naming the pool; a single key must fail
+    // for some other reason, or not at all.
+    let hit_pool_guard = matches!(&result, Err(AppError::InvalidInput(m)) if m.contains("pool"));
     assert!(
-        !matches!(result, Err(AppError::UnsupportedWithKeyPool(_))),
+        !hit_pool_guard,
         "the pool guard did not fire for a single key, got {result:?}"
     );
 }
