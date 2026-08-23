@@ -55,11 +55,12 @@ pub struct HttpClient {
     /// The slot whose session this client exposes, and the one trading is
     /// pinned to.
     ///
-    /// Normally 0. It moves when construction had to rotate because the first
-    /// key could not authenticate: pointing `auth`, `ws_info` and order traffic
-    /// at a key that failed to log in would break exactly the paths that cannot
-    /// retry elsewhere.
-    primary: usize,
+    /// Starts at 0 and moves whenever that key turns out to be unusable — at
+    /// construction, or later, on the lazy path where the first login only
+    /// happens when a request arrives. Pointing `auth`, `ws_info` and order
+    /// traffic at a key that cannot log in would break exactly the paths that
+    /// have no second key to fall back on.
+    primary: AtomicUsize,
     /// Round-robin starting point for slot selection.
     ///
     /// Without it every caller scans the pool from index 0, so concurrent
@@ -207,7 +208,7 @@ impl HttpClient {
             .user_agent(USER_AGENT)
             .build()?;
         // Build the pool first: every slot owns a single-key `Config`, so the
-        // client's own `Auth` is slot 0's rather than one built from the raw
+        // client's own `Auth` is the primary slot's rather than one built from the raw
         // config, whose `api_key` may be the whole comma-separated list.
         let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
         let (auth, pool) = Self::build_pool(&config, &account_limiter)?;
@@ -227,7 +228,7 @@ impl HttpClient {
             config,
             pool,
             account_limiter,
-            primary,
+            primary: AtomicUsize::new(primary),
             cursor: AtomicUsize::new(0),
         })
     }
@@ -254,7 +255,7 @@ impl HttpClient {
             config,
             pool,
             account_limiter,
-            primary: 0,
+            primary: AtomicUsize::new(0),
             cursor: AtomicUsize::new(0),
         })
     }
@@ -412,8 +413,8 @@ impl HttpClient {
     /// Trading never spreads. Order traffic is metered against the account, so
     /// rotating buys nothing, and keeping it on one key keeps a position's
     /// requests inside one session — which is what makes a reconciliation
-    /// possible. Trading therefore always uses slot 0 and does not touch the
-    /// cursor.
+    /// possible. Trading therefore always uses the primary slot and does not
+    /// touch the cursor.
     ///
     /// For everything else, selection starts at a shared round-robin cursor so
     /// concurrent callers walk the pool from different points instead of piling
@@ -441,7 +442,7 @@ impl HttpClient {
         // Trading stays pinned to one slot, so two consecutive orders always
         // travel on the same key and the same session.
         if class == RateLimitClass::Trading {
-            let primary = self.primary.min(self.pool.len().saturating_sub(1));
+            let primary = self.primary_index();
             if tried.contains(&primary) {
                 return Ok(None);
             }
@@ -492,6 +493,11 @@ impl HttpClient {
                 }
                 Err(e) => return Err(e),
             }
+            // This key just proved it can authenticate. If the incumbent primary
+            // cannot, hand it over: on the lazy path this is the only moment the
+            // client learns which key works, and trading and streaming follow
+            // the primary.
+            self.promote_primary_if_needed(i);
             if slot.rate_limiter.try_reserve(class) {
                 return Ok(Some(i));
             }
@@ -556,6 +562,7 @@ impl HttpClient {
         // it. Establishing the session earlier is not possible: which key wins
         // is only known once one refills.
         self.pool[winner].auth.get_session().await?;
+        self.promote_primary_if_needed(winner);
         Ok(Some(winner))
     }
 
@@ -573,7 +580,7 @@ impl HttpClient {
     /// # Errors
     /// Returns [`AppError`] when the session cannot be retrieved.
     pub async fn ws_info(&self) -> Result<WebsocketInfo, AppError> {
-        self.auth.ws_info().await
+        self.primary_auth().ws_info().await
     }
 
     /// Gets WebSocket connection information for Lightstreamer
@@ -892,13 +899,36 @@ impl HttpClient {
         })
     }
 
-    /// Switches to a different trading account
+    /// Switches to a different trading account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::UnsupportedWithKeyPool`] when the client was built
+    /// with more than one API key, and whatever [`Auth::switch_account`]
+    /// reports otherwise.
+    ///
+    /// Switching is refused with a pool because it cannot be done coherently
+    /// here: each key holds its own session, so switching only the primary
+    /// leaves the other slots authenticated against the previous account and a
+    /// non-trading read could rotate onto one of them and answer for the wrong
+    /// account. Switching all of them instead would spend one request per key —
+    /// 74 of them in this codebase's demo setup — against the very allowance the
+    /// pool exists to protect. The account also keys the shared account-wide
+    /// budget, which would have to move with it. Build a client per account
+    /// instead.
     pub async fn switch_account(
         &self,
         account_id: &str,
         default_account: Option<bool>,
     ) -> Result<(), AppError> {
-        self.auth
+        if self.pool.len() > 1 {
+            return Err(AppError::UnsupportedWithKeyPool(
+                "switch_account cannot be applied coherently to a multi-key pool; \
+                 build one client per account"
+                    .to_string(),
+            ));
+        }
+        self.primary_auth()
             .switch_account(account_id, default_account)
             .await?;
         Ok(())
@@ -906,17 +936,60 @@ impl HttpClient {
 
     /// Gets the current session
     pub async fn get_session(&self) -> Result<Session, AppError> {
-        self.auth.get_session().await
+        self.primary_auth().get_session().await
     }
 
     /// Logs out
     pub async fn logout(&self) -> Result<(), AppError> {
-        self.auth.logout().await
+        self.primary_auth().logout().await
     }
 
     /// Gets Auth reference
+    ///
+    /// This is the primary slot's `Auth`, which moves with the primary: the
+    /// session this exposes is always one that authenticated.
     pub fn auth(&self) -> &Auth {
-        &self.auth
+        self.primary_auth()
+    }
+
+    /// The `Auth` of the slot currently acting as primary.
+    fn primary_auth(&self) -> &Arc<Auth> {
+        let index = self.primary_index();
+        self.pool.get(index).map_or(&self.auth, |slot| &slot.auth)
+    }
+
+    /// The primary slot's index, clamped to the pool.
+    fn primary_index(&self) -> usize {
+        self.primary
+            .load(Ordering::Relaxed)
+            .min(self.pool.len().saturating_sub(1))
+    }
+
+    /// Moves the primary onto `index` when the current one cannot serve.
+    ///
+    /// The lazy constructors cannot know which key will authenticate — the
+    /// first login happens when a request arrives — so the primary is settled
+    /// then: the first slot that proves usable takes over if the incumbent is
+    /// parked. Without this, `ws_info`, streaming and trading would keep
+    /// pointing at a key that failed to log in.
+    fn promote_primary_if_needed(&self, index: usize) {
+        let current = self.primary_index();
+        if current == index {
+            return;
+        }
+        let incumbent_usable = self
+            .pool
+            .get(current)
+            .is_some_and(|slot| !slot.in_cooldown());
+        if !incumbent_usable {
+            self.primary.store(index, Ordering::Relaxed);
+            if let Some(slot) = self.pool.get(index) {
+                debug!(
+                    key = %redact_key(&slot.api_key),
+                    "primary key moved to a key that can authenticate"
+                );
+            }
+        }
     }
 
     /// Returns the configuration this HTTP client was built with.

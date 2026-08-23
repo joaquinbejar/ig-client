@@ -149,8 +149,8 @@ distinct because they call for different responses:
 | `RateLimitExceeded` | a bare 429 with no allowance body | not read as a per-key rejection |
 
 Rotation is enabled for non-trading REST only. Creating, amending and closing
-orders stay pinned to slot 0, so consecutive orders travel on one key and one
-session: that traffic is metered against the account, so moving it buys nothing
+orders stay pinned to the primary slot — the key whose session the client
+exposes — so consecutive orders travel on one key and one session: that traffic is metered against the account, so moving it buys nothing
 and would scatter order history across sessions.
 
 On top of the per-key budgets the pool paces against an account-wide one, fixed

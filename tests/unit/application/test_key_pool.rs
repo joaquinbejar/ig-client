@@ -1025,3 +1025,125 @@ async fn test_new_fails_when_no_key_can_authenticate() {
         ),
     }
 }
+
+/// The lazy path settles the primary too.
+///
+/// `Client::try_new` and `Client::with_config` build lazily, so the first login
+/// happens when a request arrives rather than at construction. If the first key
+/// is refused then, the primary has to move with it — otherwise trading and
+/// streaming keep pointing at the key that could not authenticate.
+#[tokio::test]
+async fn test_lazy_client_moves_the_primary_to_the_key_that_authenticates() {
+    let server = MockServer::start().await;
+
+    // key-a is refused at login; key-b authenticates.
+    Mock::given(method("POST"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "errorCode": "error.public-api.exceeded-api-key-allowance"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/positions/otc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 20, 1, 20))
+        .expect("client builds");
+
+    // A non-trading read triggers the first login and the rotation.
+    client
+        .get::<Dummy>("/data", Some(1))
+        .await
+        .expect("read served");
+
+    // Trading pins to the primary. It must have followed the rotation.
+    client
+        .post::<_, Dummy>("/positions/otc", serde_json::json!({}), Some(2))
+        .await
+        .expect("order accepted");
+
+    let order_key = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/positions/otc")
+        .filter_map(|r| {
+            r.headers
+                .get("X-IG-API-KEY")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .next_back()
+        .expect("an order was sent");
+    assert_eq!(
+        order_key, "key-b",
+        "the primary followed the key that authenticated on the lazy path"
+    );
+}
+
+/// `switch_account` is refused with a pool rather than silently leaving the
+/// other slots on the previous account.
+#[tokio::test]
+async fn test_switch_account_is_refused_with_a_key_pool() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 20, 1, 20))
+        .expect("client builds");
+
+    let err = client
+        .switch_account("OTHER", Some(false))
+        .await
+        .expect_err("switching is refused with a pool");
+    assert!(
+        matches!(err, AppError::UnsupportedWithKeyPool(_)),
+        "got {err:?}"
+    );
+
+    let switches = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/session")
+        .filter(|r| r.method == wiremock::http::Method::PUT)
+        .count();
+    assert_eq!(switches, 0, "no key was switched behind the others' backs");
+}
+
+/// A single key is not stopped by the pool guard.
+///
+/// It can still fail for its own reasons — switching is unsupported on OAuth
+/// sessions, which is a pre-existing limitation of `Auth` and unrelated to the
+/// pool — but the refusal must not be `UnsupportedWithKeyPool`.
+#[tokio::test]
+async fn test_switch_account_still_works_with_one_key() {
+    let server = MockServer::start().await;
+    mount_login_ok(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "trailingStopsEnabled": false,
+            "dealingEnabled": true,
+            "hasActiveDemoAccounts": true,
+            "hasActiveLiveAccounts": false
+        })))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "only-key", 20, 1, 20))
+        .expect("client builds");
+
+    let result = client.switch_account("OTHER", Some(false)).await;
+    assert!(
+        !matches!(result, Err(AppError::UnsupportedWithKeyPool(_))),
+        "the pool guard did not fire for a single key, got {result:?}"
+    );
+}
