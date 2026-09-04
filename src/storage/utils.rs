@@ -151,7 +151,7 @@ pub async fn create_connection_pool(config: &DatabaseConfig) -> Result<PgPool, A
 /// # Returns
 /// * `Result<DatabaseConfig, AppError>` - Database configuration or an error
 pub fn create_database_config_from_env() -> Result<DatabaseConfig, AppError> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     let url = std::env::var("DATABASE_URL").map_err(|_| {
         AppError::InvalidInput("DATABASE_URL environment variable is required".to_string())
     })?;
