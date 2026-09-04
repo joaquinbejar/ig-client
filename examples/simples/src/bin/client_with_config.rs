@@ -4,7 +4,7 @@
 //! reads the global `IG_*` environment namespace. An embedding application that
 //! keeps credentials in its own namespaced variables — and must not have the
 //! crate reach for globals or a `.env` file — uses `Config::from_credentials`
-//! plus `Client::with_config` instead. Neither touches `dotenv` nor `IG_*`.
+//! plus `Client::with_config` instead. Neither touches `dotenvy` nor `IG_*`.
 //!
 //! Run with the embedder's own variables set:
 //!

@@ -6,7 +6,7 @@ use crate::constants::{
     DEFAULT_WS_RECONNECT_INTERVAL_SECS, DEFAULT_WS_URL,
 };
 use crate::utils::config::get_env_or_default;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -357,7 +357,7 @@ impl Config {
 
     /// Creates a new configuration instance from the environment.
     ///
-    /// Loads a local `.env` file (via `dotenv`) and reads the `IG_*` /
+    /// Loads a local `.env` file (via `dotenvy`) and reads the `IG_*` /
     /// `DATABASE_*` / `TX_*` environment variables, falling back to the
     /// documented defaults for anything unset. Embedders that must not touch
     /// the `.env` file or the `IG_*` namespace should use

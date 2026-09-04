@@ -1,6 +1,6 @@
 [package]
 name = "ig-client"
-version = "0.16.4"
+version = "0.16.5"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "This crate provides a client for the IG Markets API"
@@ -51,7 +51,7 @@ reqwest ={ workspace = true}
 sqlx = { workspace = true, optional = true }
 async-trait = { workspace = true}
 regex = { workspace = true}
-dotenv = { workspace = true}
+dotenvy = { workspace = true}
 lightstreamer-rs = { workspace = true, optional = true }
 lazy_static = { workspace = true}
 nanoid = { workspace = true}
@@ -112,7 +112,7 @@ criterion = "0.8"
 sqlx = { version = "0.9", features = [ "postgres","macros","chrono","runtime-tokio","tls-native-tls"]}
 async-trait = "0.1"
 regex = "1.13"
-dotenv = "0.15"
+dotenvy = "0.15"
 lightstreamer-rs = "1.0"
 lazy_static = "1.5"
 nanoid = "0.5"

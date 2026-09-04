@@ -64,7 +64,7 @@ tracing = "0.1"                                  # Logging facade
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "postgres"] }
 ```
 
-You do not need to add `dotenv` yourself — `Config::new()` loads a local
+You do not need to add `dotenvy` yourself — `Config::new()` loads a local
 `.env` file internally. If your application supplies its own configuration
 and must not read a `.env` file or the `IG_*` namespace, use
 `Config::from_credentials()` with `Client::with_config()` instead (see
