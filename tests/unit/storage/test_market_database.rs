@@ -90,6 +90,7 @@ async fn convert_market_data_to_instrument_maps_fields() {
         update_time_utc: Some("2025-01-01T00:00:00.123Z".into()),
         bid: Some(18000.5),
         offer: Some(18001.5),
+        ..Default::default()
     };
 
     let inst = svc.convert_market_data_to_instrument(&md, "node-1");

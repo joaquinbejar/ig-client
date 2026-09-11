@@ -24,7 +24,8 @@ async fn main() -> IgResult<()> {
     // Optionally save the results to JSON
     let json = serde_json::to_string_pretty(&result.markets)?;
     let filename = format!("Data/market_search_{}.json", search_term.replace(" ", "_"));
-    std::fs::write(&filename, &json)?;
+    tokio::fs::create_dir_all("Data").await?;
+    tokio::fs::write(&filename, &json).await?;
     info!("Results saved to '{}'", filename);
 
     Ok(())

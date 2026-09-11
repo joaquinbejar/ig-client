@@ -1,6 +1,6 @@
-/// Test account switching with API v2 (CST authentication)
+/// Demonstrate API v2 account switching using one client for both position reads.
+/// Run with `cargo run -p examples_positions --bin positions_switch_account_v2 -- YOUR_ACCOUNT_ID`.
 use ig_client::prelude::*;
-use std::sync::Arc;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -8,6 +8,13 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     setup_logger();
 
     info!("=== Positions Switch Account Example (API v2) ===\n");
+
+    let target_account = std::env::args()
+        .nth(1)
+        .filter(|account| !account.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::InvalidInput("usage: positions_switch_account_v2 <account-id>".to_owned())
+        })?;
 
     // Create configuration with API v2 (CST authentication)
     let config = Config {
@@ -19,29 +26,13 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("  Base URL: {}", config.rest_api.base_url);
     info!("  API Version: {:?}", config.api_version);
 
-    // Create HTTP client and main client
-    let http_client = Arc::new(HttpClient::new(config).await?);
-    let client = Client::try_new()?;
-
-    // Step 1: Login
-    info!("\n1. Logging in with API v2...");
-    let session = match http_client.get_session().await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("✗ Login failed: {:?}", e);
-            return Err(format!("Login error: {:?}", e).into());
-        }
-    };
-
-    info!("✓ Login successful");
-    info!("  Account ID: {}", session.account_id);
-    info!("  Uses OAuth: {}", session.is_oauth());
+    // Apply API v2 to the client that owns account selection and position reads.
+    let initial_account = config.credentials.account_id.clone();
+    let client = Client::with_config(config)?;
+    info!("\n1. Client configured for API v2; the first request logs in automatically");
 
     // Step 2: Get positions from current account
-    info!(
-        "\n2. Getting positions from account: {}",
-        session.account_id
-    );
+    info!("\n2. Getting positions from account: {}", initial_account);
     match client.get_positions().await {
         Ok(positions) => {
             info!("✓ Successfully retrieved positions");
@@ -63,37 +54,25 @@ async fn main() -> Result<(), ig_client::error::AppError> {
         }
         Err(e) => {
             error!("✗ Failed to get positions: {:?}", e);
-            return Err(format!("Get positions error: {:?}", e).into());
+            return Err(e);
         }
     }
 
-    // Step 3: Switch to account ZHH5N
-    let target_account = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "ZHH5N".to_string());
-
+    // Step 3: Switch the same client before the next position read.
     info!("\n3. Switching to account: {}", target_account);
 
-    match http_client
-        .switch_account(&target_account, Some(false))
-        .await
-    {
+    match client.switch_account(&target_account, Some(false)).await {
         Ok(()) => {
             info!("✓ Successfully switched to account: {}", target_account);
         }
         Err(e) => {
             error!("✗ Failed to switch account: {:?}", e);
-            return Err(format!("Account switch error: {:?}", e).into());
+            return Err(e);
         }
     }
 
-    let new_session = http_client.get_session().await?;
-
     // Step 4: Get positions from new account
-    info!(
-        "\n4. Getting positions from account: {}",
-        new_session.account_id
-    );
+    info!("\n4. Getting positions from account: {}", target_account);
     match client.get_positions().await {
         Ok(positions) => {
             info!("✓ Successfully retrieved positions");
@@ -115,7 +94,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
         }
         Err(e) => {
             error!("✗ Failed to get positions: {:?}", e);
-            return Err(format!("Get positions error: {:?}", e).into());
+            return Err(e);
         }
     }
 

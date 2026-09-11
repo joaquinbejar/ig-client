@@ -19,8 +19,9 @@
 //!   switching.
 //! - **Account Management**: Accounts, balances, positions, working orders,
 //!   preferences, activity, and transaction history.
-//! - **Market Data**: Market search, instrument details, market navigation, and
-//!   historical prices at several resolutions.
+//! - **Market Data**: Market search, instrument details, complete category
+//!   traversal with explicit errors on incomplete results, and historical prices
+//!   at several resolutions. Explicit market-navigation methods remain available.
 //! - **Order Management**: Create, update, and close positions and working
 //!   orders with typed request builders.
 //! - **Watchlists**: Full CRUD over watchlists and their instruments.
@@ -45,7 +46,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = "0.12.3"
+//! ig-client = "0.17.0"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
@@ -70,7 +71,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = { version = "0.12.3", default-features = false }
+//! ig-client = { version = "0.17.0", default-features = false }
 //! ```
 //!
 //! That leaves `Client`, `Client::with_config`, every REST service trait
@@ -344,6 +345,35 @@
 //! - `get_market_navigation()` / `get_market_navigation_node(node_id)`
 //! - `get_all_markets()` / `get_vec_db_entries()`
 //! - `get_categories()` / `get_category_instruments(category_id, page, size)`
+//!
+//! ### Catalog enumeration and expiry (0.17.0)
+//!
+//! `get_all_markets()` traverses every account category, including categories
+//! marked non-tradeable, through the Version 1 category endpoints. Pages start at
+//! zero with a requested size of 500. Short pages continue until a validated
+//! empty response; missing or inconsistent metadata, repeated nonempty EPIC
+//! sets, and the 1,000-page safety bound produce `AppError::CatalogPagination`.
+//! Request failures produce `AppError::CatalogRequest` with the endpoint and
+//! original typed error as its source. Neither this method nor
+//! `get_vec_db_entries()` returns a successful partial traversal.
+//!
+//! Instruments are deduplicated by EPIC with the first listing retained.
+//! `get_vec_db_entries()` preserves each instrument's own raw expiry and optional
+//! `expiry_timestamp` in epoch milliseconds. Only blank expiry text is enriched
+//! from details for that same EPIC. Failed enrichment retains the listing data;
+//! `last_dealing_date` stays separate from expiry, with no inferred offset.
+//! These methods perform no historical database rewrite.
+//!
+//! Both public signatures are unchanged. The added optional `MarketData` and
+//! `DBEntryResponse` fields require updates to struct literals, and exhaustive
+//! `AppError` matches must handle the new variants. See the
+//! [catalog contract and migration guide](https://github.com/joaquinbejar/ig-client/blob/main/doc/MARKET_CATALOG.md)
+//! and [DATA-ENGINE handoff](https://github.com/joaquinbejar/ig-client/blob/main/doc/DATA_ENGINE_0.17.0_HANDOFF.md).
+//!
+//! IG's reference documents no terminal marker or snapshot token. Empty-page
+//! completion is client policy, and a completed traversal is not an atomic
+//! snapshot. Regression coverage uses local fixtures; authenticated IG catalog
+//! behavior and DATA-ENGINE's real symbol/chain mapping remain integration checks.
 //!
 //! ### `OrderService`
 //! - `create_order(request)` — open a position

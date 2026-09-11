@@ -179,7 +179,7 @@ pub struct MarketSnapshot {
 }
 
 /// Basic market data
-#[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize)]
+#[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize, Default)]
 pub struct MarketData {
     /// Unique identifier for the market
     pub epic: String,
@@ -216,6 +216,108 @@ pub struct MarketData {
     pub bid: Option<f64>,
     /// Current offer/ask price
     pub offer: Option<f64>,
+    /// Instrument lot size, when supplied by the category listing.
+    #[serde(rename = "lotSize", default, skip_serializing_if = "Option::is_none")]
+    pub lot_size: Option<f64>,
+    /// Whether OTC trading is available, when supplied by the category listing.
+    #[serde(
+        rename = "otcTradeable",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub otc_tradeable: Option<bool>,
+    /// Market data delay in minutes.
+    #[serde(rename = "delayTime", default, skip_serializing_if = "Option::is_none")]
+    pub delay_time: Option<i64>,
+    /// Highest session price; distinct from the instrument's upper price limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<f64>,
+    /// Lowest session price; distinct from the instrument's lower price limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<f64>,
+    /// Multiplying factor for the instrument's price levels.
+    #[serde(
+        rename = "scalingFactor",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scaling_factor: Option<i64>,
+    /// Listed expiry as Unix epoch milliseconds (UTC), preserved without inference.
+    #[serde(
+        rename = "expiryTimestamp",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expiry_timestamp: Option<i64>,
+    /// Name of the underlying asset supplied by the listing.
+    #[serde(
+        rename = "underlyingName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub underlying_name: Option<String>,
+    /// Popularity ranking supplied by the listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popularity: Option<i64>,
+    /// Type of the underlying market supplied by the listing.
+    #[serde(
+        rename = "marketType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub market_type: Option<String>,
+    /// Subtype of the underlying market supplied by the listing.
+    #[serde(
+        rename = "marketSubtype",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub market_subtype: Option<String>,
+}
+
+/// Converts a category listing without substituting unrelated market fields.
+/// All available listing fields are retained. Price limits and the UTC update
+/// clock are absent from this endpoint and remain `None`.
+impl From<CategoryInstrument> for MarketData {
+    fn from(instrument: CategoryInstrument) -> Self {
+        let market_status = match instrument.market_status {
+            CategoryMarketStatus::Offline => "OFFLINE",
+            CategoryMarketStatus::Closed => "CLOSED",
+            CategoryMarketStatus::Suspended => "SUSPENDED",
+            CategoryMarketStatus::OnAuction => "ON_AUCTION",
+            CategoryMarketStatus::OnAuctionNoEdits => "ON_AUCTION_NO_EDITS",
+            CategoryMarketStatus::EditsOnly => "EDITS_ONLY",
+            CategoryMarketStatus::ClosingsOnly => "CLOSINGS_ONLY",
+            CategoryMarketStatus::DealNoEdit => "DEAL_NO_EDIT",
+            CategoryMarketStatus::Tradeable => "TRADEABLE",
+        };
+        Self {
+            epic: instrument.epic,
+            instrument_name: instrument.instrument_name,
+            instrument_type: instrument.instrument_type,
+            expiry: instrument.expiry,
+            high_limit_price: None,
+            low_limit_price: None,
+            market_status: market_status.to_owned(),
+            net_change: instrument.net_change,
+            percentage_change: instrument.percentage_change,
+            update_time: instrument.update_time,
+            update_time_utc: None,
+            bid: instrument.bid,
+            offer: instrument.offer,
+            lot_size: instrument.lot_size,
+            otc_tradeable: Some(instrument.otc_tradeable),
+            delay_time: instrument.delay_time,
+            high: instrument.high,
+            low: instrument.low,
+            scaling_factor: instrument.scaling_factor,
+            expiry_timestamp: instrument.expiry_timestamp,
+            underlying_name: instrument.underlying_name,
+            popularity: instrument.popularity,
+            market_type: instrument.market_type,
+            market_subtype: instrument.market_subtype,
+        }
+    }
 }
 
 impl MarketData {
@@ -750,6 +852,7 @@ mod tests {
             update_time_utc: None,
             bid: Some(100.0),
             offer: Some(101.0),
+            ..MarketData::default()
         };
         assert!(market.is_call());
         assert!(!market.is_put());
@@ -771,6 +874,7 @@ mod tests {
             update_time_utc: None,
             bid: Some(50.0),
             offer: Some(51.0),
+            ..MarketData::default()
         };
         assert!(market.is_put());
         assert!(!market.is_call());
@@ -792,6 +896,7 @@ mod tests {
             update_time_utc: None,
             bid: Some(18000.0),
             offer: Some(18001.0),
+            ..MarketData::default()
         };
         assert!(!market.is_call());
         assert!(!market.is_put());
@@ -928,6 +1033,34 @@ mod tests {
         assert_eq!(inst.popularity, Some(91783089620));
         assert_eq!(inst.market_type.as_deref(), Some("FX_PAIR"));
         assert_eq!(inst.market_subtype.as_deref(), Some("Fiat"));
+
+        // Reuse the existing payload fixture to prove conversion keeps every
+        // source field, including session prices and raw expiry precision.
+        let source: serde_json::Value = serde_json::from_str(json).expect("fixture JSON");
+        let category_json = serde_json::to_value(&inst).expect("serialize category fixture");
+        assert_eq!(category_json, source);
+        let market = MarketData::from(inst);
+        let market_json = serde_json::to_value(&market).expect("serialize market fixture");
+        for (field, value) in source.as_object().expect("fixture object") {
+            assert_eq!(market_json.get(field), Some(value), "field {field}");
+        }
+        assert!(market.high_limit_price.is_none());
+        assert!(market.low_limit_price.is_none());
+        assert!(market.update_time_utc.is_none());
+        let roundtrip: MarketData =
+            serde_json::from_value(market_json.clone()).expect("round-trip market fixture");
+        assert_eq!(
+            serde_json::to_value(roundtrip).expect("serialize round trip"),
+            market_json
+        );
+        let entry = crate::model::responses::DBEntryResponse::from(market);
+        assert_eq!(entry.expiry, "17-JUL-26");
+        assert_eq!(entry.expiry_timestamp, Some(1784300400000));
+        assert!(entry.last_dealing_date.is_none());
+        let entry_json = serde_json::to_value(&entry).expect("serialize entry fixture");
+        let roundtrip_entry: crate::model::responses::DBEntryResponse =
+            serde_json::from_value(entry_json).expect("round-trip entry fixture");
+        assert_eq!(roundtrip_entry, entry);
     }
 
     #[test]

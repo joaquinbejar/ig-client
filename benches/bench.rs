@@ -44,6 +44,7 @@ fn make_market(i: usize) -> MarketData {
         update_time_utc: Some("2024-01-01T00:00:00Z".to_string()),
         bid: Some(75.0),
         offer: Some(76.0),
+        ..MarketData::default()
     }
 }
 

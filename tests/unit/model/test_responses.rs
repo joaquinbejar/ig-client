@@ -26,6 +26,7 @@ fn dbentry_from_marketnode_and_marketdata() {
         update_time_utc: Some("11:00".to_string()),
         bid: Some(1.1),
         offer: Some(1.2),
+        ..Default::default()
     };
 
     // From MarketData
@@ -240,6 +241,7 @@ fn market_search_response_helpers_and_display() {
         update_time_utc: Some("11:34".into()),
         bid: Some(18000.0),
         offer: Some(18001.0),
+        ..Default::default()
     };
     let m2 = MarketData {
         instrument_name: "EUR/USD".into(),
@@ -255,6 +257,7 @@ fn market_search_response_helpers_and_display() {
         update_time_utc: Some("11:35".into()),
         bid: Some(1.1),
         offer: Some(1.2),
+        ..Default::default()
     };
     let resp = MarketSearchResponse {
         markets: vec![m1, m2],

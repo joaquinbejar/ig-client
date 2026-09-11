@@ -10,7 +10,7 @@
 //!
 //! ```bash
 //! MYAPP_IG_USERNAME=... MYAPP_IG_PASSWORD=... MYAPP_IG_ACCOUNT_ID=... \
-//! MYAPP_IG_API_KEY=... cargo run -p simples --bin client_with_config
+//! MYAPP_IG_API_KEY=... cargo run -p examples_simples --bin client_with_config
 //! ```
 
 use ig_client::prelude::*;

@@ -17,6 +17,7 @@ fn create_test_market(epic: &str, name: &str) -> MarketData {
         percentage_change: Some(0.0),
         update_time: Some("00:00:00".to_string()),
         update_time_utc: Some("2024-01-01T00:00:00".to_string()),
+        ..Default::default()
     }
 }
 
@@ -169,6 +170,7 @@ fn test_extract_markets_preserves_market_data() {
         percentage_change: Some(2.5),
         update_time: Some("12:34:56".to_string()),
         update_time_utc: Some("2024-01-01T12:34:56".to_string()),
+        ..Default::default()
     };
 
     let node = MarketNode {

@@ -9,8 +9,8 @@
 //! This example demonstrates how to retrieve all categories of instruments
 //! enabled for the IG account using the `/categories` endpoint.
 //!
-//! Note: This endpoint may not be available for all account types or in demo mode.
-//! If you receive a 500 error, try using a production account.
+//! Category availability depends on the configured account. Request failures
+//! are returned to the caller; changing account environment is not a retry strategy.
 
 use ig_client::prelude::*;
 use ig_client::utils::setup_logger;
@@ -42,7 +42,8 @@ async fn main() -> IgResult<()> {
     // Save the results to JSON
     let json = serde_json::to_string_pretty(&result.categories)?;
     let filename = "Data/categories.json";
-    std::fs::write(filename, &json)?;
+    tokio::fs::create_dir_all("Data").await?;
+    tokio::fs::write(filename, &json).await?;
     info!("Results saved to '{}'", filename);
 
     Ok(())

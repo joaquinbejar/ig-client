@@ -42,7 +42,8 @@ async fn main() -> IgResult<()> {
         epic.replace(".", "_"),
         resolution
     );
-    std::fs::write(&filename, &json)?;
+    tokio::fs::create_dir_all("Data").await?;
+    tokio::fs::write(&filename, &json).await?;
     info!("Results saved to '{}'", filename);
 
     Ok(())

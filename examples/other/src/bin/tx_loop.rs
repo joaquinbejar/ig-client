@@ -4,8 +4,9 @@
 //! from the IG Markets API. It runs in a continuous loop, fetching transactions
 //! at regular intervals and storing them in a PostgreSQL database.
 //!
-//! The example uses environment variables for configuration and implements
-//! error handling with exponential backoff.
+//! The example uses environment variables for configuration. The shared client
+//! handles request pacing, finite retries, and transaction pagination. A failed
+//! fetch skips storage for that run and is retried at the next scheduled tick.
 
 use chrono::{Duration, Utc};
 use ig_client::prelude::*;
@@ -23,8 +24,8 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
     let config = Config::default();
     info!(
-        "Configuration: interval={} hours, page_size={}, lookback={} days",
-        config.sleep_hours, config.page_size, config.days_to_look_back
+        "Configuration: interval={} hours, lookback={} days",
+        config.sleep_hours, config.days_to_look_back
     );
     debug!(
         "Loaded config: database max_connections={}",
@@ -43,11 +44,23 @@ async fn main() -> Result<(), ig_client::error::AppError> {
         }
     };
 
+    // Retain one client so sessions and rate budgets are shared across ticks.
+    let client = Client::with_config(config.clone())?;
+
     // Set up signal handlers for graceful shutdown
     let ctrl_c = signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
-    let hour_interval = time::interval(StdDuration::from_secs(config.sleep_hours * 3600));
+    let interval_seconds = config
+        .sleep_hours
+        .checked_mul(3600)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            AppError::InvalidInput(
+                "transaction polling interval must be positive and fit in seconds".to_owned(),
+            )
+        })?;
+    let hour_interval = time::interval(StdDuration::from_secs(interval_seconds));
     tokio::pin!(hour_interval);
 
     info!(
@@ -66,9 +79,6 @@ async fn main() -> Result<(), ig_client::error::AppError> {
                 // If this is the first run, the interval will tick immediately
                 info!("Starting scheduled transaction fetch");
 
-                // Create client
-                let client = Client::try_new()?;
-
                 // Calculate date range
                 let to = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
                 let from = (Utc::now() - Duration::days(config.days_to_look_back))
@@ -77,8 +87,8 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
                 info!("Fetching transactions from {} to {}", from, to);
 
-                // Fetch first page to get total pages
-                let first_page = match client
+                // This public method already fetches and combines every page.
+                let history = match client
                     .get_transactions(
                         &from,
                         &to,
@@ -91,39 +101,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
                     }
                 };
 
-                // Calculate total pages
-                let total_pages = first_page.metadata.page_data.total_pages as u32;
-
-                info!("Found {} transactions in page 1 of {}", first_page.transactions.len(), total_pages);
-
-                // Process first page
-                let mut all_transactions = first_page.transactions;
-
-                // Fetch remaining pages if any
-                for page in 2..=total_pages {
-                    info!("Fetching page {} of {}", page, total_pages);
-
-                    // Add a small delay between requests to avoid rate limiting
-                    time::sleep(StdDuration::from_millis(500)).await;
-
-                    match client
-                        .get_transactions(
-                            &from,
-                            &to,
-                        )
-                        .await {
-                        Ok(page_data) => {
-                            info!("Retrieved {} transactions from page {}", page_data.transactions.len(), page);
-                            all_transactions.extend(page_data.transactions);
-                        }
-                        Err(e) => {
-                            error!("Failed to get page {}: {}", page, e);
-                            // Continue with the transactions we have so far
-                            break;
-                        }
-                    }
-                }
-
+                let all_transactions = history.transactions;
                 info!("Total transactions fetched: {}", all_transactions.len());
 
                 // Log transaction details at debug level
@@ -131,7 +109,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
                     debug!(
                         "Transaction #{}: {}",
                         i + 1,
-                        serde_json::to_string_pretty(&serde_json::to_value(transaction).unwrap()).unwrap()
+                        serde_json::to_string_pretty(transaction)?
                     );
                 }
 

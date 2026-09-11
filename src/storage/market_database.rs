@@ -877,6 +877,7 @@ mod tests {
             update_time_utc: Some("2023-12-01T10:30:00Z".to_string()),
             bid: Some(15450.2),
             offer: Some(15451.8),
+            ..MarketData::default()
         }
     }
 

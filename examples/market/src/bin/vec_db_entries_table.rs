@@ -44,19 +44,11 @@ async fn main() -> Result<(), ig_client::error::AppError> {
                     .iter()
                     .map(|entry| DBEntryDisplay {
                         symbol: entry.symbol.clone(),
-                        epic: if entry.epic.len() > 25 {
-                            format!("{}...", &entry.epic[..22])
-                        } else {
-                            entry.epic.clone()
-                        },
-                        name: if entry.name.len() > 30 {
-                            format!("{}...", &entry.name[..27])
-                        } else {
-                            entry.name.clone()
-                        },
+                        epic: truncate_display(&entry.epic, 25),
+                        name: truncate_display(&entry.name, 30),
                         instrument_type: format!("{:?}", entry.instrument_type),
                         exchange: entry.exchange.clone(),
-                        expiry: if entry.expiry.is_empty() {
+                        expiry: if entry.expiry.trim().is_empty() {
                             "N/A".to_string()
                         } else {
                             entry.expiry.clone()
@@ -74,8 +66,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
                     )
                     .to_string();
 
-                println!("\n🎯 Market DB Entries Table:");
-                println!("{}", table);
+                info!("\n🎯 Market DB Entries Table:\n{table}");
 
                 // Display summary statistics
                 info!("\n📈 Summary Statistics:");
@@ -100,10 +91,13 @@ async fn main() -> Result<(), ig_client::error::AppError> {
                     info!("    {}: {}", instrument_type, count);
                 }
 
-                let with_expiry = db_entries.iter().filter(|e| !e.expiry.is_empty()).count();
+                let with_expiry = db_entries
+                    .iter()
+                    .filter(|e| !e.expiry.trim().is_empty())
+                    .count();
                 let without_expiry = db_entries.len() - with_expiry;
-                info!("  With expiry date: {}", with_expiry);
-                info!("  Without expiry date: {}", without_expiry);
+                info!("  With listed expiry text: {}", with_expiry);
+                info!("  Without listed expiry text: {}", without_expiry);
             }
         }
         Err(e) => {
@@ -119,4 +113,31 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
     info!("\n=== Example completed successfully! ===");
     Ok(())
+}
+
+/// Truncate at Unicode scalar boundaries; reserve space for the ellipsis.
+#[must_use]
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    // A display limit shorter than the ellipsis reserves no content characters.
+    let visible = max_chars.saturating_sub(3);
+    let mut shortened: String = value.chars().take(visible).collect();
+    shortened.extend("...".chars().take(max_chars));
+    shortened
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_display;
+
+    #[test]
+    fn test_display_truncation_handles_synthetic_unicode_and_short_limits() {
+        assert_eq!(truncate_display("Synthetic市場価格ééé", 12), "Synthetic...");
+        assert_eq!(truncate_display("ééééé", 4), "é...");
+        assert_eq!(truncate_display("市場", 2), "市場");
+        assert_eq!(truncate_display("市場価格", 2), "..");
+        assert_eq!(truncate_display("市場価格", 0), "");
+    }
 }

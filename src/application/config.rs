@@ -370,7 +370,8 @@ impl Config {
         // Explicitly load the .env file
         match dotenv() {
             Ok(_) => debug!("Successfully loaded .env file"),
-            Err(e) => debug!("Failed to load .env file: {e}"),
+            // dotenvy parse errors can contain the original line and its secrets.
+            Err(_) => debug!("Failed to load .env file"),
         }
 
         // Check if environment variables are configured

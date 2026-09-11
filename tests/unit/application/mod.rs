@@ -9,3 +9,4 @@ mod test_http_request;
 mod test_key_pool;
 #[cfg(feature = "streaming")]
 mod test_listener;
+mod test_market_catalog;
