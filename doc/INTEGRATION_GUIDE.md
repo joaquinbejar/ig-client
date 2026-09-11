@@ -1,5 +1,11 @@
 # Integration Guide for OAuth Token Refresh
 
+For the current catalog integration and migration from 0.16.5, use
+[Market catalog enumeration and expiry](./MARKET_CATALOG.md), including its
+DATA-ENGINE adoption steps. High-level enumeration
+uses categories; the navigation examples below concern the older authentication
+integration and do not describe the catalog traversal.
+
 ## Problem Statement
 
 If you're seeing this error in your application:

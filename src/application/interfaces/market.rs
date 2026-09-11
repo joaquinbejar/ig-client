@@ -112,53 +112,67 @@ pub trait MarketService: Send + Sync {
         node_id: &str,
     ) -> Result<MarketNavigationResponse, AppError>;
 
-    /// Navigates through all levels of the market hierarchy and collects all MarketData
+    /// Enumerates all instruments in every category enabled for the account.
     ///
-    /// This method performs a comprehensive traversal of the IG Markets hierarchy,
-    /// starting from the root navigation and going through multiple levels to collect
-    /// all available market instruments.
+    /// Uses `GET /categories` and `GET /categories/{categoryId}/instruments`,
+    /// both Version 1. All categories are traversed, including non-tradeable
+    /// categories; the first listing of each EPIC is retained across pages and
+    /// categories. No symbol or instrument-type filter is applied.
     ///
-    /// # Arguments
-    /// * `session` - The authenticated IG session
-    /// * `max_levels` - Maximum depth to traverse (default: 5 levels)
+    /// Pages are zero-based and request 500 instruments. The client validates
+    /// the response page number and a positive, stable effective page size.
+    /// IG documents no total or next-page marker, so this client continues
+    /// after short pages until a validated empty page. This termination rule
+    /// is a client interpretation of the documented pagination fields.
     ///
-    /// # Returns
-    /// * `Result<Vec<MarketData>, AppError>` - Vector containing all found market instruments
+    /// # Errors
+    /// Returns [`AppError::CatalogRequest`] with its original typed source if
+    /// any category request fails. Returns [`AppError::CatalogPagination`] for
+    /// inconsistent metadata, repeated nonempty pages, missing identifiers, or
+    /// 1,000 page requests in a category without an empty terminal page.
+    /// An incomplete enumeration never returns `Ok`.
     async fn get_all_markets(&self) -> Result<Vec<MarketData>, AppError>;
 
-    /// Gets all markets converted to database entries format
+    /// Converts a complete market enumeration into database entry DTOs.
     ///
-    /// This method retrieves all available markets and converts them to a standardized
-    /// database entry format for storage or further processing.
+    /// Each entry retains its own listed expiry and optional expiry timestamp.
+    /// Only blank expiry text triggers a bounded detail lookup for that EPIC;
+    /// a failed or mismatched lookup preserves the entry's listing fields.
+    /// Successful enrichment keeps `expiryDetails.lastDealingDate` in the
+    /// separate `last_dealing_date` field, never in `expiry`, and applies no
+    /// time offset. This method does not write or modify historical data.
     ///
-    /// # Arguments
-    /// * `session` - The authenticated IG session
-    ///
-    /// # Returns
-    /// * `Result<Vec<DBEntry>, AppError>` - Vector of database entries representing all markets
+    /// # Errors
+    /// Returns the enumeration errors documented by [`Self::get_all_markets`].
+    /// Optional detail enrichment failures leave the original entry intact.
     async fn get_vec_db_entries(&self) -> Result<Vec<DBEntryResponse>, AppError>;
 
     /// Gets all categories of instruments enabled for the IG account
     ///
-    /// This method returns a list of all categories of instruments that are
-    /// available for trading on the account.
+    /// Includes all account-enabled categories, including non-tradeable categories.
     ///
     /// # Returns
     /// * `Result<CategoriesResponse, AppError>` - List of available categories
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP request or response decoding fails.
     async fn get_categories(&self) -> Result<CategoriesResponse, AppError>;
 
-    /// Gets all instruments for a specific category
+    /// Gets one page of instruments for a specific category.
     ///
-    /// This method returns all instruments belonging to the specified category,
-    /// with optional pagination support.
+    /// Uses the supplied pagination values or IG's documented defaults.
     ///
     /// # Arguments
     /// * `category_id` - The identifier of the category
     /// * `page_number` - Optional page number (default: 0)
-    /// * `page_size` - Optional page size (default: 150, max: 1000)
+    /// * `page_size` - Optional page size (default: 150, min: 1, max: 1000)
     ///
     /// # Returns
     /// * `Result<CategoryInstrumentsResponse, AppError>` - List of instruments in the category
+    ///
+    /// # Errors
+    /// Returns an error for a page size outside 1..=1000, or if the HTTP request
+    /// or response decoding fails. This method fetches exactly one page.
     async fn get_category_instruments(
         &self,
         category_id: &str,

@@ -116,6 +116,25 @@ impl From<AppError> for AuthError {
 /// General application error type
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// A catalog request failed before the enumeration could complete.
+    #[error("catalog request failed at {endpoint}: {source}")]
+    CatalogRequest {
+        /// Relative category endpoint including the requested pagination values.
+        endpoint: String,
+        /// Original typed request failure.
+        #[source]
+        source: Box<AppError>,
+    },
+    /// Category pagination could not establish a complete enumeration.
+    #[error("incomplete catalog at category {category_id}, page {page_number}: {reason}")]
+    CatalogPagination {
+        /// Category whose traversal could not complete.
+        category_id: String,
+        /// Zero-based page being processed or prevented by the safety bound.
+        page_number: u32,
+        /// Invalid pagination state or safety bound that stopped the traversal.
+        reason: String,
+    },
     /// Network error from reqwest
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),

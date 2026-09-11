@@ -1774,12 +1774,12 @@ mod tests {
 
     #[test]
     fn test_redact_key_shows_only_a_prefix() {
-        let key = "6cb0ae4d738dcf918fa47157858fc0ea11290a5b";
+        let key = "fixture-key-for-redaction-only";
         let shown = redact_key(key);
-        assert_eq!(shown, "6cb0ae4d…");
+        assert_eq!(shown, "fixture-…");
         assert!(
-            !shown.contains("738dcf91"),
-            "the key body must never be logged"
+            !shown.contains("key-for-redaction-only"),
+            "the secret suffix must not be displayed"
         );
     }
 

@@ -36,7 +36,8 @@ async fn main() -> IgResult<()> {
     // Optionally save to JSON
     let json = serde_json::to_string_pretty(&prices)?;
     let filename = format!("Data/recent_prices_{}.json", epic.replace(".", "_"));
-    std::fs::write(&filename, &json)?;
+    tokio::fs::create_dir_all("Data").await?;
+    tokio::fs::write(&filename, &json).await?;
     info!("Results saved to '{}'", filename);
 
     Ok(())

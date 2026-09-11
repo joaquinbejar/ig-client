@@ -76,12 +76,77 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "streaming")]
 use tracing::{error, trace};
 
-/// Maximum number of concurrent `get_market_details` requests issued while
-/// resolving per-symbol expiry dates in [`Client::get_vec_db_entries`].
-///
-/// Kept small so the shared rate limiter stays in control: this only overlaps
-/// network latency, it does not widen the request budget.
+/// Maximum concurrent detail lookups for instruments missing a listed expiry.
+/// The shared HTTP client's rate limiter continues to pace every request.
 const MARKET_DETAILS_CONCURRENCY: usize = 6;
+
+/// Requested size of each category page, within IG's documented 1..=1000 range.
+const CATEGORY_INSTRUMENTS_PAGE_SIZE: u32 = 500;
+
+/// Maximum page requests per category, including the terminal empty page.
+/// Reaching this bound before a validated empty response is an error.
+const MAX_CATEGORY_PAGES: u32 = 1_000;
+
+/// Constructs a contextual error for a category traversal that cannot complete.
+#[cold]
+#[must_use]
+fn catalog_pagination_error(category_id: &str, page_number: u32, reason: &str) -> AppError {
+    AppError::CatalogPagination {
+        category_id: category_id.to_owned(),
+        page_number,
+        reason: reason.to_owned(),
+    }
+}
+
+/// Validates the page identity and effective page size before accepting its rows.
+#[must_use = "invalid category pages must stop enumeration"]
+fn validate_category_page(
+    category_id: &str,
+    page_number: u32,
+    response: &CategoryInstrumentsResponse,
+    effective_page_size: &mut Option<i64>,
+) -> Result<(), AppError> {
+    let metadata = response.metadata.as_ref().ok_or_else(|| {
+        catalog_pagination_error(
+            category_id,
+            page_number,
+            "response paging metadata is missing",
+        )
+    })?;
+    if metadata.page_number != i64::from(page_number) {
+        return Err(catalog_pagination_error(
+            category_id,
+            page_number,
+            "response pageNumber does not match the requested page",
+        ));
+    }
+    if !(1..=i64::from(CATEGORY_INSTRUMENTS_PAGE_SIZE)).contains(&metadata.page_size) {
+        return Err(catalog_pagination_error(
+            category_id,
+            page_number,
+            "response pageSize is outside the requested range",
+        ));
+    }
+    if effective_page_size.is_some_and(|size| size != metadata.page_size) {
+        return Err(catalog_pagination_error(
+            category_id,
+            page_number,
+            "response pageSize changed during the category traversal",
+        ));
+    }
+    let page_size = usize::try_from(metadata.page_size).map_err(|_| {
+        catalog_pagination_error(category_id, page_number, "response pageSize is invalid")
+    })?;
+    if response.instruments.len() > page_size {
+        return Err(catalog_pagination_error(
+            category_id,
+            page_number,
+            "response contains more instruments than its pageSize",
+        ));
+    }
+    *effective_page_size = Some(metadata.page_size);
+    Ok(())
+}
 
 /// Awaits every task in `tasks` and then clears the list.
 ///
@@ -505,176 +570,142 @@ impl MarketService for Client {
     }
 
     async fn get_all_markets(&self) -> Result<Vec<MarketData>, AppError> {
-        let max_depth = 6;
-        info!(
-            "Starting comprehensive market hierarchy traversal (max {} levels)",
-            max_depth
-        );
+        info!("building the market catalog from all account categories");
+        let categories = self
+            .get_categories()
+            .await
+            .map_err(|source| AppError::CatalogRequest {
+                endpoint: "categories".to_owned(),
+                source: Box::new(source),
+            })?
+            .categories;
+        let mut seen_categories = HashSet::new();
+        let mut seen_epics = HashSet::new();
+        let mut all_markets = Vec::new();
 
-        let root_response = self.get_market_navigation().await?;
-        info!(
-            "Root navigation: {} nodes, {} markets at top level",
-            root_response.nodes.len(),
-            root_response.markets.len()
-        );
-
-        // Move the root response fields out instead of cloning the (potentially
-        // large) DTO. The same market epic can appear under multiple navigation
-        // nodes, so track seen epics and keep only the first occurrence.
-        let mut seen_epics: HashSet<String> = HashSet::new();
-        let mut all_markets: Vec<MarketData> = Vec::new();
-        for market in root_response.markets {
-            if seen_epics.insert(market.epic.clone()) {
-                all_markets.push(market);
+        for category in categories {
+            if category.code.trim().is_empty() {
+                return Err(catalog_pagination_error("", 0, "category code is empty"));
             }
-        }
-        let mut nodes_to_process = root_response.nodes;
-        let mut processed_levels = 0;
-
-        while !nodes_to_process.is_empty() && processed_levels < max_depth {
-            let mut next_level_nodes = Vec::new();
-            let mut level_market_count = 0;
-
-            info!(
-                "Processing level {} with {} nodes",
-                processed_levels,
-                nodes_to_process.len()
-            );
-
-            for node in &nodes_to_process {
-                match self.get_market_navigation_node(&node.id).await {
-                    Ok(node_response) => {
-                        let node_markets = node_response.markets.len();
-                        let node_children = node_response.nodes.len();
-
-                        if node_markets > 0 || node_children > 0 {
-                            debug!(
-                                "Node '{}' (level {}): {} markets, {} child nodes",
-                                node.name, processed_levels, node_markets, node_children
-                            );
-                        }
-
-                        // Deduplicate by epic across nodes to avoid storing the
-                        // same market many times.
-                        for market in node_response.markets {
-                            if seen_epics.insert(market.epic.clone()) {
-                                all_markets.push(market);
-                                level_market_count += 1;
-                            }
-                        }
-                        next_level_nodes.extend(node_response.nodes);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to get markets for node '{}' at level {}: {:?}",
-                            node.name,
-                            processed_levels,
-                            e
-                        );
+            if !seen_categories.insert(category.code.clone()) {
+                continue;
+            }
+            let mut page_number = 0_u32;
+            let mut effective_page_size = None;
+            let mut seen_pages = HashSet::new();
+            loop {
+                let response = self
+                    .get_category_instruments(
+                        &category.code,
+                        Some(page_number),
+                        Some(CATEGORY_INSTRUMENTS_PAGE_SIZE),
+                    )
+                    .await
+                    .map_err(|source| AppError::CatalogRequest {
+                        endpoint: format!(
+                            "categories/{}/instruments?pageNumber={page_number}&pageSize={CATEGORY_INSTRUMENTS_PAGE_SIZE}",
+                            category.code
+                        ),
+                        source: Box::new(source),
+                    })?;
+                validate_category_page(
+                    &category.code,
+                    page_number,
+                    &response,
+                    &mut effective_page_size,
+                )?;
+                // IG documents no total or next-page marker. Require a validated
+                // empty response even after a short page; a failed request never
+                // stands in for the end of the category.
+                if response.instruments.is_empty() {
+                    break;
+                }
+                if response
+                    .instruments
+                    .iter()
+                    .any(|instrument| instrument.epic.trim().is_empty())
+                {
+                    return Err(catalog_pagination_error(
+                        &category.code,
+                        page_number,
+                        "instrument EPIC is empty",
+                    ));
+                }
+                // Compare identities, not quotes: a repeated page may contain
+                // updated prices or a different row order while making no progress.
+                let mut page_epics: Vec<String> = response
+                    .instruments
+                    .iter()
+                    .map(|instrument| instrument.epic.clone())
+                    .collect();
+                page_epics.sort_unstable();
+                page_epics.dedup();
+                if !seen_pages.insert(page_epics) {
+                    return Err(catalog_pagination_error(
+                        &category.code,
+                        page_number,
+                        "a nonempty instrument page was repeated",
+                    ));
+                }
+                for instrument in response.instruments {
+                    // The first listing of an EPIC wins, including across categories.
+                    if seen_epics.insert(instrument.epic.clone()) {
+                        all_markets.push(MarketData::from(instrument));
                     }
                 }
+                page_number = page_number.checked_add(1).ok_or_else(|| {
+                    catalog_pagination_error(&category.code, page_number, "page counter overflowed")
+                })?;
+                if page_number >= MAX_CATEGORY_PAGES {
+                    return Err(catalog_pagination_error(
+                        &category.code,
+                        page_number,
+                        "category page request limit reached before an empty page",
+                    ));
+                }
             }
-
-            info!(
-                "Level {} completed: {} markets found, {} nodes for next level",
-                processed_levels,
-                level_market_count,
-                next_level_nodes.len()
-            );
-
-            nodes_to_process = next_level_nodes;
-            processed_levels += 1;
         }
-
         info!(
-            "Market hierarchy traversal completed: {} total markets found across {} levels",
-            all_markets.len(),
-            processed_levels
+            markets = all_markets.len(),
+            "market catalog enumeration completed"
         );
-
         Ok(all_markets)
     }
 
     async fn get_vec_db_entries(&self) -> Result<Vec<DBEntryResponse>, AppError> {
-        info!("Getting all markets from hierarchy for DB entries");
-
         let all_markets = self.get_all_markets().await?;
-        info!("Collected {} markets from hierarchy", all_markets.len());
-
-        let mut vec_db_entries: Vec<DBEntryResponse> = all_markets
-            .iter()
-            .map(DBEntryResponse::from)
-            .filter(|entry| !entry.epic.is_empty())
-            .collect();
-
-        info!("Created {} DB entries from markets", vec_db_entries.len());
-
-        // Build `symbol -> (representative epic, fallback expiry)` in ONE pass
-        // instead of re-scanning the full entries Vec per unique symbol
-        // (previously O(symbols x entries)). The first entry seen for a symbol
-        // supplies both the epic to query and the fallback expiry, matching the
-        // previous `find`-first behaviour.
-        let mut symbol_info: std::collections::HashMap<String, (String, String)> =
-            std::collections::HashMap::new();
-        for entry in &vec_db_entries {
-            if entry.symbol.is_empty() || entry.epic.is_empty() {
-                continue;
-            }
-            symbol_info
-                .entry(entry.symbol.clone())
-                .or_insert_with(|| (entry.epic.clone(), entry.expiry.clone()));
-        }
-
-        info!(
-            "Found {} unique symbols to fetch expiry dates for",
-            symbol_info.len()
-        );
-
-        // Fetch market details with bounded concurrency. The shared `RateLimiter`
-        // still paces the underlying requests; `buffer_unordered` just overlaps
-        // the network latency instead of issuing one request at a time.
-        let symbol_expiry_map: std::collections::HashMap<String, String> =
-            futures::stream::iter(symbol_info)
-                .map(|(symbol, (epic, fallback_expiry))| async move {
-                    match self.get_market_details(&epic).await {
-                        Ok(market_details) => {
-                            let expiry_date = market_details
-                                .instrument
-                                .expiry_details
-                                .as_ref()
-                                .map(|details| details.last_dealing_date.clone())
-                                .unwrap_or_else(|| market_details.instrument.expiry.clone());
-
-                            info!(
-                                symbol = %symbol,
-                                expiry = %expiry_date,
-                                "fetched expiry date for symbol"
-                            );
-                            (symbol, expiry_date)
+        let entries = futures::stream::iter(all_markets)
+            .map(|market| async move {
+                let mut entry = DBEntryResponse::from(market);
+                // Preserve the exact listing expiry, including non-date values
+                // such as "-" for undated instruments. Only missing text needs
+                // enrichment, and that lookup belongs to this EPIC alone.
+                if !entry.expiry.trim().is_empty() {
+                    return entry;
+                }
+                match self.get_market_details(&entry.epic).await {
+                    Ok(details) if details.instrument.epic == entry.epic => {
+                        if !details.instrument.expiry.trim().is_empty() {
+                            entry.expiry = details.instrument.expiry;
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to get market details for epic {} (symbol {}): {:?}",
-                                epic,
-                                symbol,
-                                e
-                            );
-                            (symbol, fallback_expiry)
-                        }
+                        entry.last_dealing_date = details.instrument.expiry_details
+                            .map(|expiry_details| expiry_details.last_dealing_date);
                     }
-                })
-                .buffer_unordered(MARKET_DETAILS_CONCURRENCY)
-                .collect()
-                .await;
-
-        for entry in &mut vec_db_entries {
-            if let Some(expiry_date) = symbol_expiry_map.get(&entry.symbol) {
-                entry.expiry = expiry_date.clone();
-            }
-        }
-
-        info!("Updated expiry dates for {} entries", vec_db_entries.len());
-        Ok(vec_db_entries)
+                    Ok(_) => {
+                        warn!(epic = %entry.epic, "market details EPIC mismatch; preserving listed expiry");
+                    }
+                    Err(error) => {
+                        warn!(epic = %entry.epic, error = %error, "expiry enrichment failed; preserving listed expiry");
+                    }
+                }
+                entry
+            })
+            // Bound concurrency while retaining the enumeration order. Requests
+            // still use the shared HTTP rate, retry and token-refresh controls.
+            .buffered(MARKET_DETAILS_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        Ok(entries)
     }
 
     async fn get_categories(&self) -> Result<CategoriesResponse, AppError> {
@@ -697,9 +728,9 @@ impl MarketService for Client {
             query_params.push(format!("pageNumber={}", page));
         }
         if let Some(size) = page_size {
-            if size > 1000 {
+            if !(1..=1000).contains(&size) {
                 return Err(AppError::InvalidInput(
-                    "pageSize cannot exceed 1000".to_string(),
+                    "pageSize must be between 1 and 1000".to_string(),
                 ));
             }
             query_params.push(format!("pageSize={}", size));

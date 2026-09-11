@@ -2,17 +2,22 @@
 
 ## Overview
 
-The IG Client includes built-in rate limiting using the `governor` crate to ensure compliance with IG Markets API rate limits. The rate limiter is automatically integrated into the authentication module and controls all API requests.
+The IG Client uses `governor` to pace authentication and API requests through
+the shared HTTP client. Each request is charged to its endpoint class; retries
+and session replays consume request capacity too. Local pacing cannot guarantee
+that a server allowance is available.
 
 ## Configuration
 
-Rate limiting is configured through environment variables that are loaded when creating a `Config` instance.
+`Config::new()` reads the following environment variables. The environment-free
+`Config::from_credentials()` path can override the resulting configuration's
+`rate_limiter` field with an explicit `RateLimiterConfig`.
 
 ### Environment Variables
 
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
-| `IG_RATE_LIMIT_MAX_REQUESTS` | Maximum number of requests allowed per period | 4 | 4 |
+| `IG_RATE_LIMIT_MAX_REQUESTS` | Number of non-trading tokens replenished per period | 4 | 4 |
 | `IG_RATE_LIMIT_PERIOD_SECONDS` | Time period in seconds for the rate limit | 12 | 12 |
 | `IG_RATE_LIMIT_BURST_SIZE` | Maximum number of requests that can be made at once (burst) | 3 | 3 |
 
@@ -35,11 +40,14 @@ IG_RATE_LIMIT_BURST_SIZE=3
 
 ### Token Bucket Algorithm
 
-The rate limiter uses a token bucket algorithm:
+Each endpoint class has a token bucket:
 
 1. **Tokens**: Each API request consumes one token
-2. **Bucket Size**: Defined by `burst_size` - allows bursts of requests
-3. **Refill Rate**: Tokens are refilled based on `max_requests` per `period_seconds`
+2. **Bucket Size**: Non-trading uses `burst_size`; trading and historical use a fixed burst of one
+3. **Refill Rate**: The non-trading bucket replenishes at `max_requests` per `period_seconds`
+
+This is an average refill rate with burst capacity, not a fixed-window request
+count. The shared account bucket can impose additional waits.
 
 ### Example Scenarios
 
@@ -49,7 +57,7 @@ Config: 4 requests per 12 seconds, burst size 3
 
 - Can make 3 requests immediately (burst)
 - Then limited to ~1 request every 3 seconds
-- Over 12 seconds, can make 4 requests total
+- Four tokens replenish over 12 seconds; the initial burst is additional capacity
 ```
 
 #### Scenario 2: Burst Handling
@@ -64,33 +72,35 @@ Config: 4 requests per 12 seconds, burst size 10
 
 ### Automatic Integration
 
-The rate limiter is automatically used by the `Auth` module:
+Use `Client` service methods to retain shared pacing and session handling:
 
 ```rust
 use ig_client::application::client::Client;
 use ig_client::application::interfaces::account::AccountService;
 use ig_client::error::AppError;
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     // Create client (rate limiter is automatically initialized)
-    let client = Client::new();
+    let client = Client::try_new()?;
     
     // All API requests are automatically rate-limited
     let accounts = client.get_accounts().await?;
     
-    println!("Accounts: {:?}", accounts);
+    info!(count = accounts.accounts.len(), "accounts retrieved");
     Ok(())
 }
 ```
 
 ### Manual Usage
 
-You can also use the rate limiter directly:
+You can also use a standalone limiter. `RateLimiter::new` is infallible and
+returns `RateLimiter`; `Client::try_new` and service calls return `Result`.
 
 ```rust
 use ig_client::application::config::RateLimiterConfig;
-use ig_client::application::rate_limiter::RateLimiter;
+use ig_client::application::rate_limiter::{RateLimitClass, RateLimiter};
 
 #[tokio::main]
 async fn main() {
@@ -102,68 +112,60 @@ async fn main() {
     
     let limiter = RateLimiter::new(&config);
     
-    // Wait until a request can be made
-    limiter.wait().await;
+    // Wait for and consume one non-trading request slot.
+    limiter.wait_for(RateLimitClass::NonTrading).await;
     // Make your API request here
     
-    // Or check if a request can be made immediately
-    if limiter.check() {
-        // Make request
+    // For a different request, try to consume a slot immediately.
+    if limiter.check_for(RateLimitClass::NonTrading) {
+        // Make that request without calling wait_for again.
     } else {
         // Handle rate limit
     }
 }
 ```
 
-## IG Markets API Limits
+`wait()` and `check()` remain non-trading compatibility methods. A successful
+`check_for()` consumes a token; it is not a read-only capacity query. The client
+already paces its requests, so callers do not need another limiter around it.
 
-According to IG Markets documentation, the API has the following limits:
+## Budgets Implemented by the Client
 
-### Trading Limits
-- **60 requests per minute** for trading operations
-- Applies to: placing orders, modifying positions, etc.
+| Class | Local pacing | Operations |
+|-------|--------------|------------|
+| `NonTrading` | Configured requests per period and burst size | Categories, markets, accounts, position/order reads, and other non-trading endpoints |
+| `Trading` | One request per second, burst size one | Order and position mutations |
+| `Historical` | One request per second, burst size one | Historical price requests |
 
-### Non-Trading Limits
-- **60 requests per minute** for non-trading operations
-- Applies to: market data, account info, etc.
+Non-trading and historical requests also share a process-wide account bucket
+of 30 requests per minute with burst size one. Trading does not use that account
+bucket. Adding API keys does not multiply the shared account budget. These are
+the client's pacing policies; server allowances can still reject a request.
 
-### Historical Data Limits
-- **10,000 data points per week** for historical data requests
+### Configuration Examples
 
-### Recommended Settings
-
-For general use:
+Default non-trading configuration:
 ```env
 IG_RATE_LIMIT_MAX_REQUESTS=4
 IG_RATE_LIMIT_PERIOD_SECONDS=12
 IG_RATE_LIMIT_BURST_SIZE=3
 ```
 
-For conservative use (to stay well under limits):
+An explicit slower refill rate:
 ```env
-IG_RATE_LIMIT_MAX_REQUESTS=50
+IG_RATE_LIMIT_MAX_REQUESTS=10
 IG_RATE_LIMIT_PERIOD_SECONDS=60
-IG_RATE_LIMIT_BURST_SIZE=5
+IG_RATE_LIMIT_BURST_SIZE=1
 ```
 
-For high-frequency applications:
-```env
-IG_RATE_LIMIT_MAX_REQUESTS=60
-IG_RATE_LIMIT_PERIOD_SECONDS=60
-IG_RATE_LIMIT_BURST_SIZE=20
-```
+Changing these settings only changes the configurable non-trading bucket.
+It does not widen trading, historical, or shared account budgets.
 
 ## Monitoring
 
-The rate limiter logs when it's waiting and when retrying:
-
-```
-DEBUG ig_client::client: Waiting for rate limiter...
-WARN  ig_client::client: Rate limit exceeded (attempt 1): {"errorCode":"error.public-api.exceeded-api-key-allowance"}. Waiting 10 seconds before retry...
-WARN  ig_client::client: Rate limit exceeded (attempt 2): {"errorCode":"error.public-api.exceeded-api-key-allowance"}. Waiting 10 seconds before retry...
-```
-
-You can monitor rate limiting behavior by enabling debug/warn logging:
+The shared HTTP layer logs request method, URL, and rate class at debug level.
+Transient retries log `attempt`, `max_retries`, and `delay_ms` at warning level.
+Enable a subscriber in the application to inspect these events:
 
 ```rust
 use tracing_subscriber;
@@ -173,28 +175,17 @@ tracing_subscriber::fmt()
     .init();
 ```
 
-### Example Log Output
-
-When rate limits are exceeded, you'll see:
-
-```
-2025-10-20T03:38:39.251273Z  INFO ig_client::application::auth: Refreshing OAuth token
-2025-10-20T03:38:39.304788Z  WARN ig_client::application::client: Rate limit exceeded (attempt 1): {"errorCode":"error.public-api.exceeded-api-key-allowance"}. Waiting 10 seconds before retry...
-2025-10-20T03:38:49.305123Z  DEBUG ig_client::application::client: Retrying request after rate limit delay
-2025-10-20T03:38:49.456789Z  INFO ig_client::application::client: Request successful after retry
-```
-
 ## Best Practices
 
 1. **Set Conservative Limits**: Start with conservative settings and adjust based on your needs
 2. **Monitor Your Usage**: Watch for rate limit warnings in logs
-3. **Handle Errors Gracefully**: Implement retry logic with exponential backoff
-4. **Separate Limiters**: Consider separate rate limiters for trading vs non-trading operations
+3. **Handle Errors Gracefully**: Handle typed failures after the finite internal retry budget; avoid adding unbounded outer retries
+4. **Share the Client**: Reuse its request pool and endpoint-class pacing
 5. **Test Thoroughly**: Test your application under load to ensure rate limits are respected
 
 ## Error Handling
 
-If you exceed rate limits, the IG API will return:
+For example, a per-key allowance rejection can contain:
 
 ```json
 {
@@ -202,49 +193,51 @@ If you exceed rate limits, the IG API will return:
 }
 ```
 
-The rate limiter prevents this by:
-1. **Proactive rate limiting**: Waiting before making requests based on configured limits
-2. **Automatic retry**: If a rate limit error is still received (403 with exceeded-api-key-allowance), the client automatically:
-   - Logs a warning with the retry attempt number
-   - Waits 10 seconds
-   - Retries the request indefinitely until it succeeds
+The client distinguishes allowance failures from transient HTTP failures:
 
-This two-layer approach ensures maximum reliability:
-- The local rate limiter prevents most rate limit errors
-- The automatic retry handles edge cases where the API's limits differ from configuration
+- HTTP 429 and 5xx responses use finite retries. By default, a request has up to
+  three retries after its initial attempt. Exhaustion returns the typed failure.
+- `MAX_RETRY_COUNT` sets the retry count; zero means one attempt with no retries.
+  `RETRY_DELAY_SECS` sets the exponential backoff base, defaulting to 10 seconds.
+  Backoff grows as `base * 2^attempt`, capped at 60 seconds before adding up to
+  25% jitter. It is not a fixed ten-second delay.
+- A 403 per-key allowance response becomes `AppError::ApiKeyAllowanceExceeded`
+  without transient backoff. A non-trading client with multiple configured keys
+  can try another eligible key; it does not cycle through the pool indefinitely.
+- Account, trading, and historical allowance failures return their respective
+  `AppError::AccountAllowanceExceeded`, `TradingAllowanceExceeded`, and
+  `HistoricalDataAllowanceExceeded` variants without transient backoff.
+- Request transport errors propagate as `AppError::Network`. A rejected session
+  can trigger one reauthentication and replay on the same key.
+
+The retry count is a per-request transport budget, not a guarantee about the
+total number of sends including key selection and session recovery. All sends
+continue to pass through the shared pacing controls.
 
 ## Advanced Configuration
 
-### Multiple Rate Limiters
+### Independent Endpoint Classes
 
-For applications that need separate limits for different operations:
+A single limiter already separates the endpoint classes:
+
+```rust
+use ig_client::application::config::RateLimiterConfig;
+use ig_client::application::rate_limiter::{RateLimitClass, RateLimiter};
+
+let limiter = RateLimiter::new(&RateLimiterConfig::default());
+let trading_slot_available = limiter.check_for(RateLimitClass::Trading);
+let market_slot_available = limiter.check_for(RateLimitClass::NonTrading);
+// Each true result reserves one request in that class.
+```
+
+### Dynamic Adjustment
+
+A standalone limiter can be rebuilt with different non-trading settings:
 
 ```rust
 use ig_client::application::config::RateLimiterConfig;
 use ig_client::application::rate_limiter::RateLimiter;
 
-// Trading operations limiter
-let trading_config = RateLimiterConfig {
-    max_requests: 60,
-    period_seconds: 60,
-    burst_size: 5,
-};
-let trading_limiter = RateLimiter::new(&trading_config);
-
-// Market data limiter
-let market_data_config = RateLimiterConfig {
-    max_requests: 60,
-    period_seconds: 60,
-    burst_size: 20,
-};
-let market_data_limiter = RateLimiter::new(&market_data_config);
-```
-
-### Dynamic Adjustment
-
-You can create new rate limiters with different settings at runtime:
-
-```rust
 // Start with conservative settings
 let mut config = RateLimiterConfig {
     max_requests: 30,
@@ -259,8 +252,12 @@ config.max_requests = 60;
 let new_limiter = RateLimiter::new(&config);
 ```
 
+The new limiter has fresh independent buckets. This does not modify an existing
+`Client` or share its request history; recreating limiters per request defeats
+pacing.
+
 ## See Also
 
-- [Configuration Guide](./CONFIGURATION.md)
+- [Configuration API](../src/application/config.rs)
 - [Authentication Guide](./AUTHENTICATION.md)
 - [IG Markets API Documentation](https://labs.ig.com/rest-trading-api-reference)

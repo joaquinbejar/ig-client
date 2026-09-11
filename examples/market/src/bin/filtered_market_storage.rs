@@ -1,6 +1,10 @@
+//! Store catalogue instruments accepted by the storage adapter's EPIC-format filter.
+//! The name mapping labels symbols; unmatched names are stored as UNKNOWN.
+//! Run `market_hierarchy` first, or pass another flat catalogue JSON path.
+//! This example writes to PostgreSQL and does not enumerate or repair history.
+
 use ig_client::prelude::*;
 use std::collections::HashMap;
-use std::fs;
 use tracing::info;
 
 #[tokio::main]
@@ -10,25 +14,27 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
     info!("Starting filtered market storage example...");
 
-    // Load and deserialize the market hierarchy backup JSON file
-    let json_path = "Data/market_hierarchy_backup.json";
-    info!("Loading market hierarchy from: {}", json_path);
-
-    let json_content =
-        fs::read_to_string(json_path).map_err(|e| format!("Failed to read JSON file: {}", e))?;
-
+    // `market_hierarchy` now exports the complete flat catalogue to this path.
+    let json_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "Data/market_catalog.json".to_owned());
+    info!(path = %json_path, "loading flat market catalogue");
+    let json_content = tokio::fs::read_to_string(&json_path).await?;
+    let markets: Vec<MarketData> = serde_json::from_str(&json_content)?;
+    // Leaf nodes adapt the catalogue to the existing storage API. These are
+    // instrument records, not an inferred IG category tree.
+    let nodes: Vec<MarketNode> = markets
+        .into_iter()
+        .map(|market| MarketNode {
+            id: market.epic.clone(),
+            name: market.instrument_name.clone(),
+            children: Vec::new(),
+            markets: vec![market],
+        })
+        .collect();
     info!(
-        "Successfully loaded JSON file ({} bytes)",
-        json_content.len()
-    );
-
-    // Deserialize JSON to Vec<MarketNode>
-    let hierarchy: Vec<MarketNode> = serde_json::from_str(&json_content)
-        .map_err(|e| format!("Failed to deserialize JSON: {}", e))?;
-
-    info!(
-        "Successfully deserialized {} top-level market nodes",
-        hierarchy.len()
+        instruments = nodes.len(),
+        "flat catalogue loaded for filtered storage"
     );
 
     // Create the symbol mapping HashMap as specified
@@ -94,7 +100,7 @@ async fn main() -> Result<(), ig_client::error::AppError> {
     info!("Storing filtered market nodes to table '{}'...", table_name);
 
     db_service
-        .store_filtered_market_nodes(&hierarchy, &symbol_map, table_name)
+        .store_filtered_market_nodes(&nodes, &symbol_map, table_name)
         .await
         .map_err(|e| format!("Failed to store filtered market nodes: {}", e))?;
 

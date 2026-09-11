@@ -8,13 +8,13 @@ async fn main() -> IgResult<()> {
 
     let client = Client::try_new()?;
 
-    info!("\n=== Getting All Markets from Hierarchy ===");
+    info!("\n=== Getting All Markets from Account Categories ===");
 
     // Get all markets using the traversal method
     let all_markets = client.get_all_markets().await?;
 
     info!(
-        "✅ Found {} total markets across all levels",
+        "✅ Found {} unique markets across all account categories",
         all_markets.len()
     );
 
@@ -43,8 +43,8 @@ async fn main() -> IgResult<()> {
     }
 
     info!("\n=== Example completed successfully! ===");
-    info!("💡 The traversal goes up to 6 levels deep in the market hierarchy");
-    info!("   This ensures maximum coverage of all available markets");
+    info!("💡 Each category is paged until a validated empty response");
+    info!("   Any failed, repeated, inconsistent or safety-truncated traversal returns an error");
 
     Ok(())
 }

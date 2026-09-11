@@ -1,5 +1,9 @@
 # New Simplified Client API
 
+For catalog enumeration in 0.17.0, see
+[Market catalog enumeration and expiry](./MARKET_CATALOG.md), including public
+struct changes and DATA-ENGINE adoption steps.
+
 ## Overview
 
 The new `Client` API provides a dramatically simplified interface for using the IG Markets API. It handles all authentication complexity internally, including:
@@ -388,7 +392,7 @@ The Client implements the following service traits:
 | Service | Description |
 |---------|-------------|
 | `AccountService` | Account info, positions, working orders, preferences, activity |
-| `MarketService` | Market search, details, historical prices, navigation |
+| `MarketService` | Market search, details, historical prices, category catalog enumeration, explicit navigation |
 | `OrderService` | Order creation, confirmation, position management |
 | `WatchlistService` | Watchlist CRUD, add/remove instruments |
 | `SentimentService` | Client sentiment for single/multiple markets |
@@ -397,6 +401,7 @@ The Client implements the following service traits:
 
 ## See Also
 
+- [Market catalog enumeration and expiry](./MARKET_CATALOG.md)
 - [OAuth Token Refresh Guide](./OAUTH_TOKEN_REFRESH.md)
 - [Integration Guide](./INTEGRATION_GUIDE.md)
 - [API Documentation](../src/application/client.rs)

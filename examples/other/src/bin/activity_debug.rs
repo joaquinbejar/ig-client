@@ -1,5 +1,9 @@
+//! Inspect a decoded activity response through the supported client API.
+//! Uses the last 30 days and supports both API v2 and OAuth v3 authentication.
+
+use chrono::{Duration, Utc};
 use ig_client::prelude::*;
-use tracing::{error, info};
+use tracing::{debug, info};
 
 #[tokio::main]
 async fn main() -> Result<(), ig_client::error::AppError> {
@@ -7,44 +11,23 @@ async fn main() -> Result<(), ig_client::error::AppError> {
 
     info!("=== Activity Debug Example ===");
 
-    // Create HTTP client and config
-    let config = Config::default();
-    let http_client = HttpClient::new_lazy(config.clone())?;
-    let session = http_client.get_session().await?;
-    info!("Session started successfully");
+    let client = Client::try_new()?;
+    let to = Utc::now();
+    let from = to.checked_sub_signed(Duration::days(30)).ok_or_else(|| {
+        AppError::InvalidInput("activity lookback exceeds the supported date range".to_owned())
+    })?;
+    let from = from.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let to = to.format("%Y-%m-%dT%H:%M:%S").to_string();
+    info!(%from, %to, "fetching a detailed account activity page");
 
-    // Get activity with raw response handling
-    info!("Fetching account activity...");
-    let url = format!(
-        "{}/{}",
-        config.rest_api.base_url.trim_end_matches('/'),
-        "history/activity?from=2025-03-01T00:00:00Z&to=2025-04-01T00:00:00Z&detailed=true"
+    // The shared client supplies authentication headers, pacing, and refresh.
+    // Diagnostics contain the decoded activity page, never a session or headers.
+    let response = client.get_activity_with_details(&from, &to).await?;
+    info!(
+        activities = response.activities.len(),
+        "activity page received"
     );
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .header("X-IG-API-KEY", &config.credentials.api_key)
-        .header("Content-Type", "application/json; charset=UTF-8")
-        .header("Accept", "application/json; charset=UTF-8")
-        .header("Version", "3")
-        .header("CST", session.cst.as_ref().unwrap())
-        .header(
-            "X-SECURITY-TOKEN",
-            session.x_security_token.as_ref().unwrap(),
-        )
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        // Get the raw text response to see the actual structure
-        let text = response.text().await?;
-        info!("Raw API response: {}", text);
-    } else {
-        error!("Request failed with status: {}", response.status());
-        let error_text = response.text().await?;
-        error!("Error response: {}", error_text);
-    }
+    debug!(response = %serde_json::to_string_pretty(&response)?, "decoded activity response");
 
     Ok(())
 }

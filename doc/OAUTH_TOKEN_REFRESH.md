@@ -173,20 +173,23 @@ async fn process_markets(
 }
 ```
 
-## Complete Example
+## Runnable Client Example
 
-See `examples/oauth_token_refresh_example.rs` for a complete working example that demonstrates:
-
-- OAuth authentication (API v3)
-- Proactive token refresh checking
-- Handling `OAuthTokenExpired` errors
-- Automatic retry after token refresh
-
-Run the example with:
+[`client_with_config`](../examples/simples/src/bin/client_with_config.rs) uses
+the current `Client` API, which manages session authentication and refresh
+internally. Set `MYAPP_IG_USERNAME`, `MYAPP_IG_PASSWORD`, `MYAPP_IG_ACCOUNT_ID`,
+and `MYAPP_IG_API_KEY` in the process environment, then run from the repository
+root:
 
 ```bash
-cargo run --example oauth_token_refresh_example
+cargo run -p examples_simples --bin client_with_config
 ```
+
+The example defaults to demo API v3, makes an account request, and does not
+load `.env` or read `IG_*` credentials. Its short execution does not force
+token expiry or prove a refresh occurred. Offline session-refresh regression
+coverage is in
+[`test_auth_flow.rs`](../tests/unit/application/test_auth_flow.rs).
 
 ## Important Notes
 
@@ -232,6 +235,6 @@ For operations that take longer than the token validity period:
 
 ## See Also
 
-- [OAuth Example](../examples/oauth_token_refresh_example.rs)
-- [Session Interface Documentation](../src/session/interface.rs)
-- [Session Helper Utilities](../src/utils/session_helper.rs)
+- [Client Configuration Example](../examples/simples/src/bin/client_with_config.rs)
+- [Session and Token Types](../src/model/auth.rs)
+- [Authentication and Refresh Implementation](../src/application/auth.rs)

@@ -17,6 +17,7 @@ fn test_market_data_display() {
         percentage_change: Some(2.5),
         update_time: Some("12:34:56".to_string()),
         update_time_utc: Some("2024-01-01T12:34:56".to_string()),
+        ..Default::default()
     };
 
     let display = format!("{}", market);
@@ -40,6 +41,7 @@ fn test_market_data_clone() {
         percentage_change: Some(2.5),
         update_time: Some("12:34:56".to_string()),
         update_time_utc: Some("2024-01-01T12:34:56".to_string()),
+        ..Default::default()
     };
 
     let cloned = market.clone();
@@ -64,6 +66,7 @@ fn test_market_data_serialization() {
         percentage_change: Some(2.5),
         update_time: Some("12:34:56".to_string()),
         update_time_utc: Some("2024-01-01T12:34:56".to_string()),
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&market).unwrap();

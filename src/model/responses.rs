@@ -34,8 +34,17 @@ pub struct DBEntryResponse {
     pub instrument_type: InstrumentType,
     /// The exchange where this instrument is traded
     pub exchange: String,
-    /// Expiration date and time for the instrument
+    /// This instrument's expiry exactly as supplied by IG.
+    /// Populated listing values are never replaced by another EPIC's expiry or
+    /// by the last dealing date. Missing text may be enriched from this EPIC's details.
     pub expiry: String,
+    /// Listed expiry as Unix epoch milliseconds (UTC), preserved without inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_timestamp: Option<i64>,
+    /// Last dealing date from this EPIC's details, when missing-expiry enrichment
+    /// succeeds. This remains separate from expiry; no offset is applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dealing_date: Option<String>,
     /// Timestamp of the last update to this record
     pub last_update: DateTime<Utc>,
 }
@@ -56,6 +65,7 @@ impl From<MarketNode> for DBEntryResponse {
             entry.instrument_type = market.instrument_type;
             entry.exchange = "IG".to_string();
             entry.expiry = market.expiry.clone();
+            entry.expiry_timestamp = market.expiry_timestamp;
             entry.last_update = Utc::now();
         }
         entry
@@ -76,6 +86,10 @@ impl From<MarketData> for DBEntryResponse {
             instrument_type: market.instrument_type,
             exchange: "IG".to_string(),
             expiry: market.expiry.clone(),
+            expiry_timestamp: market.expiry_timestamp,
+            // The listing states no dealing instant, and inventing one here is
+            // what conflated the two concepts in the first place.
+            last_dealing_date: None,
             last_update: Utc::now(),
         }
     }

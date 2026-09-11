@@ -166,17 +166,21 @@ let session = auth.login_v3().await?;
 
 ## Examples
 
-### Example 1: OAuth Authentication
+The workspace example
+[`client_with_config`](../examples/simples/src/bin/client_with_config.rs)
+constructs a client with injected configuration and makes an account request.
+Run it from the repository root after setting `MYAPP_IG_USERNAME`,
+`MYAPP_IG_PASSWORD`, `MYAPP_IG_ACCOUNT_ID`, and `MYAPP_IG_API_KEY` in the process
+environment:
 
 ```bash
-cargo run --bin auth_v3_example
+cargo run -p examples_simples --bin client_with_config
 ```
 
-### Example 2: Comparing Both Versions
-
-```bash
-cargo run --bin auth_comparison_example
-```
+This example uses the `MYAPP_IG_*` namespace and does not load `.env` or read
+`IG_*` credentials. It defaults to the demo endpoint and API v3. Login occurs
+on the first API request. The example demonstrates this configuration path;
+it does not compare v2 and v3 sessions or force token expiry.
 
 ## API Request Format
 
