@@ -2362,3 +2362,131 @@ mod streaming_tests {
         assert!(tasks.is_empty());
     }
 }
+
+#[cfg(test)]
+mod catalog_limit_tests {
+    use super::Client;
+    use crate::application::config::{Config, Credentials, RateLimiterConfig};
+    use crate::application::http::HttpClient;
+    use crate::application::interfaces::market::MarketService;
+    use crate::application::rate_limiter::RateLimiter;
+    use crate::error::AppError;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_public_catalog_page_limit_without_completion_is_an_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Synthetic transport fixtures, not recorded IG responses. This test
+        // checks traversal limits, not real-time governor scheduling; inject
+        // the account quota only in this cfg(test) build to keep all 2,000 page
+        // requests fast without weakening production's 30/minute allowance.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/session"))
+                .and(header("Version", "3"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "clientId": "CATALOG-LIMIT-FIXTURE-CLIENT",
+                    "accountId": "CATALOG-LIMIT-FIXTURE-ACCOUNT",
+                    "timezoneOffset": 0,
+                    "lightstreamerEndpoint": "https://example.invalid",
+                    "oauthToken": {
+                        "access_token": "FIXTURE-NOT-A-REAL-ACCESS-TOKEN",
+                        "refresh_token": "FIXTURE-NOT-A-REAL-REFRESH-TOKEN",
+                        "scope": "profile",
+                        "token_type": "Bearer",
+                        "expires_in": "3600"
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/categories"))
+                .and(header("Version", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "categories": [{"code": "unbounded", "nonTradeable": false}]
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/categories/unbounded/instruments"))
+                .and(header("Version", "1"))
+                .and(query_param("pageSize", "500"))
+                .respond_with(|request: &wiremock::Request| {
+                    let page = request
+                        .url
+                        .query_pairs()
+                        .find(|(name, _)| name == "pageNumber")
+                        .and_then(|(_, value)| value.parse::<i64>().ok())
+                        .unwrap_or(-1);
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "instruments": [{
+                            "epic": format!("IX.D.FIXTURE.PAGE{page}.IP"),
+                            "instrumentName": "Synthetic never-ending category fixture",
+                            "expiry": "DFB",
+                            "instrumentType": "INDICES",
+                            "otcTradeable": true,
+                            "marketStatus": "TRADEABLE"
+                        }],
+                        "metadata": {"pageNumber": page, "pageSize": 1}
+                    }))
+                })
+                .expect(2_000)
+                .mount(&server)
+                .await;
+            let quota = RateLimiterConfig {
+                max_requests: 100_000,
+                period_seconds: 1,
+                burst_size: 2_010,
+            };
+            let mut config = Config::from_credentials(Credentials::new(
+                "FIXTURE-USER".into(),
+                "FIXTURE-PASSWORD".into(),
+                "CATALOG-LIMIT-FIXTURE-ACCOUNT".into(),
+                "FIXTURE-API-KEY".into(),
+            ));
+            config.rest_api.base_url = server.uri();
+            config.api_version = Some(3);
+            config.rate_limiter = quota.clone();
+            let client = Client {
+                http_client: Arc::new(HttpClient::new_lazy_with_test_account_limiter(
+                    config,
+                    RateLimiter::new(&quota),
+                )?),
+            };
+            let market_error = client
+                .get_all_markets()
+                .await
+                .err()
+                .ok_or("unbounded catalogue unexpectedly succeeded")?;
+            let entry_error = client
+                .get_vec_db_entries()
+                .await
+                .err()
+                .ok_or("unbounded database entries unexpectedly succeeded")?;
+            for error in [market_error, entry_error] {
+                let AppError::CatalogPagination {
+                    category_id,
+                    page_number,
+                    reason,
+                } = error
+                else {
+                    return Err("expected the catalogue page limit error".into());
+                };
+                assert_eq!(category_id, "unbounded");
+                assert_eq!(page_number, 1000);
+                assert!(reason.contains("page request limit"));
+            }
+            server.verify().await;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .await??;
+        Ok(())
+    }
+}

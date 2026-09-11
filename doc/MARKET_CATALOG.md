@@ -145,11 +145,18 @@ mapping remains part of the consumer's integration verification.
 ## Verification and DATA-ENGINE adoption
 
 The public-client regressions in
-[`test_market_catalog.rs`](../tests/unit/application/test_market_catalog.rs) use
-local HTTP mocks. Their categories, instruments, dates, and failures are synthetic
+[`test_market_catalog.rs`](../tests/unit/application/test_market_catalog.rs) and
+the page-limit regression in the
+[`Client` test module](../src/application/client.rs) use local HTTP mocks.
+Their categories, instruments, dates, and failures are synthetic
 fixtures, not claims about observed production incidents. They exercise both
 public methods, pagination failures, duplicate handling, and individual expiries.
 DTO conversion round-trips also reuse the existing category payload fixture.
+
+The page-limit fixture uses an isolated account quota compiled only for tests.
+It exercises the actual 1,000-page boundary through both public methods without
+waiting for the production account budget. Other catalogue fixtures use distinct
+synthetic accounts so concurrent tests do not compete for one account quota.
 
 Official documentation was checked; this change has not been exercised against
 an authenticated IG account. Compilation and fixture checks do not establish

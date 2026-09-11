@@ -11,18 +11,27 @@ use ig_client::presentation::instrument::InstrumentType;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+// Production pacing is shared per account. Independent fixtures must not share
+// that budget when the test harness runs them concurrently.
+static FIXTURE_ACCOUNT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 /// Build an env-free client with fake credentials and a local mock session.
 async fn fixture_client(server: &MockServer) -> Result<Client, Box<dyn Error>> {
+    let account_id = format!(
+        "CATALOG-FIXTURE-ACCOUNT-{}",
+        FIXTURE_ACCOUNT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
     Mock::given(method("POST"))
         .and(path("/session"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "clientId": "FIXTURE-CLIENT",
-            "accountId": "FIXTURE-ACCOUNT",
+            "accountId": account_id,
             "timezoneOffset": 0,
             "lightstreamerEndpoint": "https://example.invalid",
             "oauthToken": {
@@ -39,7 +48,7 @@ async fn fixture_client(server: &MockServer) -> Result<Client, Box<dyn Error>> {
     let mut config = Config::from_credentials(Credentials::new(
         "FIXTURE-USER".into(),
         "FIXTURE-PASSWORD".into(),
-        "FIXTURE-ACCOUNT".into(),
+        account_id,
         "FIXTURE-API-KEY".into(),
     ));
     config.rest_api.base_url = server.uri();
@@ -432,58 +441,9 @@ async fn test_public_catalog_changing_effective_page_size_is_an_error() -> TestR
     Ok(())
 }
 
-#[tokio::test]
-async fn test_public_catalog_page_limit_without_completion_is_an_error() -> TestResult {
-    let server = MockServer::start().await;
-    let client = fixture_client(&server).await?;
-    mount_categories(&server, &["unbounded"], 2).await;
-    Mock::given(method("GET"))
-        .and(path("/categories/unbounded/instruments"))
-        .and(header("Version", "1"))
-        .and(query_param("pageSize", "500"))
-        .respond_with(|request: &wiremock::Request| {
-            let page = request
-                .url
-                .query_pairs()
-                .find(|(name, _)| name == "pageNumber")
-                .and_then(|(_, value)| value.parse::<i64>().ok())
-                .unwrap_or(-1);
-            // A synthetic server that never finishes and never repeats an EPIC.
-            ResponseTemplate::new(200).set_body_json(fixture_page(
-                page,
-                1,
-                vec![fixture_instrument(
-                    &format!("IX.D.FIXTURE.PAGE{page}.IP"),
-                    "DFB",
-                    "INDICES",
-                )],
-            ))
-        })
-        .expect(2_000)
-        .mount(&server)
-        .await;
-    let market_error = client
-        .get_all_markets()
-        .await
-        .err()
-        .ok_or("unbounded catalog succeeded")?;
-    let entry_error = client
-        .get_vec_db_entries()
-        .await
-        .err()
-        .ok_or("unbounded entries succeeded")?;
-    for error in [market_error, entry_error] {
-        assert!(matches!(
-            error,
-            AppError::CatalogPagination {
-                page_number: 1000,
-                ..
-            }
-        ));
-    }
-    server.verify().await;
-    Ok(())
-}
+// The 1,000-page safety-limit regression lives in the client's cfg(test)
+// module. It exercises both public methods with an injected test-only account
+// quota, so it does not spend over an hour on the real 30/minute allowance.
 
 #[tokio::test]
 async fn test_public_catalog_blank_category_or_epic_is_an_error() -> TestResult {

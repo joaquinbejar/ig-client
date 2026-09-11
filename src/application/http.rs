@@ -281,6 +281,27 @@ impl HttpClient {
         })
     }
 
+    /// Creates a lazy fixture client with an isolated account quota.
+    ///
+    /// Rebuild the auth pool as well as request pacing before any request, so
+    /// login and data traffic share the same injected quota. Production builds
+    /// expose no override and retain the fixed per-account allowance.
+    #[cfg(test)]
+    pub(crate) fn new_lazy_with_test_account_limiter(
+        config: Config,
+        account_limiter: RateLimiter,
+    ) -> Result<Self, AppError> {
+        let mut client = Self::new_lazy(config)?;
+        let (auth, pool) = Self::build_pool(&client.config, &account_limiter)?;
+        client.auth = auth;
+        client.pool = pool;
+        client.selected = Arc::new(StdMutex::new(SelectedAccount {
+            id: client.config.credentials.account_id.clone(),
+            limiter: account_limiter,
+        }));
+        Ok(client)
+    }
+
     /// Builds one [`KeySlot`] per API key declared in the configuration.
     ///
     /// Every slot — the first included — gets a `Config` carrying **only its own
