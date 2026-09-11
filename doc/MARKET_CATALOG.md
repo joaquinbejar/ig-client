@@ -152,6 +152,26 @@ public methods, pagination failures, duplicate handling, and individual expiries
 DTO conversion round-trips also reuse the existing category payload fixture.
 
 Official documentation was checked; this change has not been exercised against
-an authenticated IG account. See the
-[0.17.0 DATA-ENGINE handoff](./DATA_ENGINE_0.17.0_HANDOFF.md) for release status,
-verification evidence, and the remaining consumer checks.
+an authenticated IG account. Compilation and fixture checks do not establish
+successful enumeration or symbol mapping against IG. The full mock HTTP suite
+must also pass in an environment that permits local test-server sockets; it
+could not run to completion in the restricted development environment.
+
+DATA-ENGINE adoption requires the following steps:
+
+1. Confirm that `ig-client` 0.17.0 has been published to the dependency registry
+   before updating the dependency and lockfile. A local version bump or package
+   archive is not publication confirmation.
+2. Adapt struct literals and serialized schemas for the added optional fields,
+   and update exhaustive error matches as described above. Preserve
+   `CatalogRequest.source` when classifying request failures.
+3. Run DATA-ENGINE's integration suite against its actual IG account. Check the
+   complete category/page traversal and real symbol/chain mapping; a correctly
+   propagated error alone does not establish that the mapping works.
+4. Check distinct instruments of the same symbol retain their individual expiry
+   text and available timestamps, including failed enrichment, and keep
+   `last_dealing_date` separate. Apply the change to newly returned client data
+   without rewriting historical records.
+
+Report fixture results separately from authenticated IG and consumer-integration
+results when coordinating adoption.

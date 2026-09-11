@@ -367,8 +367,7 @@
 //! Both public signatures are unchanged. The added optional `MarketData` and
 //! `DBEntryResponse` fields require updates to struct literals, and exhaustive
 //! `AppError` matches must handle the new variants. See the
-//! [catalog contract and migration guide](https://github.com/joaquinbejar/ig-client/blob/main/doc/MARKET_CATALOG.md)
-//! and [DATA-ENGINE handoff](https://github.com/joaquinbejar/ig-client/blob/main/doc/DATA_ENGINE_0.17.0_HANDOFF.md).
+//! [catalog contract, migration guide, and DATA-ENGINE adoption steps](https://github.com/joaquinbejar/ig-client/blob/main/doc/MARKET_CATALOG.md).
 //!
 //! IG's reference documents no terminal marker or snapshot token. Empty-page
 //! completion is client policy, and a completed traversal is not an atomic

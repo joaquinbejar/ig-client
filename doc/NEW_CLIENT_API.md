@@ -2,7 +2,7 @@
 
 For catalog enumeration in 0.17.0, see
 [Market catalog enumeration and expiry](./MARKET_CATALOG.md), including public
-struct changes and the [DATA-ENGINE adoption handoff](./DATA_ENGINE_0.17.0_HANDOFF.md).
+struct changes and DATA-ENGINE adoption steps.
 
 ## Overview
 
