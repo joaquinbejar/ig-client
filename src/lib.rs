@@ -15,15 +15,16 @@
 //! ## Features
 //!
 //! - **Authentication**: IG session v2 (`CST` / `X-SECURITY-TOKEN` headers) and
-//!   v3 (OAuth bearer) with automatic, transparent token refresh and account
-//!   switching.
+//!   v3 (OAuth bearer), with session establishment, proactive refresh, and account
+//!   switching. Standard reads can refresh and replay once after authentication
+//!   rejection; trading mutations return that error without replay.
 //! - **Account Management**: Accounts, balances, positions, working orders,
 //!   preferences, activity, and transaction history.
 //! - **Market Data**: Market search, instrument details, complete category
 //!   traversal with explicit errors on incomplete results, and historical prices
 //!   at several resolutions. Explicit market-navigation methods remain available.
 //! - **Order Management**: Create, update, and close positions and working
-//!   orders with typed request builders.
+//!   orders with typed request builders and one business-request attempt.
 //! - **Watchlists**: Full CRUD over watchlists and their instruments.
 //! - **Client Sentiment**: Sentiment for single, multiple, and related markets.
 //! - **Indicative Costs**: Costs and charges for opening, closing, or editing
@@ -33,8 +34,9 @@
 //!   dynamic subscription management.
 //! - **Rate Limiting**: `governor`-backed pacing configured per IG's trading vs
 //!   non-trading budgets.
-//! - **Finite Retry**: Exponential backoff with jitter via `RetryConfig`
-//!   (bounded — no unbounded retry loops).
+//! - **Request Policy**: Finite backoff for eligible standard requests;
+//!   `RequestPolicy::SingleAttempt` disables business-request retries,
+//!   redirects, key rotation, and authentication replay.
 //! - **Type Safety**: Strongly typed request / response DTOs and domain enums.
 //! - **Async**: Built on `tokio` with a shared, pooled `reqwest` client.
 //! - **Persistence** (feature `persistence`, on by default): PostgreSQL storage
@@ -46,7 +48,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = "0.17.0"
+//! ig-client = "0.18.0"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
@@ -71,7 +73,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = { version = "0.17.0", default-features = false }
+//! ig-client = { version = "0.18.0", default-features = false }
 //! ```
 //!
 //! That leaves `Client`, `Client::with_config`, every REST service trait
@@ -190,8 +192,9 @@
 //! Two knobs are still resolved from the process environment on the injected
 //! path, because they are not part of `Config`:
 //!
-//! - Retry policy — `MAX_RETRY_COUNT` and `RETRY_DELAY_SECS` are read per
-//!   request via `RetryConfig::default()`; unset means the crate defaults.
+//! - Standard retry policy — `MAX_RETRY_COUNT` and `RETRY_DELAY_SECS` are read
+//!   via `RetryConfig::default()`; unset means the crate defaults. These values
+//!   cannot enable replay for a single-attempt request.
 //! - `IG_PRICING_ADAPTER` — the Lightstreamer price adapter name, defaulting
 //!   to `Pricing` when unset.
 //!
@@ -383,6 +386,58 @@
 //! - `create_working_order(request)` / `update_working_order(deal_id, update)` /
 //!   `delete_working_order(deal_id)`
 //!
+//! ### Request replay policy (0.18.0)
+//!
+//! All seven `OrderService` mutation methods use `RequestPolicy::SingleAttempt`:
+//! opening and closing positions, both position amendment methods, and creating,
+//! amending, or cancelling working orders. Each invocation sends at most one
+//! business request. A 401, 429, server error, redirect, transport failure, or
+//! failed response decode cannot cause that mutation to be sent again by the
+//! SDK. Initial login or proactive token refresh may occur before the send.
+//! Confirmation and position reads retain their standard retry behavior.
+//!
+//! Callers of the public `HttpClient` can select the policy explicitly:
+//!
+//! ```rust,no_run
+//! use ig_client::prelude::{AppError, CreateOrderRequest, CreateOrderResponse,
+//!                          HttpClient, RequestPolicy};
+//! use reqwest::Method;
+//!
+//! async fn submit_once(
+//!     http: &HttpClient,
+//!     order: &CreateOrderRequest,
+//! ) -> Result<CreateOrderResponse, AppError> {
+//!     http.request_with_policy(
+//!         Method::POST,
+//!         "positions/otc",
+//!         Some(order),
+//!         Some(2),
+//!         RequestPolicy::SingleAttempt,
+//!     ).await
+//! }
+//! ```
+//!
+//! Known trading mutations cannot opt back into retries with `Standard`, including
+//! through the generic verb helpers. Selection uses the canonical URL path;
+//! percent-escaped mutation paths also get strict replay protection. Opaque
+//! endpoint aliases do not establish a recognized trading rate class, so prefer
+//! the service methods or canonical IG paths. Caller-owned free functions such as
+//! `make_http_request` cannot change their supplied reqwest client's redirect or
+//! protocol-retry settings; use `HttpClient` for the complete policy.
+//!
+//! An error after sending leaves the broker outcome uncertain. Persist the
+//! request's identity and intent, then reconcile before submitting again. The
+//! policy supplies neither broker-side idempotency nor exactly-once execution.
+//! A separate caller invocation is another request, and cancelling a future
+//! cannot retract an order that IG has received. An attempt limit also does not
+//! impose a request deadline; the caller must apply its own deadline where needed.
+//!
+//! Authentication now rejects redirects for login, refresh, account switching,
+//! and logout, so a redirected login cannot forward its credential body. Configure
+//! the final IG base URL directly. Standard business-read redirects retain their
+//! previous transport behavior; this authentication change does not harden that
+//! separate path.
+//!
 //! ### `WatchlistService`
 //! - `get_watchlists()` / `create_watchlist(name, epics)`
 //! - `get_watchlist(id)` / `delete_watchlist(id)`
@@ -408,9 +463,9 @@
 //! different budgets). The budget is configured from the environment via
 //! `IG_RATE_LIMIT_MAX_REQUESTS`, `IG_RATE_LIMIT_PERIOD_SECONDS`, and
 //! `IG_RATE_LIMIT_BURST_SIZE` (see `RateLimiterConfig`). On top of pacing,
-//! transient failures (429 / 5xx / connection errors) are retried with
-//! **finite** exponential backoff and jitter via `RetryConfig`; non-idempotent
-//! trading calls are never retried blindly.
+//! eligible standard-request failures (429 / retryable 5xx) use **finite**
+//! exponential backoff and jitter via `RetryConfig`. Single-attempt requests
+//! retain pacing, with no business-request retry or post-send key rotation.
 //!
 //! ## Architecture
 //!

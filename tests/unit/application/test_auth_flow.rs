@@ -13,6 +13,152 @@ use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+type RedirectTestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[tokio::test]
+async fn test_login_redirect_never_forwards_credentials_or_sends_mutation() -> RedirectTestResult {
+    for api_version in [2, 3] {
+        for status in [307, 308] {
+            let origin = MockServer::start().await;
+            let destination = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/session"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("Location", format!("{}/collect", destination.uri())),
+                )
+                .expect(1)
+                .mount(&origin)
+                .await;
+            let mut config = test_config(&origin.uri(), api_version);
+            config.credentials.account_id = format!("AUTH-REDIRECT-{api_version}-{status}");
+            let client = HttpClient::new_lazy(config)?;
+            let result: Result<serde_json::Value, AppError> = client
+                .post("positions/otc", serde_json::json!({"test": true}), Some(2))
+                .await;
+            assert!(
+                matches!(result, Err(AppError::Unexpected(actual)) if actual.as_u16() == status)
+            );
+            let sent = origin.received_requests().await.expect("recording enabled");
+            assert_eq!(sent.len(), 1, "initial login only; no mutation is allowed");
+            let login = sent.first().expect("one login");
+            assert_eq!(login.url.path(), "/session");
+            assert!(login.headers.contains_key("X-IG-API-KEY"));
+            let body: serde_json::Value = serde_json::from_slice(&login.body)?;
+            assert!(body.get("identifier").is_some());
+            assert!(body.get("password").is_some());
+            // No request means no body, IG header, or token reached that origin.
+            assert!(
+                destination
+                    .received_requests()
+                    .await
+                    .expect("recording enabled")
+                    .is_empty()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_force_refresh_redirect_never_forwards_session_credentials() -> RedirectTestResult {
+    for api_version in [2, 3] {
+        for status in [307, 308] {
+            let origin = MockServer::start().await;
+            let destination = MockServer::start().await;
+            let body = if api_version == 2 {
+                V2_BODY.to_owned()
+            } else {
+                v3_body("3600")
+            };
+            Mock::given(method("POST"))
+                .and(path("/session"))
+                .respond_with(
+                    json_ok(body)
+                        .insert_header("CST", "FAKE-CST")
+                        .insert_header("X-SECURITY-TOKEN", "FAKE-XST"),
+                )
+                .mount(&origin)
+                .await;
+            let auth = Auth::try_new(Arc::new(test_config(&origin.uri(), api_version)))?;
+            auth.login().await?;
+            origin.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/session"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("Location", format!("{}/collect", destination.uri())),
+                )
+                .expect(1)
+                .mount(&origin)
+                .await;
+            let result = auth.force_refresh().await;
+            assert!(
+                matches!(result, Err(AppError::Unexpected(actual)) if actual.as_u16() == status)
+            );
+            assert_eq!(
+                origin
+                    .received_requests()
+                    .await
+                    .expect("recording enabled")
+                    .len(),
+                1
+            );
+            assert!(
+                destination
+                    .received_requests()
+                    .await
+                    .expect("recording enabled")
+                    .is_empty()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_expired_oauth_refresh_redirect_never_reaches_destination() -> RedirectTestResult {
+    for status in [307, 308] {
+        let origin = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(json_ok(v3_body("0")))
+            .mount(&origin)
+            .await;
+        let auth = Auth::try_new(Arc::new(test_config(&origin.uri(), 3)))?;
+        auth.login().await?;
+        origin.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Location", format!("{}/collect", destination.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let result = auth.refresh_token().await;
+        assert!(matches!(result, Err(AppError::Unexpected(actual)) if actual.as_u16() == status));
+        assert_eq!(
+            origin
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .len(),
+            1
+        );
+        assert!(
+            destination
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
 /// Builds a hermetic `Config` pointing at `base_url` with the given API version.
 /// Constructed directly (never via `Config::default`) so the tests do not read
 /// `.env` / environment variables and stay deterministic. The rate limiter is

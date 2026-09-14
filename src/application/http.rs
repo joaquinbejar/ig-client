@@ -17,7 +17,7 @@ use crate::application::config::{Config, RateLimiterConfig};
 use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
 use crate::constants::USER_AGENT;
 use crate::error::AppError;
-use crate::model::retry::RetryConfig;
+use crate::model::retry::{RequestPolicy, RetryConfig};
 use reqwest::Client as HttpInternalClient;
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Serialize;
@@ -40,6 +40,9 @@ use tracing::{debug, error, warn};
 pub struct HttpClient {
     auth: Arc<Auth>,
     http_client: HttpInternalClient,
+    /// Persistent transport for requests that must never be replayed. Reqwest
+    /// configures retries and redirects per client, not per request.
+    single_attempt_client: HttpInternalClient,
     config: Arc<Config>,
     /// One entry per API key in the pool. `pool[0]` owns the same [`Auth`] and
     /// [`RateLimiter`] as the fields above, so a single-key configuration keeps
@@ -199,6 +202,19 @@ impl KeySlot {
     }
 }
 
+/// Builds each persistent transport with the same common settings. Keeping the
+/// standard transport unchanged preserves read redirects and protocol retries.
+#[must_use = "builders do nothing unless .build() is called"]
+fn transport_builder(policy: RequestPolicy) -> reqwest::ClientBuilder {
+    let builder = HttpInternalClient::builder().user_agent(USER_AGENT);
+    match policy {
+        RequestPolicy::Standard => builder,
+        RequestPolicy::SingleAttempt => builder
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none()),
+    }
+}
+
 impl HttpClient {
     /// Creates a new client and performs initial authentication
     ///
@@ -217,9 +233,8 @@ impl HttpClient {
         let config = Arc::new(config);
 
         // Create HTTP client and rate limiter first
-        let http_client = HttpInternalClient::builder()
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http_client = transport_builder(RequestPolicy::Standard).build()?;
+        let single_attempt_client = transport_builder(RequestPolicy::SingleAttempt).build()?;
         // Build the pool first: every slot owns a single-key `Config`, so the
         // client's own `Auth` is the primary slot's rather than one built from the raw
         // config, whose `api_key` may be the whole comma-separated list.
@@ -242,6 +257,7 @@ impl HttpClient {
         Ok(Self {
             auth,
             http_client,
+            single_attempt_client,
             config,
             pool,
             selected,
@@ -258,9 +274,8 @@ impl HttpClient {
         let config = Arc::new(config);
 
         // Create HTTP client and rate limiter first
-        let http_client = HttpInternalClient::builder()
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http_client = transport_builder(RequestPolicy::Standard).build()?;
+        let single_attempt_client = transport_builder(RequestPolicy::SingleAttempt).build()?;
         // Same as `new`: the client's `Auth` is the pool's first slot, never an
         // `Auth` built from a config whose `api_key` is the whole pool list.
         let account_limiter = Self::build_account_limiter(&config.credentials.account_id);
@@ -273,6 +288,7 @@ impl HttpClient {
         Ok(Self {
             auth,
             http_client,
+            single_attempt_client,
             config,
             pool,
             selected,
@@ -684,6 +700,7 @@ impl HttpClient {
     ///
     /// This is required by IG API for closing positions, as they don't support
     /// DELETE requests with a body. Instead, they use POST with a special header.
+    /// Uses [`RequestPolicy::SingleAttempt`], including for authentication errors.
     ///
     /// # Arguments
     /// * `path` - API endpoint path
@@ -692,6 +709,11 @@ impl HttpClient {
     ///
     /// # Returns
     /// Deserialized response of type T
+    ///
+    /// # Errors
+    /// Returns the initial session, HTTP, or response parsing error without
+    /// replaying the close. A failure after sending requires reconciliation.
+    #[must_use = "a failed close may require reconciliation"]
     pub async fn post_with_delete_method<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
@@ -699,20 +721,28 @@ impl HttpClient {
         version: Option<u8>,
     ) -> Result<T, AppError> {
         // IG requires POST + `_method: DELETE` for position closes; it rejects a
-        // DELETE with a body. Everything else — URL construction, auth headers,
-        // and the 401 refresh-and-replay contract — is identical to a normal
-        // request, so it routes through the same wrapper with one extra header.
-        self.request_with_refresh(
+        // DELETE with a body. Keep that override and the single-attempt policy
+        // together so a close cannot fall back to the read replay contract.
+        self.request_with_headers(
             Method::POST,
             path,
             Some(body),
             version,
             &[("_method", "DELETE")],
+            RequestPolicy::SingleAttempt,
         )
         .await
     }
 
-    /// Makes a request with custom API version
+    /// Makes a request with a custom API version and safe trading defaults.
+    ///
+    /// Known trading mutations and percent-escaped mutation paths use
+    /// [`RequestPolicy::SingleAttempt`]. Other requests retain finite retries
+    /// and one authentication replay.
+    ///
+    /// # Errors
+    /// Returns a session, HTTP, or response parsing error. A mutation error
+    /// after sending leaves the broker outcome unknown.
     pub async fn request<B: Serialize, T: DeserializeOwned>(
         &self,
         method: Method,
@@ -720,46 +750,61 @@ impl HttpClient {
         body: Option<B>,
         version: Option<u8>,
     ) -> Result<T, AppError> {
-        self.request_with_refresh(method, path, body, version, &[])
+        self.request_with_policy(method, path, body, version, RequestPolicy::Standard)
             .await
     }
 
-    /// Sends a request through the shared builder and applies the token
-    /// refresh-and-replay contract exactly once.
+    /// Makes a request with an explicit policy for retries and replay.
     ///
-    /// This is the single place the 401 / OAuth-token-expiry handling lives:
-    /// both [`request`](Self::request) and
-    /// [`post_with_delete_method`](Self::post_with_delete_method) route through
-    /// here. On [`AppError::OAuthTokenExpired`] it forces a fresh login and
-    /// replays the request one time. The match arm is not a loop: the replay
-    /// happens exactly once, after which any further failure is returned.
-    async fn request_with_refresh<B: Serialize, T: DeserializeOwned>(
+    /// [`RequestPolicy::SingleAttempt`] also disables HTTP redirects and
+    /// protocol retries in the persistent underlying transport. Initial login
+    /// or proactive refresh may occur before the business request is sent.
+    /// Known trading mutations and percent-escaped mutation paths cannot opt
+    /// out of this policy by requesting [`RequestPolicy::Standard`]. Escaped
+    /// endpoints are conservative because server decoding rules can differ;
+    /// their rate class still depends on the recognizable canonical URL path.
+    /// Rate limiting applies to either policy.
+    ///
+    /// # Errors
+    /// Returns the session, HTTP, or parsing error. Single-attempt requests
+    /// return 401 errors without a forced refresh or replay; after any send,
+    /// the caller must reconcile an uncertain broker outcome before resubmitting.
+    #[must_use = "a failed mutation may require reconciliation"]
+    pub async fn request_with_policy<B: Serialize, T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<B>,
+        version: Option<u8>,
+        policy: RequestPolicy,
+    ) -> Result<T, AppError> {
+        self.request_with_headers(method, path, body, version, &[], policy)
+            .await
+    }
+
+    /// Shares policy enforcement and parsing with the POST-close header path.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_headers<B: Serialize, T: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
         body: Option<B>,
         version: Option<u8>,
         extra_headers: &[(&str, &str)],
+        policy: RequestPolicy,
     ) -> Result<T, AppError> {
         // The refresh-and-replay lives in `request_internal`, which knows which
         // slot's session IG rejected. Refreshing here would always refresh slot
         // 0, so an expired token on any other key of the pool would be replayed
         // unchanged and fail again.
         let response = self
-            .request_internal(method, path, &body, version, extra_headers)
+            .request_internal(method, path, &body, version, extra_headers, policy)
             .await?;
         self.parse_response(response).await
     }
 
-    /// Builds and sends a single HTTP request against the IG API.
-    ///
-    /// Constructs the URL, assembles the common headers (API key, content type,
-    /// version) plus the session auth headers (OAuth `Bearer` or v2
-    /// `CST` / `X-SECURITY-TOKEN`), appends any `extra_headers` (e.g. IG's
-    /// `_method: DELETE` for position closes), and dispatches through
-    /// [`make_http_request`] with the finite default retry policy. It performs
-    /// no token refresh — that is the caller's job via
-    /// [`request_with_refresh`](Self::request_with_refresh).
+    /// Selects a session and enforces policy across retries, rotation and replay.
+    #[allow(clippy::too_many_arguments)]
     async fn request_internal<B: Serialize>(
         &self,
         method: Method,
@@ -767,6 +812,7 @@ impl HttpClient {
         body: &Option<B>,
         version: Option<u8>,
         extra_headers: &[(&str, &str)],
+        policy: RequestPolicy,
     ) -> Result<Response, AppError> {
         let url = if path.starts_with("http") {
             path.to_string()
@@ -775,13 +821,37 @@ impl HttpClient {
             format!("{}/{}", self.config.rest_api.base_url, path)
         };
 
-        let class = classify_endpoint(&method, path);
+        // Parse through reqwest without sending, preserving its typed URL error.
+        // Classify and dispatch the same canonical destination: dot segments or
+        // a configured base path must not hide a trading endpoint. Host names,
+        // query values and fragments do not determine the endpoint's class.
+        let url = self
+            .http_client
+            .request(method.clone(), url)
+            .build()?
+            .url()
+            .clone();
+        let class = classify_endpoint(&method, url.path());
+        // Servers differ in how they decode percent-escaped endpoint aliases.
+        // Keep encoded mutations single-attempt even when their route is not
+        // recognizable locally; never decode/change a caller's deal identifier.
+        let encoded_mutation = matches!(method, Method::POST | Method::PUT | Method::DELETE)
+            && url.path().contains('%');
+        // Enforce the trading default here as well as at service call sites:
+        // callers of public verb helpers cannot weaken it accidentally.
+        let policy = if class == RateLimitClass::Trading || encoded_mutation {
+            RequestPolicy::SingleAttempt
+        } else {
+            policy
+        };
 
         // Only non-trading REST rotates. Order placement, amendment and closure
         // stay on one key: they are metered against the account, not the key, so
         // moving them buys nothing and would spread order traffic over sessions
         // that a reconciliation has to tell apart afterwards.
-        let may_rotate = class == RateLimitClass::NonTrading && self.pool.len() > 1;
+        let may_rotate = policy == RequestPolicy::Standard
+            && class == RateLimitClass::NonTrading
+            && self.pool.len() > 1;
 
         let mut tried: Vec<usize> = Vec::with_capacity(self.pool.len());
         // One replay after a forced refresh, never a loop of them.
@@ -814,7 +884,7 @@ impl HttpClient {
             // move than to wait out this one's backoff, so the per-request retry
             // budget is dropped and rotation handles it.
             let rotate = may_rotate && tried.len() < self.pool.len();
-            let retry = if rotate {
+            let retry = if rotate || policy == RequestPolicy::SingleAttempt {
                 RetryConfig {
                     max_retry_count: Some(0),
                     retry_delay_secs: None,
@@ -824,7 +894,16 @@ impl HttpClient {
             };
 
             let result = self
-                .request_on_slot(slot, &method, &url, body, version, extra_headers, retry)
+                .request_on_slot(
+                    slot,
+                    &method,
+                    url.as_str(),
+                    body,
+                    version,
+                    extra_headers,
+                    retry,
+                    policy,
+                )
                 .await;
 
             match result {
@@ -856,7 +935,9 @@ impl HttpClient {
                 // local clock still considered it valid (v2 lasts six hours), so
                 // nothing refreshed it, and every request returned 401 without
                 // ever attempting to authenticate again.
-                Err(AppError::OAuthTokenExpired | AppError::Unauthorized) if !replayed => {
+                Err(AppError::OAuthTokenExpired | AppError::Unauthorized)
+                    if policy == RequestPolicy::Standard && !replayed =>
+                {
                     warn!(
                         key = %redact_key(&slot.api_key),
                         "session rejected by IG, re-authenticating this key and replaying once"
@@ -892,6 +973,7 @@ impl HttpClient {
         version: Option<u8>,
         extra_headers: &[(&str, &str)],
         retry: RetryConfig,
+        policy: RequestPolicy,
     ) -> Result<Response, AppError> {
         let session = slot.auth.get_session().await?;
 
@@ -926,8 +1008,12 @@ impl HttpClient {
             headers.push(("X-SECURITY-TOKEN", token_val.as_str()));
         }
 
+        let transport = match policy {
+            RequestPolicy::Standard => &self.http_client,
+            RequestPolicy::SingleAttempt => &self.single_attempt_client,
+        };
         make_http_request_paced(
-            &self.http_client,
+            transport,
             Pacing {
                 key: &slot.rate_limiter,
                 account: Some(&account_limiter),
@@ -1168,6 +1254,12 @@ impl HttpClient {
 /// rate limits) are retried with exponential backoff up to
 /// `retry_config.max_retries()`; everything else fails fast. The 401
 /// token-refresh path is handled by the caller, not here.
+///
+/// This low-level helper accepts a caller-owned transport. A zero retry count
+/// disables this function's retry loop, but cannot disable redirects or
+/// protocol retries configured in that transport. Use
+/// [`HttpClient::request_with_policy`] with [`RequestPolicy::SingleAttempt`]
+/// for the complete single-attempt contract.
 ///
 /// # Example
 ///
@@ -1531,10 +1623,17 @@ pub(crate) fn classify_status(status: StatusCode) -> StatusClass {
 ///
 /// `path` may be a bare path or a full URL; matching is by path substring, so
 /// both `positions/otc` and `.../positions/otc/{deal_id}` classify as trading.
+/// Full URLs are normalized before matching; hosts, queries and fragments are
+/// excluded. The selector and the physical-send pacing use the same classifier.
 /// A `GET` on `positions` or `workingorders` is a read and stays non-trading.
 #[must_use]
 #[inline]
 pub(crate) fn classify_endpoint(method: &Method, path: &str) -> RateLimitClass {
+    let parsed = reqwest::Url::parse(path).ok();
+    let path = parsed.as_ref().map_or_else(
+        || path.split(['?', '#']).next().unwrap_or(path),
+        reqwest::Url::path,
+    );
     let is_mutation = matches!(*method, Method::POST | Method::PUT | Method::DELETE);
     let is_trading_path = path.contains("positions/otc") || path.contains("workingorders/otc");
 
@@ -1546,6 +1645,10 @@ pub(crate) fn classify_endpoint(method: &Method, path: &str) -> RateLimitClass {
         RateLimitClass::NonTrading
     }
 }
+
+#[cfg(test)]
+#[path = "http_policy_tests.rs"]
+mod single_attempt_tests;
 
 #[cfg(test)]
 mod tests {

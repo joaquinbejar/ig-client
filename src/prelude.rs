@@ -55,6 +55,9 @@ pub use crate::application::config::{
 // Rate limiter
 pub use crate::application::rate_limiter::{RateLimitClass, RateLimiter};
 
+// Per-request replay policy (available without optional features)
+pub use crate::model::retry::RequestPolicy;
+
 // Service interfaces
 pub use crate::application::interfaces::account::AccountService;
 pub use crate::application::interfaces::costs::CostsService;

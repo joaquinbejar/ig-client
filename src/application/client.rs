@@ -39,7 +39,7 @@ use crate::model::responses::{
 use crate::model::responses::{
     ClosePositionResponse, CreateOrderResponse, CreateWorkingOrderResponse, UpdatePositionResponse,
 };
-use crate::model::retry::backoff_delay;
+use crate::model::retry::{RequestPolicy, backoff_delay};
 #[cfg(feature = "streaming")]
 use crate::model::streaming::{
     StreamingAccountDataField, StreamingChartField, StreamingMarketField, StreamingPriceField,
@@ -63,7 +63,7 @@ use lightstreamer_rs::{
     ItemGroup, ServerAddress, SessionEvent, SessionEvents, Snapshot, Subscription,
     SubscriptionEvent, SubscriptionMode,
 };
-use reqwest::StatusCode;
+use reqwest::{Method, StatusCode};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -926,7 +926,13 @@ impl OrderService for Client {
         info!("Creating order for: {}", order.epic);
         let result: CreateOrderResponse = self
             .http_client
-            .post("positions/otc", order, Some(2))
+            .request_with_policy(
+                Method::POST,
+                "positions/otc",
+                Some(order),
+                Some(2),
+                RequestPolicy::SingleAttempt,
+            )
             .await?;
         debug!("Order created with reference: {}", result.deal_reference);
         Ok(result)
@@ -991,7 +997,16 @@ impl OrderService for Client {
     ) -> Result<UpdatePositionResponse, AppError> {
         let path = format!("positions/otc/{}", deal_id);
         info!("Updating position: {}", deal_id);
-        let result: UpdatePositionResponse = self.http_client.put(&path, update, Some(2)).await?;
+        let result: UpdatePositionResponse = self
+            .http_client
+            .request_with_policy(
+                Method::PUT,
+                &path,
+                Some(update),
+                Some(2),
+                RequestPolicy::SingleAttempt,
+            )
+            .await?;
         debug!(
             "Position updated: {} with deal reference: {}",
             deal_id, result.deal_reference
@@ -1016,7 +1031,16 @@ impl OrderService for Client {
             trailing_stop_distance: None,
             trailing_stop_increment: None,
         };
-        let result: UpdatePositionResponse = self.http_client.put(&path, update, Some(2)).await?;
+        let result: UpdatePositionResponse = self
+            .http_client
+            .request_with_policy(
+                Method::PUT,
+                &path,
+                Some(update),
+                Some(2),
+                RequestPolicy::SingleAttempt,
+            )
+            .await?;
         debug!(
             "Position updated: {} with deal reference: {}",
             deal_id, result.deal_reference
@@ -1031,7 +1055,7 @@ impl OrderService for Client {
         info!("Closing position");
 
         // IG API requires POST with _method: DELETE header for closing positions
-        // This is a workaround for HTTP client limitations with DELETE + body
+        // The close helper enforces SingleAttempt, including on a 401 response.
         let result: ClosePositionResponse = self
             .http_client
             .post_with_delete_method("positions/otc", close_request, Some(1))
@@ -1048,7 +1072,13 @@ impl OrderService for Client {
         info!("Creating working order for: {}", order.epic);
         let result: CreateWorkingOrderResponse = self
             .http_client
-            .post("workingorders/otc", order, Some(2))
+            .request_with_policy(
+                Method::POST,
+                "workingorders/otc",
+                Some(order),
+                Some(2),
+                RequestPolicy::SingleAttempt,
+            )
             .await?;
         debug!(
             "Working order created with reference: {}",
@@ -1059,8 +1089,16 @@ impl OrderService for Client {
 
     async fn delete_working_order(&self, deal_id: &str) -> Result<(), AppError> {
         let path = format!("workingorders/otc/{}", deal_id);
-        let result: CreateWorkingOrderResponse =
-            self.http_client.delete(path.as_str(), Some(2)).await?;
+        let result: CreateWorkingOrderResponse = self
+            .http_client
+            .request_with_policy(
+                Method::DELETE,
+                &path,
+                None::<()>,
+                Some(2),
+                RequestPolicy::SingleAttempt,
+            )
+            .await?;
         debug!(
             "Working order created with reference: {}",
             result.deal_reference
@@ -1083,8 +1121,16 @@ impl OrderService for Client {
     ) -> Result<CreateWorkingOrderResponse, AppError> {
         let path = format!("workingorders/otc/{}", deal_id);
         info!("Updating working order: {}", deal_id);
-        let result: CreateWorkingOrderResponse =
-            self.http_client.put(&path, update, Some(2)).await?;
+        let result: CreateWorkingOrderResponse = self
+            .http_client
+            .request_with_policy(
+                Method::PUT,
+                &path,
+                Some(update),
+                Some(2),
+                RequestPolicy::SingleAttempt,
+            )
+            .await?;
         debug!(
             "Working order updated: {} with reference: {}",
             deal_id, result.deal_reference

@@ -10,3 +10,4 @@ mod test_key_pool;
 #[cfg(feature = "streaming")]
 mod test_listener;
 mod test_market_catalog;
+mod test_mutation_policy;

@@ -16,6 +16,13 @@ use async_trait::async_trait;
 /// This trait defines the interface for interacting with the IG Markets order endpoints,
 /// allowing clients to create new orders, get order confirmations, update existing positions,
 /// and close positions.
+///
+/// The SDK [`Client`](crate::application::client::Client) sends each creation,
+/// amendment, cancellation or close at most once. It does not retry or replay
+/// that mutation on HTTP, transport or authentication errors. Initial session
+/// establishment may happen before the send. An error after sending can leave
+/// the broker outcome unknown; reconcile it before submitting another mutation.
+/// Confirmation and position reads retain their finite retry behavior.
 pub trait OrderService: Send + Sync {
     /// Creates a new order
     async fn create_order(
