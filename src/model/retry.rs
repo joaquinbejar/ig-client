@@ -12,6 +12,29 @@ use pretty_simple_display::{DebugPretty, DisplaySimple};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Controls whether a business request may be sent again after dispatch.
+///
+/// Session establishment and proactive token refresh may happen before either
+/// policy sends the business request. The policy applies to that request, not
+/// to connection establishment or a later, separate caller invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RequestPolicy {
+    /// Uses finite status retries, eligible key rotation, and one auth replay.
+    ///
+    /// Known trading mutations and percent-escaped mutation paths always use
+    /// `SingleAttempt`, even when this policy is requested explicitly. The
+    /// server's decoding of an escaped endpoint cannot establish replay safety.
+    Standard,
+    /// Sends at most one business request, without retries or redirects.
+    ///
+    /// Disables status retries, post-send key rotation, authentication replay,
+    /// and underlying HTTP protocol retries. A failure after sending leaves
+    /// the broker outcome unknown: reconcile before submitting another mutation.
+    /// This is not a broker-side exactly-once or idempotency guarantee.
+    SingleAttempt,
+}
+
 /// Configuration for HTTP request retry behavior.
 ///
 /// Retry is always finite: when a field is unset the finite defaults

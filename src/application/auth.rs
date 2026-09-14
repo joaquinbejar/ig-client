@@ -184,6 +184,9 @@ impl Auth {
     /// separate limiters, the key's real budget is the sum of the two and IG
     /// rejects requests the client believed were within budget. Sharing one
     /// limiter per key is what makes the local pacing match the remote one.
+    /// Authentication redirects are never followed: a redirected login could
+    /// forward its password body and IG headers to another origin. This also
+    /// applies to refresh, account-switch and logout requests on this transport.
     ///
     /// # Arguments
     /// * `config` - Configuration containing credentials and API settings
@@ -196,7 +199,10 @@ impl Auth {
         config: Arc<Config>,
         rate_limiter: RateLimiter,
     ) -> Result<Self, AppError> {
-        let client = Client::builder().user_agent(USER_AGENT).build()?;
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         Ok(Self {
             config,
