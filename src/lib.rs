@@ -48,7 +48,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = "0.17.0"
+//! ig-client = "0.18.0"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
@@ -73,7 +73,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = { version = "0.17.0", default-features = false }
+//! ig-client = { version = "0.18.0", default-features = false }
 //! ```
 //!
 //! That leaves `Client`, `Client::with_config`, every REST service trait
@@ -386,7 +386,7 @@
 //! - `create_working_order(request)` / `update_working_order(deal_id, update)` /
 //!   `delete_working_order(deal_id)`
 //!
-//! ### Request replay policy
+//! ### Request replay policy (0.18.0)
 //!
 //! All seven `OrderService` mutation methods use `RequestPolicy::SingleAttempt`:
 //! opening and closing positions, both position amendment methods, and creating,
