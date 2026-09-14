@@ -2,8 +2,8 @@
 
 This branch prepares the SDK boundary required by ig-engine's trading journal.
 It is an unpublished change based on `d497ff5755696533e356fff8bf415951e750cd7e`.
-The package version is unchanged. Owner review and a published release are still
-required before ig-engine may consume it; ig-engine keeps its
+The package version is bumped to 0.18.0 in this branch. A published release is
+still required before ig-engine may consume it; ig-engine keeps its
 `disabled|simulation` execution backends meanwhile.
 
 ## Public contract
@@ -103,11 +103,13 @@ execution logs are saved under the prepared checkout's ignored `target/ci/`
 directory. This doctest outcome is recorded separately from the 72 selected
 implementation tests.
 
-The complete upstream suite and `make pre-push` were **not** executed: existing
-unselected tests invoke environment-loading constructors. Do not substitute an
-unfiltered `cargo test` or feature-matrix test target for the audited selectors.
-Run the following only with a sanitized process environment, local-only test
-configuration, and the resolved offline lockfile used for this handoff:
+Owner validation on 2026-09-14 then ran the complete suite on this branch:
+`cargo test --all-features` passed 595 tests with 0 failures and 37 ignored
+(environment-gated live tests), and `cargo fmt --all --check`,
+`cargo clippy --all-targets --all-features -- -D warnings` and
+`cargo build --release` passed. The selected commands below reproduce the policy
+coverage in isolation and remain useful when the process environment carries IG
+variables that the unselected tests would load:
 
 ```sh
 cargo test -p ig-client --locked --offline --no-default-features --test unit_tests application::test_mutation_policy::
@@ -118,5 +120,5 @@ cargo test -p ig-client --locked --offline --no-default-features --test unit_tes
 ```
 
 No authenticated IG test, real mutation, release, registry publication, or
-ig-engine adoption is claimed. No dependency, CI, Makefile, or package-version
-change is part of this branch.
+ig-engine adoption is claimed. No dependency, CI or Makefile change is part of
+this branch; the package version is bumped to 0.18.0.
