@@ -94,15 +94,11 @@ pub trait OrderService: Send + Sync {
         order: &CreateWorkingOrderRequest,
     ) -> Result<CreateWorkingOrderResponse, AppError>;
 
-    /// Deletes a working order based on the provided deal ID.
+    /// Submits a working-order cancellation, discarding its acknowledgement reference.
     ///
-    /// # Parameters
-    /// - `deal_id`: A `String` representing the deal ID of the working order that needs to be deleted.
-    ///
-    /// # Returns
-    /// - `Result<(), AppError>`:
-    ///   - On success, the function returns `Ok(())` indicating that the working order was successfully deleted.
-    ///   - On failure, it returns `Err(AppError)` containing the error details that occurred during the deletion process.
+    /// `Ok(())` acknowledges submission, not confirmed deletion. Use
+    /// [`Self::delete_working_order_with_reference`] to retain IG's deal reference
+    /// and reconcile the outcome with [`Self::get_order_confirmation`].
     ///
     /// # Errors
     /// This function will return an `AppError` in the following scenarios:
@@ -111,6 +107,36 @@ pub trait OrderService: Send + Sync {
     /// - If the calling user does not have permission to delete the specified working order.
     ///
     async fn delete_working_order(&self, deal_id: &str) -> Result<(), AppError>;
+
+    /// Submits a working-order cancellation and retains IG's deal reference.
+    ///
+    /// The SDK [`Client`](crate::application::client::Client) uses one trading
+    /// `DELETE /workingorders/otc/{dealId}` request with API version 2. It never
+    /// retries, follows redirects, or replays the cancellation after an
+    /// authentication failure. A successful response acknowledges submission;
+    /// use its reference with [`Self::get_order_confirmation`] to determine the
+    /// outcome. If the response is lost, the reference may be unavailable and
+    /// this method must not be retried to recover it.
+    ///
+    /// The default keeps existing service implementations source-compatible.
+    /// It reports an unsupported capability without calling the legacy deletion
+    /// method or sending any request. Implementors must override it to expose
+    /// the actual acknowledgement; they must not fabricate a reference.
+    ///
+    /// # Errors
+    /// Returns [`AppError::InvalidInput`] when the service implementation does
+    /// not support this capability. The SDK client instead propagates typed
+    /// authentication, transport, HTTP-status and response-decoding failures.
+    #[must_use = "retain the cancellation reference and reconcile its outcome"]
+    async fn delete_working_order_with_reference(
+        &self,
+        _deal_id: &str,
+    ) -> Result<CreateWorkingOrderResponse, AppError> {
+        Err(AppError::InvalidInput(
+            "delete_working_order_with_reference is unsupported by this service implementation"
+                .to_owned(),
+        ))
+    }
 
     /// Gets a single position by deal ID
     ///
