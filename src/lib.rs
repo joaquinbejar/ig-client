@@ -387,7 +387,7 @@
 //!   `delete_working_order(deal_id)`
 //! - `delete_working_order_with_reference(deal_id)` — retain the cancellation acknowledgement
 //!
-//! ### Working-order cancellation references (unreleased)
+//! ### Working-order cancellation references
 //!
 //! `delete_working_order_with_reference` returns IG's acknowledgement as the
 //! existing `CreateWorkingOrderResponse`. Retain `deal_reference` and use

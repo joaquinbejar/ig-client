@@ -1,4 +1,4 @@
-# Working-order cancellation references (unreleased)
+# Working-order cancellation references
 
 `OrderService::delete_working_order_with_reference(deal_id)` preserves IG's
 cancellation acknowledgement instead of discarding it. The method returns the
@@ -6,10 +6,9 @@ existing `CreateWorkingOrderResponse`, whose `deal_reference` identifies the
 submission for a later `get_order_confirmation` read. Both types are already
 available through `ig_client::prelude`.
 
-This helper is an unpublished addition to the published 0.18.0 baseline. It is
-not available in that release. No package version is changed by this diff;
-ig-engine must wait for the owner to publish the reviewed SDK change before
-consuming the helper.
+This method is not part of the 0.18.0 release. Consumers pinned to that
+version, including ig-engine, must upgrade to the first published release that
+includes it.
 
 ## Submission and reconciliation
 
