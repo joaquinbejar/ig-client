@@ -94,16 +94,18 @@ enum Mutation {
     Close,
     CreateWorking,
     CancelWorking,
+    CancelWorkingWithReference,
     AmendWorking,
 }
 
-const MUTATIONS: [Mutation; 7] = [
+const MUTATIONS: [Mutation; 8] = [
     Mutation::Create,
     Mutation::Amend,
     Mutation::AmendLevel,
     Mutation::Close,
     Mutation::CreateWorking,
     Mutation::CancelWorking,
+    Mutation::CancelWorkingWithReference,
     Mutation::AmendWorking,
 ];
 
@@ -112,7 +114,7 @@ impl Mutation {
         match self {
             Self::Create | Self::Close | Self::CreateWorking => Method::POST,
             Self::Amend | Self::AmendLevel | Self::AmendWorking => Method::PUT,
-            Self::CancelWorking => Method::DELETE,
+            Self::CancelWorking | Self::CancelWorkingWithReference => Method::DELETE,
         }
     }
 
@@ -121,7 +123,9 @@ impl Mutation {
             Self::Create | Self::Close => "/positions/otc",
             Self::Amend | Self::AmendLevel => "/positions/otc/FAKE-DEAL",
             Self::CreateWorking => "/workingorders/otc",
-            Self::CancelWorking | Self::AmendWorking => "/workingorders/otc/FAKE-DEAL",
+            Self::CancelWorking | Self::CancelWorkingWithReference | Self::AmendWorking => {
+                "/workingorders/otc/FAKE-DEAL"
+            }
         }
     }
 
@@ -178,6 +182,10 @@ impl Mutation {
                 .delete_working_order("FAKE-DEAL")
                 .await
                 .map(|()| ACK.into()),
+            Self::CancelWorkingWithReference => client
+                .delete_working_order_with_reference("FAKE-DEAL")
+                .await
+                .map(|response| response.deal_reference),
             Self::AmendWorking => client
                 .update_working_order(
                     "FAKE-DEAL",
@@ -264,7 +272,10 @@ async fn test_order_mutations_success_preserves_wire_contract() -> TestResult {
         let requests = mutation_requests(&server).await;
         assert_wire_request(operation, &requests);
         let request = requests.first().expect("one mutation");
-        if matches!(operation, Mutation::CancelWorking) {
+        if matches!(
+            operation,
+            Mutation::CancelWorking | Mutation::CancelWorkingWithReference
+        ) {
             assert!(request.body.is_empty());
         } else {
             let body: Value = serde_json::from_slice(&request.body)?;
@@ -283,7 +294,9 @@ async fn test_order_mutations_success_preserves_wire_contract() -> TestResult {
                     assert_eq!(body.get("limitLevel"), Some(&json!(2.0)))
                 }
                 Mutation::AmendWorking => assert_eq!(body.get("level"), Some(&json!(2.0))),
-                Mutation::CancelWorking => unreachable!("cancel has no body"),
+                Mutation::CancelWorking | Mutation::CancelWorkingWithReference => {
+                    unreachable!("cancel has no body")
+                }
             }
         }
     }
@@ -496,7 +509,9 @@ async fn test_http_wrappers_cannot_weaken_trading_policy() -> TestResult {
                         Mutation::Amend | Mutation::AmendLevel | Mutation::AmendWorking => {
                             client.put(&target, json!({}), Some(2)).await
                         }
-                        Mutation::CancelWorking => client.delete(&target, Some(2)).await,
+                        Mutation::CancelWorking | Mutation::CancelWorkingWithReference => {
+                            client.delete(&target, Some(2)).await
+                        }
                     }
                 };
                 assert!(matches!(result, Err(AppError::Unauthorized)));

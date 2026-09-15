@@ -17,7 +17,7 @@ still required before ig-engine may consume it; ig-engine keeps its
   HTTP redirects, and reqwest protocol retries.
 
 `HttpClient::request_with_policy(method, path, body, version, policy)` adds an
-explicit policy without changing the seven `OrderService` mutation signatures or
+explicit policy without changing the existing `OrderService` mutation signatures or
 their IG request/response DTOs. The generic `request`, `post`, `put`, `delete`, and
 POST-with-DELETE-override helpers cannot weaken known trading mutations by
 selecting `Standard`. Selection and dispatch use the same normalized URL.
@@ -81,7 +81,7 @@ or exactly-once guarantee.
 The implementation agent ran 72 selected tests with explicit synthetic
 configuration and local listeners: 14 mutation cases, 3 transport/classifier
 cases, 10 auth-flow cases, 9 HTTP-read retry cases, and 36 key-pool cases. Each
-selected test may cover multiple operations and statuses. Cases include all seven
+selected test may cover multiple operations and statuses. Cases include all eight
 mutations, v2/OAuth authentication rejection, allowance errors, redirects,
 malformed success payloads, received-request connection loss, truncated bodies,
 canonical and escaped endpoint aliases, and standard-read regressions.

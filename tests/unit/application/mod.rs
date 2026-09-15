@@ -11,3 +11,4 @@ mod test_key_pool;
 mod test_listener;
 mod test_market_catalog;
 mod test_mutation_policy;
+mod test_order_service_compatibility;

@@ -1088,6 +1088,15 @@ impl OrderService for Client {
     }
 
     async fn delete_working_order(&self, deal_id: &str) -> Result<(), AppError> {
+        self.delete_working_order_with_reference(deal_id)
+            .await
+            .map(|_| ())
+    }
+
+    async fn delete_working_order_with_reference(
+        &self,
+        deal_id: &str,
+    ) -> Result<CreateWorkingOrderResponse, AppError> {
         let path = format!("workingorders/otc/{}", deal_id);
         let result: CreateWorkingOrderResponse = self
             .http_client
@@ -1100,10 +1109,10 @@ impl OrderService for Client {
             )
             .await?;
         debug!(
-            "Working order created with reference: {}",
-            result.deal_reference
+            deal_reference = %result.deal_reference,
+            "Working-order cancellation acknowledged"
         );
-        Ok(())
+        Ok(result)
     }
 
     async fn get_position(&self, deal_id: &str) -> Result<SinglePositionResponse, AppError> {

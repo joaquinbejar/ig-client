@@ -391,10 +391,40 @@ behavior and DATA-ENGINE's real symbol/chain mapping remain integration checks.
 - `close_position(request)` / `get_position(deal_id)`
 - `create_working_order(request)` / `update_working_order(deal_id, update)` /
   `delete_working_order(deal_id)`
+- `delete_working_order_with_reference(deal_id)` — retain the cancellation acknowledgement
+
+#### Working-order cancellation references
+
+`delete_working_order_with_reference` returns IG's acknowledgement as the
+existing `CreateWorkingOrderResponse`. Retain `deal_reference` and use
+`get_order_confirmation` to establish the outcome; a successful submission
+is not confirmed deletion.
+
+```rust
+use ig_client::prelude::{AppError, Client, CreateWorkingOrderResponse, OrderService};
+
+async fn cancel_with_reference(
+    client: &Client,
+    deal_id: &str,
+) -> Result<CreateWorkingOrderResponse, AppError> {
+    client.delete_working_order_with_reference(deal_id).await
+}
+```
+
+The existing `delete_working_order(deal_id) -> Result<(), AppError>` remains
+available. The SDK delegates it once, discarding only the acknowledgement.
+Existing external `OrderService` implementations compile unchanged: unless
+overridden, the new method returns `AppError::InvalidInput` without invoking
+their legacy cancellation method or submitting a request.
+
+If the response is lost, the reference may be unavailable. Reconcile the
+working order instead of repeating the cancellation to recover a reference.
+See the [cancellation-reference adoption guide](https://github.com/joaquinbejar/ig-client/blob/main/doc/CANCELLATION_REFERENCE.md)
+for compatibility and release requirements.
 
 #### Request replay policy (0.18.0)
 
-All seven `OrderService` mutation methods use `RequestPolicy::SingleAttempt`:
+The SDK's `OrderService` mutation methods use `RequestPolicy::SingleAttempt`:
 opening and closing positions, both position amendment methods, and creating,
 amending, or cancelling working orders. Each invocation sends at most one
 business request. A 401, 429, server error, redirect, transport failure, or
