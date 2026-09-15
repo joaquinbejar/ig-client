@@ -6,9 +6,8 @@ existing `CreateWorkingOrderResponse`, whose `deal_reference` identifies the
 submission for a later `get_order_confirmation` read. Both types are already
 available through `ig_client::prelude`.
 
-This method is not part of the 0.18.0 release. Consumers pinned to that
-version, including ig-engine, must upgrade to the first published release that
-includes it.
+This method is available from 0.18.1. Consumers pinned to 0.18.0, including
+ig-engine, must upgrade to 0.18.1 or later.
 
 ## Submission and reconciliation
 
