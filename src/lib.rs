@@ -48,7 +48,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = "0.18.1"
+//! ig-client = "0.18.2"
 //! tokio = { version = "1", features = ["full"] }  # Async runtime
 //! tracing = "0.1"                                  # Logging facade
 //! # Optional, only if you use the PostgreSQL persistence layer:
@@ -73,7 +73,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! ig-client = { version = "0.18.1", default-features = false }
+//! ig-client = { version = "0.18.2", default-features = false }
 //! ```
 //!
 //! That leaves `Client`, `Client::with_config`, every REST service trait
