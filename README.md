@@ -77,7 +77,7 @@ and must not read a `.env` file or the `IG_*` namespace, use
 
 | Feature | Default | Pulls in | Gives you |
 |---|---|---|---|
-| `streaming` | on | `lightstreamer-rs` | `StreamerClient`, `DynamicMarketStreamer`, `StreamingUpdate` and its DTO adapters, `application::interfaces::listener` |
+| `streaming` | on | `lightstreamer-rs` | `StreamerClient`, `DynamicMarketStreamer`, `QuoteStreamer`, `StreamingUpdate` and its DTO adapters, `application::interfaces::listener` |
 | `persistence` | on | `sqlx` | the `storage` module: `MarketDatabaseService`, historical prices, connection pooling |
 
 Both are on by default, so the crate behaves exactly as before unless you
@@ -330,6 +330,35 @@ async fn main() -> Result<(), AppError> {
 }
 ```
 
+#### Live quotes on demand
+
+*Requires the default `streaming` feature.*
+
+IG caps how many instruments one account streams at once (about thirty).
+`QuoteStreamer` subscribes to an instrument the first time its quote is
+asked for, answers from the stream afterwards without any REST request,
+and drops the least recently used instrument when the cap is reached.
+Adding or dropping one instrument is a single control request on the open
+session; the other subscriptions keep flowing.
+
+```rust
+use ig_client::prelude::*;
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+    let capacity = NonZeroUsize::new(DEFAULT_QUOTE_CAPACITY).expect("positive");
+    let streamer = QuoteStreamer::new(Client::try_new()?, capacity);
+
+    // Subscribes, then waits up to a second for IG's snapshot.
+    if let Some(quote) = streamer.quote("IX.D.DAX.DAILY.IP", Duration::from_secs(1)).await? {
+        println!("bid {:?} offer {:?}", quote.bid, quote.offer);
+    }
+    streamer.close().await
+}
+```
+
 ### Available Services
 
 Every service trait below is implemented by `Client`; bring the traits into
@@ -544,7 +573,8 @@ src/
 │   ├── client.rs      # Client (REST services) + StreamerClient
 │   ├── config.rs      # Config, Credentials, REST / WS / rate-limiter config
 │   ├── rate_limiter.rs      # governor-backed request pacing
-│   └── dynamic_streamer.rs  # DynamicMarketStreamer (subscriptions)
+│   ├── dynamic_streamer.rs  # DynamicMarketStreamer (subscriptions)
+│   └── quote_streamer.rs    # QuoteStreamer (live quotes on demand)
 ├── model/             # Pure DTOs: requests, responses, streaming, retry
 ├── presentation/      # Domain entities (account, market, order, price, …)
 ├── storage/           # PostgreSQL persistence via sqlx (feature `persistence`)
