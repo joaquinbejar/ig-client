@@ -74,6 +74,8 @@ pub use crate::application::interfaces::watchlist::WatchlistService;
 pub use crate::application::client::StreamerClient;
 #[cfg(feature = "streaming")]
 pub use crate::application::dynamic_streamer::DynamicMarketStreamer;
+#[cfg(feature = "streaming")]
+pub use crate::application::quote_streamer::{DEFAULT_QUOTE_CAPACITY, QuoteStreamer, StreamQuote};
 // The seam between `lightstreamer-rs` and the presentation DTOs: implement
 // `From<&StreamingUpdate>` to plug your own type into `Listener<T>`.
 #[cfg(feature = "streaming")]

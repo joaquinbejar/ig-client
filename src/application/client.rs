@@ -223,6 +223,10 @@ fn ensure_zone_designator(raw: &str) -> String {
 ///
 /// This client provides a unified interface for all IG Markets API operations,
 /// including market data, account management, and order execution.
+///
+/// Cloning is cheap: clones share the HTTP client, its sessions and its
+/// rate limiters.
+#[derive(Clone)]
 pub struct Client {
     http_client: Arc<HttpClient>,
 }

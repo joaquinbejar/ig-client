@@ -231,7 +231,65 @@ impl Auth {
     /// refresh failure).
     pub async fn ws_info(&self) -> Result<WebsocketInfo, AppError> {
         let session = self.get_session().await?;
-        Ok(session.get_websocket_info())
+        let mut info = session.get_websocket_info();
+        // An OAuth (v3) session carries no CST / X-SECURITY-TOKEN, and
+        // Lightstreamer authenticates with nothing else: its password is the
+        // token pair. IG hands the pair for an OAuth session on request.
+        if session.api_version == 3 && (info.cst.is_none() || info.x_security_token.is_none()) {
+            let (cst, x_security_token) = self.fetch_session_tokens(&session).await?;
+            info.cst = Some(cst);
+            info.x_security_token = Some(x_security_token);
+        }
+        Ok(info)
+    }
+
+    /// The CST / X-SECURITY-TOKEN pair for an OAuth session, from
+    /// `GET /session?fetchSessionTokens=true` (version 1).
+    ///
+    /// # Errors
+    /// Returns [`AppError::Unauthorized`] when the session has no OAuth token or
+    /// IG answers without the pair, and the request's own errors otherwise.
+    async fn fetch_session_tokens(&self, session: &Session) -> Result<(String, String), AppError> {
+        let oauth = session.oauth_token.as_ref().ok_or(AppError::Unauthorized)?;
+        let url = format!(
+            "{}/session?fetchSessionTokens=true",
+            self.config.rest_api.base_url
+        );
+        let bearer = format!("Bearer {}", oauth.access_token);
+        let headers = vec![
+            ("X-IG-API-KEY", self.config.credentials.api_key.as_str()),
+            ("Content-Type", "application/json"),
+            ("Version", "1"),
+            ("Authorization", bearer.as_str()),
+            ("IG-ACCOUNT-ID", session.account_id.as_str()),
+        ];
+        let response = make_http_request_with_account(
+            &self.client,
+            self.pacing(),
+            Method::GET,
+            &url,
+            headers,
+            &None::<serde_json::Value>,
+            RetryConfig::default(),
+        )
+        .await?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        match (header("CST"), header("X-SECURITY-TOKEN")) {
+            (Some(cst), Some(x_security_token)) => {
+                debug!("streaming tokens fetched for the OAuth session");
+                Ok((cst, x_security_token))
+            }
+            _ => {
+                warn!("IG answered fetchSessionTokens without the token pair");
+                Err(AppError::Unauthorized)
+            }
+        }
     }
 
     /// Gets the WebSocket password for Lightstreamer authentication
@@ -882,6 +940,62 @@ mod session_lifecycle_tests {
         assert!(!should_switch_account(2, "ACC-A", "ACC-A"));
         // OAuth (v3) is never switched through this path.
         assert!(!should_switch_account(3, "ACC-B", "ACC-A"));
+    }
+
+    #[tokio::test]
+    async fn test_ws_info_fetches_streaming_tokens_for_an_oauth_session() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/session"))
+            .and(query_param("fetchSessionTokens", "true"))
+            .and(header("Authorization", "Bearer ACCESS"))
+            .and(header("IG-ACCOUNT-ID", "ACC123"))
+            .and(header("Version", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("CST", "STREAM-CST")
+                    .insert_header("X-SECURITY-TOKEN", "STREAM-XST")
+                    .set_body_json(serde_json::json!({"accountId": "ACC123"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        config.rest_api.base_url = server.uri();
+        let auth = Auth::try_new(Arc::new(config)).expect("auth construction should succeed");
+        let seeded = Session {
+            account_id: "ACC123".to_string(),
+            client_id: "CLIENT1".to_string(),
+            lightstreamer_endpoint: "demo-apd.marketdatasystems.com".to_string(),
+            cst: None,
+            x_security_token: None,
+            oauth_token: Some(OAuthToken {
+                access_token: "ACCESS".to_string(),
+                refresh_token: "REFRESH".to_string(),
+                scope: "profile".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: "3600".to_string(),
+                created_at: Utc::now(),
+            }),
+            api_version: 3,
+            expires_at: (Utc::now().timestamp() + 3600) as u64,
+        };
+        {
+            let mut guard = auth.session.write().await;
+            *guard = Some(seeded);
+        }
+
+        let ws = match auth.ws_info().await {
+            Ok(ws) => ws,
+            Err(e) => panic!("ws_info should fetch the streaming tokens: {e}"),
+        };
+        assert_eq!(ws.cst.as_deref(), Some("STREAM-CST"));
+        assert_eq!(ws.x_security_token.as_deref(), Some("STREAM-XST"));
+        assert_eq!(ws.get_ws_password(), "CST-STREAM-CST|XST-STREAM-XST");
     }
 
     #[tokio::test]
