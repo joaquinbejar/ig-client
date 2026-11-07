@@ -497,7 +497,7 @@ impl HttpClient {
                     );
                     last = Some(e);
                 }
-                Err(e) if pool.len() > 1 && is_key_refusal(&e) => {
+                Err(e) if is_key_refusal(&e) && Self::may_park_in(pool, index) => {
                     slot.mark_refused();
                     last = Some(e);
                 }
@@ -551,8 +551,16 @@ impl HttpClient {
                 return Ok(None);
             }
             self.pool[primary].rate_limiter.reserve(class).await;
-            self.pool[primary].auth.get_session().await?;
-            return Ok(Some(primary));
+            return match self.pool[primary].auth.get_session().await {
+                Ok(_) => Ok(Some(primary)),
+                Err(e) if is_key_refusal(&e) && self.may_park(primary) => {
+                    // The primary's key is refused: orders would keep failing on
+                    // it, so park it and move trading to a key that logs in.
+                    self.pool[primary].mark_refused();
+                    self.trading_fallback(class, primary, tried, e).await
+                }
+                Err(e) => Err(e),
+            };
         }
 
         let len = self.pool.len();
@@ -600,7 +608,7 @@ impl HttpClient {
                     );
                     continue;
                 }
-                Err(e) if self.pool.len() > 1 && is_key_refusal(&e) => {
+                Err(e) if is_key_refusal(&e) && self.may_park(i) => {
                     slot.mark_refused();
                     continue;
                 }
@@ -681,7 +689,7 @@ impl HttpClient {
         // it. Establishing the session earlier is not possible: which key wins
         // is only known once one refills.
         if let Err(e) = self.pool[winner].auth.get_session().await {
-            if self.pool.len() > 1 && is_key_refusal(&e) {
+            if is_key_refusal(&e) && self.may_park(winner) {
                 self.pool[winner].mark_refused();
                 let mut tried = tried.to_vec();
                 tried.push(winner);
@@ -691,6 +699,35 @@ impl HttpClient {
         }
         self.promote_primary_if_needed(winner);
         Ok(Some(winner))
+    }
+
+    /// Moves trading off a refused primary: the first other key that logs in
+    /// becomes the primary and serves the order. Keys refused on the way are
+    /// parked, except the last usable one; with none left, `refusal` is
+    /// returned as the primary's own failure would have been.
+    async fn trading_fallback(
+        &self,
+        class: RateLimitClass,
+        refused: usize,
+        tried: &[usize],
+        refusal: AppError,
+    ) -> Result<Option<usize>, AppError> {
+        for i in 0..self.pool.len() {
+            let slot = &self.pool[i];
+            if i == refused || tried.contains(&i) || slot.in_cooldown() {
+                continue;
+            }
+            match slot.auth.get_session().await {
+                Ok(_) => {
+                    self.promote_primary_if_needed(i);
+                    slot.rate_limiter.reserve(class).await;
+                    return Ok(Some(i));
+                }
+                Err(e) if is_key_refusal(&e) && self.may_park(i) => slot.mark_refused(),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(refusal)
     }
 
     /// Gets WebSocket connection information for Lightstreamer, reusing the
@@ -1252,6 +1289,21 @@ impl HttpClient {
     }
 
     /// The primary slot's index, clamped to the pool.
+    /// Whether `index` may be parked for a refused login: only while another
+    /// key of the pool is still usable. The last usable key is never parked, so
+    /// a refusal that is not about the key (an account switch, an IG-wide 403)
+    /// costs no more than it did before keys could be parked: the next request
+    /// tries it again.
+    fn may_park(&self, index: usize) -> bool {
+        Self::may_park_in(&self.pool, index)
+    }
+
+    fn may_park_in(pool: &[KeySlot], index: usize) -> bool {
+        pool.iter()
+            .enumerate()
+            .any(|(i, slot)| i != index && !slot.in_cooldown())
+    }
+
     fn primary_index(&self) -> usize {
         self.primary
             .load(Ordering::Relaxed)

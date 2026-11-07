@@ -1785,3 +1785,102 @@ async fn test_pool_every_key_refused_fails_fast() {
         "no data request went out"
     );
 }
+
+/// The last usable key is never parked. If IG refuses every key for a while
+/// (not a bad key: an IG-wide 403, say), the pool must recover as soon as IG
+/// does, not stay shut for the hour a parked key waits out.
+#[tokio::test]
+async fn test_pool_last_usable_key_is_not_parked_and_recovers() {
+    let server = MockServer::start().await;
+    for key in ["key-a", "key-b"] {
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .and(wiremock::matchers::header("X-IG-API-KEY", key))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "errorCode": "error.public-api.failure.unavailable"
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
+    mount_login_ok(&server).await;
+    mount_data_ok(&server).await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 20, 60, 20))
+        .expect("client builds");
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.get::<Dummy>("/data", Some(1)),
+    )
+    .await;
+    assert!(
+        matches!(first, Ok(Err(_))),
+        "both keys refused: the request fails, got {first:?}"
+    );
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.get::<Dummy>("/data", Some(1)),
+    )
+    .await;
+    assert!(
+        matches!(second, Ok(Ok(_))),
+        "IG answers again and the unparked key serves, got {second:?}"
+    );
+}
+
+/// Trading follows a refused primary off its key: the order is sent on a key
+/// that logs in, which becomes the primary, so the next order uses it too.
+#[tokio::test]
+async fn test_pool_trading_moves_off_a_refused_primary() {
+    let server = MockServer::start().await;
+    mount_login_refused_for(&server, "key-a").await;
+    mount_login_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/positions/otc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let client = HttpClient::new_lazy(pool_config_burst(&server.uri(), "key-a,key-b", 20, 60, 20))
+        .expect("client builds");
+
+    for _ in 0..2 {
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            client.post::<_, Dummy>("/positions/otc", serde_json::json!({}), Some(2)),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "order accepted, got {result:?}"
+        );
+    }
+
+    let orders: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == "/positions/otc")
+        .map(|r| {
+            r.headers
+                .get("X-IG-API-KEY")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        orders,
+        ["key-b", "key-b"],
+        "both orders on the key that logs in"
+    );
+    assert_eq!(
+        logins_with(&server, "key-a").await,
+        1,
+        "the refused primary tried once"
+    );
+}
