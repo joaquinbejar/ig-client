@@ -73,6 +73,11 @@ pub struct HttpClient {
     /// requests pile onto the first key while the rest sit idle. Advancing it
     /// per selection spreads equally-available keys evenly.
     cursor: AtomicUsize,
+    /// Serialises "may this key be parked? then park it". Two requests refused
+    /// at the same moment on different keys could otherwise each see the other
+    /// key still usable and park both, shutting the pool for an hour. Held only
+    /// for that check and the store, never across an await.
+    park_lock: StdMutex<()>,
 }
 
 /// The account in force and the account-wide budget metered against it.
@@ -305,6 +310,7 @@ impl HttpClient {
             selected,
             primary: AtomicUsize::new(primary),
             cursor: AtomicUsize::new(0),
+            park_lock: StdMutex::new(()),
         })
     }
 
@@ -336,6 +342,7 @@ impl HttpClient {
             selected,
             primary: AtomicUsize::new(0),
             cursor: AtomicUsize::new(0),
+            park_lock: StdMutex::new(()),
         })
     }
 
@@ -553,10 +560,9 @@ impl HttpClient {
             self.pool[primary].rate_limiter.reserve(class).await;
             return match self.pool[primary].auth.get_session().await {
                 Ok(_) => Ok(Some(primary)),
-                Err(e) if is_key_refusal(&e) && self.may_park(primary) => {
+                Err(e) if is_key_refusal(&e) && self.try_park_refused(primary) => {
                     // The primary's key is refused: orders would keep failing on
-                    // it, so park it and move trading to a key that logs in.
-                    self.pool[primary].mark_refused();
+                    // it, so it is parked and trading moves to a key that logs in.
                     self.trading_fallback(class, primary, tried, e).await
                 }
                 Err(e) => Err(e),
@@ -608,10 +614,8 @@ impl HttpClient {
                     );
                     continue;
                 }
-                Err(e) if is_key_refusal(&e) && self.may_park(i) => {
-                    slot.mark_refused();
-                    continue;
-                }
+                // Parks the key when another is still usable (see `try_park_refused`).
+                Err(e) if is_key_refusal(&e) && self.try_park_refused(i) => continue,
                 Err(e) => return Err(e),
             }
             // This key just proved it can authenticate. If the incumbent primary
@@ -689,8 +693,7 @@ impl HttpClient {
         // it. Establishing the session earlier is not possible: which key wins
         // is only known once one refills.
         if let Err(e) = self.pool[winner].auth.get_session().await {
-            if is_key_refusal(&e) && self.may_park(winner) {
-                self.pool[winner].mark_refused();
+            if is_key_refusal(&e) && self.try_park_refused(winner) {
                 let mut tried = tried.to_vec();
                 tried.push(winner);
                 return Box::pin(self.reserve_slot(class, &tried)).await;
@@ -723,7 +726,7 @@ impl HttpClient {
                     slot.rate_limiter.reserve(class).await;
                     return Ok(Some(i));
                 }
-                Err(e) if is_key_refusal(&e) && self.may_park(i) => slot.mark_refused(),
+                Err(e) if is_key_refusal(&e) && self.try_park_refused(i) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -1296,6 +1299,22 @@ impl HttpClient {
     /// tries it again.
     fn may_park(&self, index: usize) -> bool {
         Self::may_park_in(&self.pool, index)
+    }
+
+    /// Parks `index` for a refused login if another key is still usable, as one
+    /// step under `park_lock`. Returns whether it parked.
+    fn try_park_refused(&self, index: usize) -> bool {
+        let _guard = match self.park_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !self.may_park(index) {
+            return false;
+        }
+        if let Some(slot) = self.pool.get(index) {
+            slot.mark_refused();
+        }
+        true
     }
 
     fn may_park_in(pool: &[KeySlot], index: usize) -> bool {
