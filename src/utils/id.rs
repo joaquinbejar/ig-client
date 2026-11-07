@@ -35,9 +35,8 @@ pub fn get_id() -> String {
 
 /// An IG account id reduced to its first and last character, for logs.
 ///
-/// Account ids identify a client's account (the live-money one included), so
-/// the full id never goes to a log line; this masked form is enough to tell two
-/// accounts apart when reading one.
+/// Account ids identify a client's account, so the full id never goes to a log
+/// line; this masked form is enough to tell two accounts apart when reading one.
 ///
 /// # Examples
 /// ```

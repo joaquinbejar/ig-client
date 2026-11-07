@@ -1898,7 +1898,8 @@ impl StreamerClient {
             .collect();
         let field_names = get_streaming_price_fields(&fields);
 
-        debug!(?items, ?field_names, "Pricing subscription shape");
+        // Not the items themselves: each one carries the account id.
+        debug!(epic_count, ?field_names, "Pricing subscription shape");
 
         // The `Pricing` data adapter name is a server-side configuration
         // detail; it is overridable so a differently-configured IG environment

@@ -96,7 +96,12 @@ fn test_no_log_line_prints_a_raw_account_id() {
                 let code_only = without_masked(&without_strings(call));
                 // A field named account_id is fine; its value is what counts.
                 let values = code_only.replace("account_id =", "");
-                if values.contains("account_id") {
+                // Streaming item names (`TRADE:`, `ACCOUNT:`, `PRICE:`) embed
+                // the account id, so a log line never prints them either.
+                let prints_items = ["?items", "%items", "items =", "item_names"]
+                    .iter()
+                    .any(|name| code_only.contains(name));
+                if values.contains("account_id") || prints_items {
                     found.push(format!("{}:{}: {}", path.display(), index + 1, code));
                 }
             }
