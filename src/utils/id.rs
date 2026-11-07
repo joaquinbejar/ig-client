@@ -32,3 +32,26 @@ const DEAL_REF_LENGTH: usize = 30;
 pub fn get_id() -> String {
     nanoid::nanoid!(DEAL_REF_LENGTH, &DEAL_REF_ALPHABET)
 }
+
+/// An IG account id reduced to its first and last character, for logs.
+///
+/// Account ids identify a client's account, so the full id never goes to a log
+/// line; this masked form is enough to tell two accounts apart when reading one.
+///
+/// # Examples
+/// ```
+/// use ig_client::utils::id::mask_account_id;
+///
+/// assert_eq!(mask_account_id("ABC123"), "A…3");
+/// assert_eq!(mask_account_id("A"), "…");
+/// assert_eq!(mask_account_id(""), "");
+/// ```
+#[must_use]
+pub fn mask_account_id(account_id: &str) -> String {
+    let mut chars = account_id.chars();
+    match (chars.next(), chars.next_back()) {
+        (Some(first), Some(last)) => format!("{first}…{last}"),
+        (Some(_), None) => "…".to_string(),
+        _ => String::new(),
+    }
+}

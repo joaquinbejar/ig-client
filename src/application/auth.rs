@@ -395,7 +395,10 @@ impl Auth {
             *sess = Some(session.clone());
         }
 
-        info!("✓ Login successful, account: {}", session.account_id);
+        info!(
+            "✓ Login successful, account: {}",
+            crate::utils::id::mask_account_id(&session.account_id)
+        );
 
         // v2 account selection: the v2 `/session` response reports IG's
         // current/default account, which may differ from the configured one.
@@ -669,11 +672,17 @@ impl Auth {
         }
 
         if current_session.account_id == account_id {
-            debug!("Already on account {}", account_id);
+            debug!(
+                "Already on account {}",
+                crate::utils::id::mask_account_id(account_id)
+            );
             return Ok(current_session);
         }
 
-        info!("Switching to account: {}", account_id);
+        info!(
+            "Switching to account: {}",
+            crate::utils::id::mask_account_id(account_id)
+        );
 
         let url = format!("{}/session", self.config.rest_api.base_url);
 
@@ -754,7 +763,10 @@ impl Auth {
             *session = Some(new_session.clone());
         }
 
-        info!("✓ Switched to account: {}", account_id);
+        info!(
+            "✓ Switched to account: {}",
+            crate::utils::id::mask_account_id(account_id)
+        );
         Ok(new_session)
     }
 
