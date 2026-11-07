@@ -108,6 +108,34 @@ struct KeySlot {
 /// long that the pool shrinks under sustained load.
 const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// How long a key is skipped after IG refuses its login outright.
+///
+/// A 403 at login that is not an allowance code (a disabled or revoked key, a
+/// key not valid for this environment) does not recover by itself within
+/// minutes. Without this, every request that reached that key's slot logged in
+/// again and failed, while the pool's other keys could have served it.
+const KEY_REFUSED_COOLDOWN: Duration = Duration::from_secs(3600);
+
+/// Whether a login failure is IG refusing this key, as opposed to an allowance
+/// or a network problem: a 403 whose code is none of the allowance ones, which
+/// the transport reports as `Unexpected(FORBIDDEN)`.
+fn is_key_refusal(error: &AppError) -> bool {
+    matches!(error, AppError::Unexpected(StatusCode::FORBIDDEN))
+}
+
+/// IG's `errorCode` from an error body, for logs: the code only, never the
+/// body, and only when it looks like one (`error.security.api-key-disabled`).
+fn ig_error_code(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = value.get("errorCode")?.as_str()?;
+    let plausible = !code.is_empty()
+        && code.len() <= 120
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    plausible.then(|| code.to_string())
+}
+
 /// The two budgets every physical request has to pass.
 ///
 /// IG meters an allowance per API key *and* one per account, and a pool draws
@@ -194,7 +222,21 @@ impl KeySlot {
 
     /// Marks the key as exhausted for [`KEY_COOLDOWN`].
     fn mark_exhausted(&self) {
-        let until = Instant::now() + KEY_COOLDOWN;
+        self.park_for(KEY_COOLDOWN);
+    }
+
+    /// Parks the key for [`KEY_REFUSED_COOLDOWN`] after IG refused its login.
+    fn mark_refused(&self) {
+        self.park_for(KEY_REFUSED_COOLDOWN);
+        warn!(
+            key = %redact_key(&self.api_key),
+            cooldown_secs = KEY_REFUSED_COOLDOWN.as_secs(),
+            "IG refused this API key's login; parking it and using the pool's other keys"
+        );
+    }
+
+    fn park_for(&self, cooldown: Duration) {
+        let until = Instant::now() + cooldown;
         match self.cooldown_until.lock() {
             Ok(mut g) => *g = Some(until),
             Err(poisoned) => *poisoned.into_inner() = Some(until),
@@ -455,6 +497,10 @@ impl HttpClient {
                     );
                     last = Some(e);
                 }
+                Err(e) if pool.len() > 1 && is_key_refusal(&e) => {
+                    slot.mark_refused();
+                    last = Some(e);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -554,6 +600,10 @@ impl HttpClient {
                     );
                     continue;
                 }
+                Err(e) if self.pool.len() > 1 && is_key_refusal(&e) => {
+                    slot.mark_refused();
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
             // This key just proved it can authenticate. If the incumbent primary
@@ -585,6 +635,12 @@ impl HttpClient {
                 .min()
             {
                 let now = Instant::now();
+                // Every key left is parked, and the soonest back is a refused
+                // one: waiting an hour inside a request helps nobody, so fail
+                // as a refused login would have.
+                if until > now + KEY_COOLDOWN {
+                    return Err(AppError::Unexpected(StatusCode::FORBIDDEN));
+                }
                 if until > now {
                     debug!(
                         wait_ms = (until - now).as_millis(),
@@ -624,7 +680,15 @@ impl HttpClient {
         // The winner's token is already spent, so a login failure here does cost
         // it. Establishing the session earlier is not possible: which key wins
         // is only known once one refills.
-        self.pool[winner].auth.get_session().await?;
+        if let Err(e) = self.pool[winner].auth.get_session().await {
+            if self.pool.len() > 1 && is_key_refusal(&e) {
+                self.pool[winner].mark_refused();
+                let mut tried = tried.to_vec();
+                tried.push(winner);
+                return Box::pin(self.reserve_slot(class, &tried)).await;
+            }
+            return Err(e);
+        }
         self.promote_primary_if_needed(winner);
         Ok(Some(winner))
     }
@@ -1488,7 +1552,12 @@ pub async fn make_http_request_paced<B: Serialize>(
                     warn!("account allowance exceeded");
                     return Err(AppError::AccountAllowanceExceeded);
                 } else {
-                    error!(status = ?status, "forbidden");
+                    let error_code = ig_error_code(&body_text);
+                    error!(
+                        status = ?status,
+                        error_code = error_code.as_deref().unwrap_or("-"),
+                        "forbidden"
+                    );
                     return Err(AppError::Unexpected(status));
                 }
             }
@@ -1665,6 +1734,33 @@ mod tests {
     use reqwest::{Method, StatusCode};
 
     const BASE: &str = "https://demo-api.ig.com/gateway/deal";
+
+    #[test]
+    fn test_ig_error_code_reads_the_code_and_nothing_else() {
+        use super::ig_error_code;
+        assert_eq!(
+            ig_error_code(r#"{"errorCode":"error.security.api-key-disabled"}"#).as_deref(),
+            Some("error.security.api-key-disabled")
+        );
+        assert_eq!(ig_error_code("not json"), None);
+        assert_eq!(ig_error_code(r#"{"other":"x"}"#), None);
+        // Anything that does not look like an IG code is not echoed into a log.
+        assert_eq!(
+            ig_error_code(r#"{"errorCode":"secret value with spaces"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_only_a_plain_403_counts_as_a_key_refusal() {
+        use super::is_key_refusal;
+        use crate::error::AppError;
+        assert!(is_key_refusal(&AppError::Unexpected(StatusCode::FORBIDDEN)));
+        assert!(!is_key_refusal(&AppError::ApiKeyAllowanceExceeded));
+        assert!(!is_key_refusal(&AppError::Unexpected(
+            StatusCode::BAD_GATEWAY
+        )));
+    }
 
     #[test]
     fn test_classify_endpoint_post_positions_otc_is_trading() {
