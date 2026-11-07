@@ -339,7 +339,10 @@ impl QuoteStreamer {
             ))
             .build()?;
         let (client, mut events) = LsClient::connect(config).await?;
-        info!(account_id = %ws_info.account_id, "quote streaming session opened");
+        info!(
+            account_id = %crate::utils::id::mask_account_id(&ws_info.account_id),
+            "quote streaming session opened"
+        );
 
         let (alive_tx, alive) = watch::channel(true);
         let mut shutdown = self.inner.shutdown_tx.subscribe();

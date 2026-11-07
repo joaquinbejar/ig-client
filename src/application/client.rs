@@ -1580,7 +1580,10 @@ impl StreamerClient {
     async fn ensure_session(&mut self) -> Result<&LsClient, AppError> {
         if self.client.is_none() {
             let (client, events) = LsClient::connect(self.config.clone()).await?;
-            info!(account_id = %self.account_id, "Lightstreamer session opened");
+            info!(
+                account_id = %crate::utils::id::mask_account_id(&self.account_id),
+                "Lightstreamer session opened"
+            );
             self.client = Some(client);
             self.session_events = Some(events);
         }
@@ -1781,7 +1784,10 @@ impl StreamerClient {
             .await?;
         self.has_market_stream_subs = true;
 
-        info!(account_id = %account_id, "Trade subscription created");
+        info!(
+            account_id = %crate::utils::id::mask_account_id(&account_id),
+            "Trade subscription created"
+        );
         Ok(receiver)
     }
 
@@ -1836,7 +1842,10 @@ impl StreamerClient {
             .await?;
         self.has_market_stream_subs = true;
 
-        info!(account_id = %account_id, "Account subscription created");
+        info!(
+            account_id = %crate::utils::id::mask_account_id(&account_id),
+            "Account subscription created"
+        );
         Ok(receiver)
     }
 
@@ -1911,7 +1920,10 @@ impl StreamerClient {
             .await?;
         self.has_price_stream_subs = true;
 
-        info!(account_id = %account_id, "Price subscription created for {epic_count} instruments");
+        info!(
+            account_id = %crate::utils::id::mask_account_id(&account_id),
+            "Price subscription created for {epic_count} instruments"
+        );
         Ok(receiver)
     }
 

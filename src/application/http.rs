@@ -1142,7 +1142,11 @@ impl HttpClient {
             guard.id = account_id.to_string();
             guard.limiter = limiter;
         }
-        debug!(account = %account_id, oauth = is_oauth, "account switched");
+        debug!(
+            account = %crate::utils::id::mask_account_id(account_id),
+            oauth = is_oauth,
+            "account switched"
+        );
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+mod account_id_logs_tests;
 mod parsing_tests;
 mod test_config;
 mod test_finance;
