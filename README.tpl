@@ -137,13 +137,13 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [lightstreamer-rs](https://github.com/joaquinbejar/lightstreamer-rs) · [crates.io](https://crates.io/crates/lightstreamer-rs) | Rust client SDK for the Lightstreamer TLCP protocol. |
-| [pretty-simple-display](https://github.com/joaquinbejar/pretty-simple-display) · [crates.io](https://crates.io/crates/pretty-simple-display) | Derive macros for pretty and simple JSON display formatting. |
+| [lightstreamer-rs](https://github.com/joaquinbejar/lightstreamer-rs) | Lightstreamer TLCP client behind the optional `streaming` feature for real-time prices and account updates. |
+| [pretty-simple-display](https://github.com/joaquinbejar/pretty-simple-display) | Derive macros that give the API models their pretty and simple JSON `Debug` and `Display` output. |
 
 ### Used by
 
 | Repository | Description |
 |------------|-------------|
-| [ChainView](https://github.com/joaquinbejar/ChainView) | Terminal UI for option chains, Greeks and volatility, real-time and backtest replay. |
+| [ChainView](https://github.com/joaquinbejar/ChainView) | Terminal UI for option chains, Greeks and volatility; uses ig-client as its IG Markets data source. |
 
 <!-- related-projects:end -->
