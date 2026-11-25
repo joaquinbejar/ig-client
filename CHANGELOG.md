@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.20.0] - 2026-11-25
+
+### Changed (breaking)
+
+- `PositionDetails::contract_size` is now `Option<f64>`.
+- `PositionDetails::created_date_utc` is now `Option<String>`.
+- `ExpiryDetails::last_dealing_date` is now `Option<String>`.
+
+A missing or null `contractSize`, `createdDateUTC` or `lastDealingDate` failed
+deserialization of the whole positions or market details response. They now
+decode as `None`. Adding two positions keeps `contract_size` only when both
+sides report it.
+
 ## [0.19.0] - 2026-11-25
 
 ### Changed (breaking)

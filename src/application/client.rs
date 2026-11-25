@@ -693,7 +693,7 @@ impl MarketService for Client {
                             entry.expiry = details.instrument.expiry;
                         }
                         entry.last_dealing_date = details.instrument.expiry_details
-                            .map(|expiry_details| expiry_details.last_dealing_date);
+                            .and_then(|expiry_details| expiry_details.last_dealing_date);
                     }
                     Ok(_) => {
                         warn!(epic = %entry.epic, "market details EPIC mismatch; preserving listed expiry");

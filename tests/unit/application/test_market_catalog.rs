@@ -201,8 +201,9 @@ fn test_synthetic_fixture_payloads_deserialize() -> TestResult {
             .instrument
             .expiry_details
             .ok_or("expiry details missing")?
-            .last_dealing_date,
-        "2026-09-11T16:58:00"
+            .last_dealing_date
+            .as_deref(),
+        Some("2026-09-11T16:58:00")
     );
     Ok(())
 }
@@ -520,8 +521,9 @@ async fn test_public_catalog_expiries_survive_detail_success_and_failure() -> Te
             .instrument
             .expiry_details
             .ok_or("expiry details missing")?
-            .last_dealing_date,
-        "2026-09-11T16:58:00"
+            .last_dealing_date
+            .as_deref(),
+        Some("2026-09-11T16:58:00")
     );
     assert!(client.get_market_details(second_epic).await.is_err());
 

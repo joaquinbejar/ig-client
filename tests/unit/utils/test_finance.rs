@@ -32,9 +32,9 @@ fn create_test_position(
     };
 
     let details = PositionDetails {
-        contract_size: 1.0,
+        contract_size: Some(1.0),
         created_date: "2024-01-01T00:00:00".into(),
-        created_date_utc: "2024-01-01T00:00:00Z".into(),
+        created_date_utc: Some("2024-01-01T00:00:00Z".into()),
         deal_id: "D1".into(),
         deal_reference: "R1".into(),
         direction,

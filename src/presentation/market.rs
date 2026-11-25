@@ -421,9 +421,9 @@ pub struct PriceAllowance {
 /// Details about instrument expiry
 #[derive(DebugPretty, DisplaySimple, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExpiryDetails {
-    /// The last dealing date and time for the instrument
-    #[serde(rename = "lastDealingDate")]
-    pub last_dealing_date: String,
+    /// The last dealing date and time for the instrument; `None` when IG omits it or sends null
+    #[serde(rename = "lastDealingDate", default)]
+    pub last_dealing_date: Option<String>,
 
     /// Information about settlement
     #[serde(rename = "settlementInfo")]
@@ -1175,10 +1175,10 @@ mod tests {
     #[test]
     fn test_expiry_details_creation() {
         let expiry = ExpiryDetails {
-            last_dealing_date: "2024-12-31".to_string(),
+            last_dealing_date: Some("2024-12-31".to_string()),
             settlement_info: Some("Cash settlement".to_string()),
         };
-        assert_eq!(expiry.last_dealing_date, "2024-12-31");
+        assert_eq!(expiry.last_dealing_date.as_deref(), Some("2024-12-31"));
         assert_eq!(expiry.settlement_info, Some("Cash settlement".to_string()));
     }
 
