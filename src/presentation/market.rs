@@ -1082,6 +1082,11 @@ mod tests {
         assert_eq!(inst.popularity, Some(91783089620));
         assert_eq!(inst.market_type.as_deref(), Some("FX_PAIR"));
         assert_eq!(inst.market_subtype.as_deref(), Some("Fiat"));
+        // Old shape keeps decoding the now optional fields as present.
+        assert_eq!(inst.instrument_type, Some(InstrumentType::OptCurrencies));
+        assert_eq!(inst.otc_tradeable, Some(true));
+        assert!(inst.reference_epic.is_none());
+        assert!(inst.maturity_type.is_none());
 
         // Reuse the existing payload fixture to prove conversion keeps every
         // source field, including session prices and raw expiry precision.
