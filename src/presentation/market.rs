@@ -281,20 +281,23 @@ pub struct MarketData {
 impl From<CategoryInstrument> for MarketData {
     fn from(instrument: CategoryInstrument) -> Self {
         let market_status = match instrument.market_status {
-            CategoryMarketStatus::Offline => "OFFLINE",
-            CategoryMarketStatus::Closed => "CLOSED",
-            CategoryMarketStatus::Suspended => "SUSPENDED",
-            CategoryMarketStatus::OnAuction => "ON_AUCTION",
-            CategoryMarketStatus::OnAuctionNoEdits => "ON_AUCTION_NO_EDITS",
-            CategoryMarketStatus::EditsOnly => "EDITS_ONLY",
-            CategoryMarketStatus::ClosingsOnly => "CLOSINGS_ONLY",
-            CategoryMarketStatus::DealNoEdit => "DEAL_NO_EDIT",
-            CategoryMarketStatus::Tradeable => "TRADEABLE",
+            None => "UNKNOWN",
+            Some(CategoryMarketStatus::Offline) => "OFFLINE",
+            Some(CategoryMarketStatus::Closed) => "CLOSED",
+            Some(CategoryMarketStatus::Suspended) => "SUSPENDED",
+            Some(CategoryMarketStatus::OnAuction) => "ON_AUCTION",
+            Some(CategoryMarketStatus::OnAuctionNoEdits) => "ON_AUCTION_NO_EDITS",
+            Some(CategoryMarketStatus::EditsOnly) => "EDITS_ONLY",
+            Some(CategoryMarketStatus::ClosingsOnly) => "CLOSINGS_ONLY",
+            Some(CategoryMarketStatus::DealNoEdit) => "DEAL_NO_EDIT",
+            Some(CategoryMarketStatus::Tradeable) => "TRADEABLE",
         };
         Self {
             epic: instrument.epic,
             instrument_name: instrument.instrument_name,
-            instrument_type: instrument.instrument_type,
+            instrument_type: instrument
+                .instrument_type
+                .unwrap_or(InstrumentType::Unknown),
             expiry: instrument.expiry,
             high_limit_price: None,
             low_limit_price: None,
@@ -306,7 +309,7 @@ impl From<CategoryInstrument> for MarketData {
             bid: instrument.bid,
             offer: instrument.offer,
             lot_size: instrument.lot_size,
-            otc_tradeable: Some(instrument.otc_tradeable),
+            otc_tradeable: instrument.otc_tradeable,
             delay_time: instrument.delay_time,
             high: instrument.high,
             low: instrument.low,
@@ -666,18 +669,18 @@ pub struct CategoryInstrument {
     pub instrument_name: String,
     /// Expiry date of the instrument
     pub expiry: String,
-    /// Type of the instrument
-    #[serde(rename = "instrumentType")]
-    pub instrument_type: InstrumentType,
+    /// Type of the instrument; absent on some feeds (for example IG UK `OPTIONS`)
+    #[serde(rename = "instrumentType", default)]
+    pub instrument_type: Option<InstrumentType>,
     /// Size of an instrument lot
     #[serde(rename = "lotSize")]
     pub lot_size: Option<f64>,
-    /// True if the instrument can be traded OTC
-    #[serde(rename = "otcTradeable")]
-    pub otc_tradeable: bool,
-    /// Current status of the market
-    #[serde(rename = "marketStatus")]
-    pub market_status: CategoryMarketStatus,
+    /// True if the instrument can be traded OTC; absent on some feeds
+    #[serde(rename = "otcTradeable", default)]
+    pub otc_tradeable: Option<bool>,
+    /// Current status of the market; absent on some feeds
+    #[serde(rename = "marketStatus", default)]
+    pub market_status: Option<CategoryMarketStatus>,
     /// Price delay time for market data in minutes
     #[serde(rename = "delayTime")]
     pub delay_time: Option<i64>,
@@ -720,6 +723,20 @@ pub struct CategoryInstrument {
     /// Market subtype of the underlying (e.g. "Fiat")
     #[serde(rename = "marketSubtype")]
     pub market_subtype: Option<String>,
+    /// EPIC of the reference market, when the listing names one (IG UK `OPTIONS`)
+    #[serde(
+        rename = "referenceEpic",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reference_epic: Option<String>,
+    /// Maturity class of the listing, e.g. `DAILY`, `WEEKLY`, `MONTHLY`
+    #[serde(
+        rename = "maturityType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub maturity_type: Option<String>,
 }
 
 /// Paging metadata for category instruments response
@@ -989,12 +1006,44 @@ mod tests {
         let inst = CategoryInstrument::default();
         assert!(inst.epic.is_empty());
         assert!(inst.instrument_name.is_empty());
-        assert_eq!(inst.market_status, CategoryMarketStatus::Offline);
+        assert_eq!(inst.market_status, None);
+        assert_eq!(inst.instrument_type, None);
+        assert_eq!(inst.otc_tradeable, None);
         assert!(inst.expiry_timestamp.is_none());
         assert!(inst.underlying_name.is_none());
         assert!(inst.popularity.is_none());
         assert!(inst.market_type.is_none());
         assert!(inst.market_subtype.is_none());
+    }
+
+    #[test]
+    fn test_category_instrument_deserialization_uk_options_listing() {
+        // Shape returned by IG UK demo GET /categories/OPTIONS/instruments (v1):
+        // no instrumentType, otcTradeable, marketStatus or prices.
+        let json = r#"{"instruments":[{
+            "epic": "IX.D.NASDAQ.IFD.IP",
+            "instrumentName": "US Tech 100",
+            "expiry": "Daily",
+            "referenceEpic": "IX.D.NASDAQ.IFD.IP",
+            "underlyingName": "US Tech 100",
+            "maturityType": "DAILY",
+            "popularity": 2975842491795626599,
+            "marketType": "index",
+            "expiryTimestamp": 1795640400000
+        }],"metadata":{"pageNumber":0,"pageSize":200,"totalPages":2,"totalResults":240}}"#;
+        let page: crate::model::responses::CategoryInstrumentsResponse =
+            serde_json::from_str(json).expect("deserialize failed");
+        let inst = &page.instruments[0];
+        assert_eq!(inst.instrument_type, None);
+        assert_eq!(inst.otc_tradeable, None);
+        assert_eq!(inst.market_status, None);
+        assert_eq!(inst.reference_epic.as_deref(), Some("IX.D.NASDAQ.IFD.IP"));
+        assert_eq!(inst.maturity_type.as_deref(), Some("DAILY"));
+        assert_eq!(inst.popularity, Some(2975842491795626599));
+        let market = MarketData::from(inst.clone());
+        assert_eq!(market.instrument_type, InstrumentType::Unknown);
+        assert_eq!(market.market_status, "UNKNOWN");
+        assert_eq!(market.otc_tradeable, None);
     }
 
     #[test]
@@ -1027,12 +1076,17 @@ mod tests {
         assert_eq!(inst.epic, "OD.D.OTCWK2AUD.28.IP");
         assert_eq!(inst.instrument_name, "Weekly AUDUSD ($1) 7200 Call");
         assert_eq!(inst.expiry, "17-JUL-26");
-        assert_eq!(inst.market_status, CategoryMarketStatus::EditsOnly);
+        assert_eq!(inst.market_status, Some(CategoryMarketStatus::EditsOnly));
         assert_eq!(inst.expiry_timestamp, Some(1784300400000));
         assert_eq!(inst.underlying_name.as_deref(), Some("AUD/USD"));
         assert_eq!(inst.popularity, Some(91783089620));
         assert_eq!(inst.market_type.as_deref(), Some("FX_PAIR"));
         assert_eq!(inst.market_subtype.as_deref(), Some("Fiat"));
+        // Old shape keeps decoding the now optional fields as present.
+        assert_eq!(inst.instrument_type, Some(InstrumentType::OptCurrencies));
+        assert_eq!(inst.otc_tradeable, Some(true));
+        assert!(inst.reference_epic.is_none());
+        assert!(inst.maturity_type.is_none());
 
         // Reuse the existing payload fixture to prove conversion keeps every
         // source field, including session prices and raw expiry precision.
