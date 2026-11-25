@@ -398,15 +398,15 @@ impl Add for Position {
 /// Details of a position
 #[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize)]
 pub struct PositionDetails {
-    /// Size of one contract
-    #[serde(rename = "contractSize")]
-    pub contract_size: f64,
+    /// Size of one contract; `None` when IG omits it or sends null
+    #[serde(rename = "contractSize", default)]
+    pub contract_size: Option<f64>,
     /// Date and time when the position was created
     #[serde(rename = "createdDate")]
     pub created_date: String,
-    /// UTC date and time when the position was created
-    #[serde(rename = "createdDateUTC")]
-    pub created_date_utc: String,
+    /// UTC date and time when the position was created; `None` when IG omits it or sends null
+    #[serde(rename = "createdDateUTC", default)]
+    pub created_date_utc: Option<String>,
     /// Unique identifier for the deal
     #[serde(rename = "dealId")]
     pub deal_id: String,
@@ -455,13 +455,17 @@ impl Add for PositionDetails {
                 self.direction
             };
             (
-                (self.contract_size - other.contract_size).abs(),
+                self.contract_size
+                    .zip(other.contract_size)
+                    .map(|(a, b)| (a - b).abs()),
                 (self.size - other.size).abs(),
                 direction,
             )
         } else {
             (
-                self.contract_size + other.contract_size,
+                self.contract_size
+                    .zip(other.contract_size)
+                    .map(|(a, b)| a + b),
                 self.size + other.size,
                 self.direction,
             )
@@ -1001,9 +1005,9 @@ mod tests {
 
     fn sample_position_details(direction: Direction, level: f64, size: f64) -> PositionDetails {
         PositionDetails {
-            contract_size: 1.0,
+            contract_size: Some(1.0),
             created_date: "2025/10/30 18:13:53:000".to_string(),
-            created_date_utc: "2025-10-30T17:13:53".to_string(),
+            created_date_utc: Some("2025-10-30T17:13:53".to_string()),
             deal_id: "DIAAAAVJNQPWZAG".to_string(),
             deal_reference: "RZ0RQ1K8V1S1JN2".to_string(),
             direction,

@@ -606,13 +606,10 @@ impl std::fmt::Display for MultipleMarketDetailsResponse {
                 .instrument
                 .expiry_details
                 .as_ref()
-                .map(|ed| {
+                .and_then(|ed| ed.last_dealing_date.as_deref())
+                .map(|date| {
                     // Extract just the date part (YYYY-MM-DD)
-                    ed.last_dealing_date
-                        .split('T')
-                        .next()
-                        .unwrap_or(&ed.last_dealing_date)
-                        .to_string()
+                    date.split('T').next().unwrap_or(date).to_string()
                 })
                 .unwrap_or_else(|| {
                     details

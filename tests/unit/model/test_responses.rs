@@ -312,9 +312,9 @@ fn positions_response_compact_by_epic_merges_positions() {
 
     let pos_a = Position {
         position: PositionDetails {
-            contract_size: 10.0,
+            contract_size: Some(10.0),
             created_date: "2025-10-19T10:00:00".into(),
-            created_date_utc: "2025-10-19T08:00:00Z".into(),
+            created_date_utc: Some("2025-10-19T08:00:00Z".into()),
             deal_id: "D1".into(),
             deal_reference: "R1".into(),
             direction: Direction::Buy,
@@ -334,9 +334,9 @@ fn positions_response_compact_by_epic_merges_positions() {
 
     let pos_b = Position {
         position: PositionDetails {
-            contract_size: 6.0,
+            contract_size: Some(6.0),
             created_date: "2025-10-19T10:05:00".into(),
-            created_date_utc: "2025-10-19T08:05:00Z".into(),
+            created_date_utc: Some("2025-10-19T08:05:00Z".into()),
             deal_id: "D2".into(),
             deal_reference: "R2".into(),
             direction: Direction::Sell,
@@ -359,7 +359,7 @@ fn positions_response_compact_by_epic_merges_positions() {
     let m = &merged[0];
     assert_eq!(m.market.epic, "IX.D.DAX.IFD.IP");
     // Opposite directions => abs differences
-    assert_eq!(m.position.contract_size, 4.0);
+    assert_eq!(m.position.contract_size, Some(4.0));
     assert_eq!(m.position.size, 2.0);
     // Level averaged
     assert!((m.position.level - 55.0).abs() < 1e-9);
@@ -552,4 +552,41 @@ fn simple_deal_reference_responses_serde_field_names() {
     };
     let j = json_value(&x);
     assert_eq!(j.get("dealReference").unwrap(), "X1");
+}
+
+#[test]
+fn test_position_and_expiry_optional_fields_absent_or_null() {
+    use ig_client::presentation::account::Position;
+    use ig_client::presentation::market::ExpiryDetails;
+    let market = serde_json::json!({
+        "instrumentName": "US 500", "expiry": "DEC-26", "epic": "OP.D.SPX.IP",
+        "instrumentType": "OPT_INDICES", "lotSize": 1.0, "high": null, "low": null,
+        "percentageChange": 0.0, "netChange": 0.0, "bid": null, "offer": null,
+        "updateTime": "17:13:53", "updateTimeUTC": "17:13:53", "delayTime": 0,
+        "streamingPricesAvailable": true, "marketStatus": "TRADEABLE", "scalingFactor": 1
+    });
+    let base = serde_json::json!({
+        "createdDate": "2025/10/30 17:13:53:000", "dealId": "D1", "dealReference": "R1",
+        "direction": "BUY", "limitLevel": null, "level": 10.5, "size": 2.0,
+        "stopLevel": null, "trailingStep": null, "trailingStopDistance": null,
+        "currency": "USD", "controlledRisk": false, "limitedRiskPremium": null
+    });
+    let absent: Position =
+        serde_json::from_value(serde_json::json!({"position": base, "market": market}))
+            .expect("absent fields must deserialize");
+    assert!(absent.position.contract_size.is_none());
+    assert!(absent.position.created_date_utc.is_none());
+    let mut null_fields = base.clone();
+    null_fields["contractSize"] = serde_json::Value::Null;
+    null_fields["createdDateUTC"] = serde_json::Value::Null;
+    let nulls: Position =
+        serde_json::from_value(serde_json::json!({"position": null_fields, "market": market}))
+            .expect("null fields must deserialize");
+    assert!(nulls.position.contract_size.is_none());
+    assert!(nulls.position.created_date_utc.is_none());
+    let absent: ExpiryDetails = serde_json::from_value(serde_json::json!({})).expect("absent");
+    assert!(absent.last_dealing_date.is_none());
+    let null: ExpiryDetails =
+        serde_json::from_value(serde_json::json!({"lastDealingDate": null})).expect("null");
+    assert!(null.last_dealing_date.is_none());
 }
