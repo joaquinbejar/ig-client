@@ -1683,6 +1683,18 @@ impl StreamerClient {
     /// This method creates a subscription to receive real-time market data updates
     /// for the given EPICs and returns a channel receiver for consuming the updates.
     ///
+    /// # IG demo refuses `MARKET:` items
+    ///
+    /// IG's demo Lightstreamer servers refuse every `MARKET:{epic}` group with
+    /// code 21 ("Invalid group"), whatever the EPIC: measured on 2026-10-23 and
+    /// again on 2026-11-26 on an IG UK demo account, where `CS.D.EURUSD.CFD.IP`,
+    /// `IX.D.FTSE.DAILY.IP` and index options were all refused, alone and grouped.
+    /// The refusal arrives after the session opens, as an error log and a closed
+    /// receiver, not as an `Err` from this call. Use [`Self::price_subscribe`]
+    /// (`PRICE:{account}:{epic}` on the `Pricing` adapter), which IG serves on the
+    /// same account; its `NET_CHG`, `BIDPRICE1`, `ASKPRICE1`, `TIMESTAMP` and
+    /// `DLG_FLAG` fields cover what this subscription offers.
+    ///
     /// # Arguments
     ///
     /// * `epics` - List of instrument EPICs to subscribe to
