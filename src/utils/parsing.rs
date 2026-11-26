@@ -223,6 +223,35 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+/// Deserialize a string that may be `null`; `null` becomes an empty string.
+///
+/// Pair with `#[serde(default)]` so an absent key also yields `""`.
+pub fn deserialize_null_as_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+/// Deserialize a list leniently: an item that fails to decode is skipped
+/// (and logged) instead of failing the whole list. `null` yields an empty list.
+pub fn deserialize_vec_skip_invalid<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    let mut out = Vec::new();
+    for value in raw.unwrap_or_default() {
+        match serde_json::from_value::<T>(value) {
+            Ok(item) => out.push(item),
+            Err(err) => warn!("skipping list item that failed to deserialize: {err}"),
+        }
+    }
+    Ok(out)
+}
+
 /// Helper function to deserialize a nullable status field
 /// When the status is null in the JSON, we default to Open status
 pub fn deserialize_nullable_status<'de, D>(deserializer: D) -> Result<Status, D::Error>

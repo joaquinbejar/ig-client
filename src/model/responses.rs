@@ -304,7 +304,12 @@ impl CategoriesResponse {
 /// Response containing instruments for a specific category
 #[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize, Default)]
 pub struct CategoryInstrumentsResponse {
-    /// List of instruments in the category
+    /// List of instruments in the category; an item that fails to decode is
+    /// skipped so one malformed listing never fails the whole page
+    #[serde(
+        default,
+        deserialize_with = "crate::utils::parsing::deserialize_vec_skip_invalid"
+    )]
     pub instruments: Vec<CategoryInstrument>,
     /// Paging metadata
     pub metadata: Option<CategoryInstrumentsMetadata>,

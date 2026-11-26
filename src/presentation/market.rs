@@ -664,10 +664,19 @@ pub enum CategoryMarketStatus {
 pub struct CategoryInstrument {
     /// Unique instrument identifier (EPIC)
     pub epic: String,
-    /// Name of the instrument
-    #[serde(rename = "instrumentName")]
+    /// Name of the instrument; empty when IG omits it or sends `null`
+    #[serde(
+        rename = "instrumentName",
+        default,
+        deserialize_with = "crate::utils::parsing::deserialize_null_as_empty_string"
+    )]
     pub instrument_name: String,
-    /// Expiry date of the instrument
+    /// Expiry date of the instrument; empty when IG omits it or sends `null`
+    /// (for example IG UK `CRYPTOCURRENCY` listings carry no `expiry` key)
+    #[serde(
+        default,
+        deserialize_with = "crate::utils::parsing::deserialize_null_as_empty_string"
+    )]
     pub expiry: String,
     /// Type of the instrument; absent on some feeds (for example IG UK `OPTIONS`)
     #[serde(rename = "instrumentType", default)]
@@ -1014,6 +1023,45 @@ mod tests {
         assert!(inst.popularity.is_none());
         assert!(inst.market_type.is_none());
         assert!(inst.market_subtype.is_none());
+    }
+
+    #[test]
+    fn test_category_instrument_deserialization_uk_crypto_listing_without_expiry() {
+        // Shape returned by IG UK demo GET /categories/CRYPTOCURRENCY/instruments (v1):
+        // no `expiry` key at all.
+        let json = r#"{"instruments":[
+            {"epic":"CS.D.BSVUSD.TODAY.IP","instrumentName":"Bitcoin SV","underlyingName":"Bitcoin SV"},
+            {"epic":"CS.D.NEOUSD.TODAY.IP","instrumentName":"NEO","underlyingName":"NEO"}
+        ]}"#;
+        let page: crate::model::responses::CategoryInstrumentsResponse =
+            serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(page.instruments.len(), 2);
+        assert_eq!(page.instruments[0].expiry, "");
+        assert_eq!(page.instruments[0].epic, "CS.D.BSVUSD.TODAY.IP");
+        assert!(page.metadata.is_none());
+    }
+
+    #[test]
+    fn test_category_instrument_null_expiry_and_name() {
+        let json = r#"{"epic":"X.Y.Z","instrumentName":null,"expiry":null}"#;
+        let inst: CategoryInstrument = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(inst.expiry, "");
+        assert_eq!(inst.instrument_name, "");
+    }
+
+    #[test]
+    fn test_category_instruments_skip_invalid_item() {
+        // One malformed item (no epic, wrong type) must not fail the page.
+        let json = r#"{"instruments":[
+            {"epic":"A.B.C","instrumentName":"Good","expiry":"-"},
+            {"instrumentName":42},
+            {"epic":"D.E.F","instrumentName":"Also good"}
+        ],"metadata":null}"#;
+        let page: crate::model::responses::CategoryInstrumentsResponse =
+            serde_json::from_str(json).expect("deserialize failed");
+        let epics: Vec<&str> = page.instruments.iter().map(|i| i.epic.as_str()).collect();
+        assert_eq!(epics, vec!["A.B.C", "D.E.F"]);
+        assert_eq!(page.instruments[0].expiry, "-");
     }
 
     #[test]
