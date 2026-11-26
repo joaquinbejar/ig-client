@@ -301,18 +301,85 @@ impl CategoriesResponse {
     }
 }
 
+/// A category instrument that IG returned but that could not be decoded.
+///
+/// Kept so callers can count raw rows (for pagination) and account for the loss.
+#[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct SkippedCategoryInstrument {
+    /// Zero-based position of the item in the raw `instruments` array
+    pub index: usize,
+    /// The item's `epic`, when it is present and a string
+    pub epic: Option<String>,
+    /// Decode error message
+    pub error: String,
+}
+
 /// Response containing instruments for a specific category
 #[derive(DebugPretty, DisplaySimple, Clone, Deserialize, Serialize, Default)]
+#[serde(from = "RawCategoryInstrumentsResponse")]
 pub struct CategoryInstrumentsResponse {
-    /// List of instruments in the category; an item that fails to decode is
-    /// skipped so one malformed listing never fails the whole page
-    #[serde(
-        default,
-        deserialize_with = "crate::utils::parsing::deserialize_vec_skip_invalid"
-    )]
+    /// Decoded instruments, in page order. An item that fails to decode is left
+    /// out and recorded in `skipped_instruments`, so one malformed listing never
+    /// fails the whole page.
     pub instruments: Vec<CategoryInstrument>,
     /// Paging metadata
     pub metadata: Option<CategoryInstrumentsMetadata>,
+    /// Items IG returned that could not be decoded, with their raw positions.
+    /// `instruments.len() + skipped_instruments.len()` is the raw page length.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_instruments: Vec<SkippedCategoryInstrument>,
+}
+
+#[derive(Deserialize)]
+struct RawCategoryInstrumentsResponse {
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+    instruments: Vec<serde_json::Value>,
+    #[serde(default)]
+    metadata: Option<CategoryInstrumentsMetadata>,
+    // Accept a previously serialized response; recomputed from `instruments`.
+    #[serde(default, rename = "skipped_instruments")]
+    _skipped: Option<serde_json::Value>,
+}
+
+impl From<RawCategoryInstrumentsResponse> for CategoryInstrumentsResponse {
+    fn from(raw: RawCategoryInstrumentsResponse) -> Self {
+        let mut instruments = Vec::with_capacity(raw.instruments.len());
+        let mut skipped_instruments = Vec::new();
+        for (index, value) in raw.instruments.into_iter().enumerate() {
+            let epic = value
+                .get("epic")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            match serde_json::from_value::<CategoryInstrument>(value) {
+                Ok(item) => instruments.push(item),
+                Err(err) => {
+                    tracing::warn!(
+                        index,
+                        ?epic,
+                        "skipping category instrument that failed to deserialize: {err}"
+                    );
+                    skipped_instruments.push(SkippedCategoryInstrument {
+                        index,
+                        epic,
+                        error: err.to_string(),
+                    });
+                }
+            }
+        }
+        Self {
+            instruments,
+            metadata: raw.metadata,
+            skipped_instruments,
+        }
+    }
+}
+
+impl CategoryInstrumentsResponse {
+    /// Number of items IG returned on this page, decoded or not
+    #[must_use]
+    pub fn raw_len(&self) -> usize {
+        self.instruments.len() + self.skipped_instruments.len()
+    }
 }
 
 impl CategoryInstrumentsResponse {

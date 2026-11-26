@@ -1062,6 +1062,15 @@ mod tests {
         let epics: Vec<&str> = page.instruments.iter().map(|i| i.epic.as_str()).collect();
         assert_eq!(epics, vec!["A.B.C", "D.E.F"]);
         assert_eq!(page.instruments[0].expiry, "-");
+        assert_eq!(page.raw_len(), 3);
+        assert_eq!(page.skipped_instruments.len(), 1);
+        assert_eq!(page.skipped_instruments[0].index, 1);
+        assert_eq!(page.skipped_instruments[0].epic, None);
+        assert!(!page.skipped_instruments[0].error.is_empty());
+        // Round trip keeps the decoded rows.
+        let back: crate::model::responses::CategoryInstrumentsResponse =
+            serde_json::from_str(&serde_json::to_string(&page).unwrap()).unwrap();
+        assert_eq!(back.instruments.len(), 2);
     }
 
     #[test]
