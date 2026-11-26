@@ -13,8 +13,12 @@ pub struct Instrument {
     pub name: String,
     /// Expiry date of the instrument
     pub expiry: String,
-    /// Size of one contract
-    #[serde(rename = "contractSize")]
+    /// Size of one contract; empty when IG sends `null` (some IG UK shares)
+    #[serde(
+        rename = "contractSize",
+        default,
+        deserialize_with = "crate::utils::parsing::deserialize_null_as_empty_string"
+    )]
     pub contract_size: String,
     /// Size of one lot
     #[serde(rename = "lotSize")]
@@ -33,8 +37,12 @@ pub struct Instrument {
     pub margin_factor_unit: Option<String>,
     /// Available currencies for trading this instrument
     pub currencies: Option<Vec<Currency>>,
-    #[serde(rename = "valueOfOnePip")]
-    /// Value of one pip for this instrument
+    /// Value of one pip for this instrument; empty when IG sends `null`
+    #[serde(
+        rename = "valueOfOnePip",
+        default,
+        deserialize_with = "crate::utils::parsing::deserialize_null_as_empty_string"
+    )]
     pub value_of_one_pip: String,
     /// Type of the instrument
     #[serde(rename = "instrumentType")]
@@ -1023,6 +1031,17 @@ mod tests {
         assert!(inst.popularity.is_none());
         assert!(inst.market_type.is_none());
         assert!(inst.market_subtype.is_none());
+    }
+
+    #[test]
+    fn test_market_details_uk_share_with_null_pip_and_contract_size() {
+        // IG UK demo GET /markets/AR.D.BIDSJ.CASH.IP (v3) returns `contractSize`,
+        // `valueOfOnePip` and `onePipMeans` as null.
+        let json = include_str!("../../tests/fixtures/market_details_uk_share_null_pip.json");
+        let details: MarketDetails = serde_json::from_str(json).expect("deserialize failed");
+        assert_eq!(details.instrument.epic, "AR.D.BIDSJ.CASH.IP");
+        assert_eq!(details.instrument.contract_size, "");
+        assert_eq!(details.instrument.value_of_one_pip, "");
     }
 
     #[test]
