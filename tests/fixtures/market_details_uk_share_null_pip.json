@@ -1,0 +1,119 @@
+{
+  "dealingRules": {
+    "controlledRiskSpacing": {
+      "unit": "POINTS",
+      "value": 180.0
+    },
+    "marketOrderPreference": "AVAILABLE_DEFAULT_OFF",
+    "maxStopOrLimitDistance": {
+      "unit": "PERCENTAGE",
+      "value": 75.0
+    },
+    "minControlledRiskStopDistance": {
+      "unit": "PERCENTAGE",
+      "value": 12.5
+    },
+    "minDealSize": {
+      "unit": "POINTS",
+      "value": 0.1
+    },
+    "minNormalStopOrLimitDistance": {
+      "unit": "PERCENTAGE",
+      "value": 0.1
+    },
+    "minStepDistance": {
+      "unit": "PERCENTAGE",
+      "value": 1.0
+    },
+    "trailingStopsPreference": "AVAILABLE"
+  },
+  "instrument": {
+    "chartCode": "BIDJ",
+    "contractSize": null,
+    "controlledRiskAllowed": true,
+    "country": "ZA",
+    "currencies": [
+      {
+        "baseExchangeRate": 22.98406,
+        "code": "ZAR",
+        "exchangeRate": 0.067,
+        "isDefault": false,
+        "symbol": "SR"
+      }
+    ],
+    "epic": "AR.D.BIDSJ.CASH.IP",
+    "expiry": "-",
+    "expiryDetails": null,
+    "forceOpenAllowed": true,
+    "limitedRiskPremium": {
+      "unit": "PERCENTAGE",
+      "value": 5
+    },
+    "lotSize": 1.0,
+    "marginDepositBands": [
+      {
+        "currency": "ZAR",
+        "margin": 20,
+        "max": 230,
+        "min": 0
+      },
+      {
+        "currency": "ZAR",
+        "margin": 20,
+        "max": 1150,
+        "min": 230
+      },
+      {
+        "currency": "ZAR",
+        "margin": 40,
+        "max": 4600,
+        "min": 1150
+      },
+      {
+        "currency": "ZAR",
+        "margin": 75,
+        "max": null,
+        "min": 4600
+      }
+    ],
+    "marginFactor": 20,
+    "marginFactorUnit": "PERCENTAGE",
+    "marketId": "BID-ZA",
+    "name": "Bid Corporation Limited",
+    "newsCode": "BIDJ.J",
+    "onePipMeans": null,
+    "openingHours": null,
+    "rolloverDetails": null,
+    "slippageFactor": {
+      "unit": "pct",
+      "value": 100.0
+    },
+    "specialInfo": [
+      "DEFAULT KNOCK OUT LEVEL DISTANCE",
+      "MAX KNOCK OUT LEVEL DISTANCE",
+      "No Controlled Risk"
+    ],
+    "sprintMarketsMaximumExpiryTime": null,
+    "sprintMarketsMinimumExpiryTime": null,
+    "stopsLimitsAllowed": true,
+    "streamingPricesAvailable": false,
+    "type": "SHARES",
+    "unit": "AMOUNT",
+    "valueOfOnePip": null
+  },
+  "snapshot": {
+    "bid": 48981.00,
+    "binaryOdds": null,
+    "controlledRiskExtraSpread": null,
+    "decimalPlacesFactor": 2,
+    "delayTime": 0,
+    "high": 49619.00,
+    "low": 48280.00,
+    "marketStatus": "TRADEABLE",
+    "netChange": 421,
+    "offer": 49001.00,
+    "percentageChange": 0.87,
+    "scalingFactor": 1,
+    "updateTime": "14:35:16"
+  }
+}
